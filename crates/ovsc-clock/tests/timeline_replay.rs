@@ -24,7 +24,7 @@ use ovsc_clock::{
 use ovsc_shm::clock::{ClockBlock, ClockRead, ClockRecord, READ_TRIES};
 use ovsc_shm::timeline::{ClockInput, DeviceTimeline, Regime, TimelineParams, Zts};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 const US: u64 = 1_000;
 const MS: u64 = 1_000_000;
