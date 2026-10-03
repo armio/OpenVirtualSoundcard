@@ -30,7 +30,7 @@ cpal = "0.18"
 hex = "0.4"
 libc = "0.2"
 mach2 = "0.6"
-netdev = "0.36"
+netdev = "0.46"
 thread-priority = "3"
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }
