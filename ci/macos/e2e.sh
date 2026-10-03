@@ -340,7 +340,8 @@ s11() {
         return 1
     fi
     local p
-    for p in "$PLIST" /Library/Audio/Plug-Ins/HAL/OpenVirtualSoundcard.driver "$APP_SUPPORT"; do
+    for p in "$PLIST" /Library/Audio/Plug-Ins/HAL/OpenVirtualSoundcard.driver \
+        /Applications/OpenVirtualSoundcard.app "$APP_SUPPORT"; do
         [ -e "$p" ] && { echo "left behind: $p"; return 1; }
     done
     return 0

@@ -95,24 +95,35 @@ time, so `install.sh` refuses `--no-driver` then.
 
 ### Installer package
 
-`packaging/macos/build-pkg.sh` builds `dist/OpenVirtualSoundcard-<version>-<arch>.pkg`
-(`dist/OpenVirtualSoundcard-<version>.pkg` when the driver and the daemon are universal
-binaries) from the same files; `BUILD=1` builds both first, and
-`BUILD=1 UNIVERSAL=1` builds them for arm64 and x86_64 (first
-`rustup target add aarch64-apple-darwin x86_64-apple-darwin`). Its
-postinstall script runs the same steps from the same `install-lib.sh`.
-`build-pkg.sh` names the package on its last line (`built <path> ...`), and
-older packages stay in `dist`. The package does not include the OpenVirtualSoundcard
-app yet: build and install it with `build-app.sh` and `install.sh`. Install that one, for example:
+Releases come with an installer package: download
+`OpenVirtualSoundcard-<version>.pkg` from the repository's Releases page and
+open it. It installs everything `install.sh` does, the app and the
+third-party licence notices included, for Apple silicon and Intel Macs, and
+its postinstall script runs the same steps from the same `install-lib.sh`.
+
+A package that is not signed with a Developer ID makes macOS say it cannot
+verify the developer. Open it anyway from System Settings > Privacy &
+Security (**Open Anyway**, under Security), or install it from Terminal:
 
 ```sh
-sudo installer -pkg dist/OpenVirtualSoundcard-<version>-arm64.pkg -target /
+sudo installer -pkg ~/Downloads/OpenVirtualSoundcard-<version>.pkg -target /
 ```
 
-Do not hand out an unsigned package for download: Gatekeeper blocks it, and
-macOS 15 dropped the Control-click way around that. `build-pkg.sh` signs with
-a Developer ID when `CODESIGN_IDENTITY` and `INSTALLER_IDENTITY` are set, and
-notarizes with `NOTARY_PROFILE`.
+`packaging/macos/build-pkg.sh` builds the package locally:
+
+| Command | Builds |
+|---|---|
+| `packaging/macos/build-pkg.sh` | a package of what is already built: the driver and the daemon, plus the app and the notices when `build-app.sh` and `third-party-licenses.sh` made them |
+| `BUILD=1 packaging/macos/build-pkg.sh` | everything first, for this Mac's architecture |
+| `BUILD=1 UNIVERSAL=1 packaging/macos/build-pkg.sh` | everything for arm64 and x86_64, as releases do (first `rustup target add aarch64-apple-darwin x86_64-apple-darwin` and `cargo install cargo-about --locked --features cli`) |
+
+It writes `dist/OpenVirtualSoundcard-<version>.pkg` (with `-<arch>` for a
+single architecture), names it on its last line (`built <path> ...`), and
+leaves older packages in `dist`. It signs the driver, the daemon, the app and
+the package with a Developer ID when `CODESIGN_IDENTITY` and
+`INSTALLER_IDENTITY` are set, and notarizes it with `NOTARY_PROFILE`; the
+release workflow does that when its secrets are set
+([`RELEASING.md`](RELEASING.md)).
 
 ## What gets installed
 
@@ -124,6 +135,7 @@ notarizes with `NOTARY_PROFILE`.
 | `/Library/Application Support/OpenVirtualSoundcard/ovsc.toml` | The configuration. |
 | `/Library/Application Support/OpenVirtualSoundcard/state.toml` | Renames, subscriptions and the latency set from a controller or the app (`state_file` in the default configuration). |
 | `/Applications/OpenVirtualSoundcard.app` | The [OpenVirtualSoundcard app](#the-openvirtualsoundcard-app), if it was built. |
+| `/Library/Application Support/OpenVirtualSoundcard/THIRD-PARTY-LICENSES.html` | The licences of the open-source software in the package (packages only). |
 | `/var/run/ovsc/control.sock` | The daemon's [control socket](#the-control-socket), while it runs. |
 | `/Library/Application Support/OpenVirtualSoundcard/uninstall.sh` | The uninstaller. |
 | `/Library/LaunchDaemons/org.openvirtualsoundcard.daemon.plist` | The launchd job `org.openvirtualsoundcard.daemon`. |

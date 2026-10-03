@@ -119,7 +119,7 @@ main() {
     if [ "$purge" = 1 ]; then
         remove "$SUPPORT" "$LOG_DIR"
     else
-        remove "$SUPPORT/bin" "$SUPPORT/uninstall.sh"
+        remove "$SUPPORT/bin" "$SUPPORT/uninstall.sh" "$SUPPORT/THIRD-PARTY-LICENSES.html"
         if rmdir "$SUPPORT" 2>/dev/null; then
             log "removed the empty $SUPPORT"
         elif [ -d "$SUPPORT" ]; then

@@ -88,8 +88,14 @@ Route audio with Dante Controller, or from the command line:
 
 ### macOS quick start
 
-The Core Audio device needs the Xcode command-line tools. From the repository
-root:
+Releases come with an installer package: download
+`OpenVirtualSoundcard-<version>.pkg` from the
+[Releases](https://github.com/armio/OpenVirtualSoundcard/releases) page and
+open it ([unsigned packages](docs/MACOS.md#installer-package) need one more
+step).
+
+To build and install from source instead, you need Rust and the Xcode
+command-line tools. From the repository root:
 
 ```sh
 cargo build --release --locked -p ovsc
