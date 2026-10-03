@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A new push to a pull request cancels its older runs.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Dependencies: licences compatible with the GPL, crates.io only, no known
+  # advisories (deny.toml).
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: apps/macos/Cargo.toml
+          arguments: --all-features --config deny.toml
+          command: check advisories licenses bans sources
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev shellcheck
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # ovsc-shm must stay no_std: thumbv7em has no 64-bit atomics and
+      # builds the parts without them, aarch64-unknown-none the whole crate.
+      - name: ovsc-shm builds without std
+        run: |
+          rustup target add thumbv7em-none-eabihf aarch64-unknown-none
+          cargo build -p ovsc-shm --target thumbv7em-none-eabihf
+          cargo build -p ovsc-shm --target aarch64-unknown-none
+      - name: Shell scripts and macOS packaging files
+        run: |
+          shellcheck -x packaging/macos/*.sh packaging/macos/scripts/* ci/macos/*.sh
+          python3 -c 'import plistlib, sys; [plistlib.load(open(p, "rb")) for p in sys.argv[1:]]' \
+            packaging/macos/*.plist packaging/macos/Info.plist.in
+          python3 -c 'import sys, xml.dom.minidom; xml.dom.minidom.parse(sys.argv[1])' \
+            packaging/macos/distribution.xml
+
+  # macOS is the only target for now: the macOS workflow runs these tests on
+  # a Mac, and Windows is not tested.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --all-targets
+      - run: cargo test --workspace

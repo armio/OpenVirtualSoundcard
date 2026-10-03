@@ -1,0 +1,55 @@
+# Runs the Core Audio sandbox probe (tools/macos-probe) on GitHub's macOS
+# runners: does an ad-hoc signed, Rust-built server plug-in load, and which
+# channels to a LaunchDaemon does the driver sandbox allow? An ad-hoc signed
+# BlackHole build runs alongside as a control.
+name: macOS probe
+
+# The probe answered its questions before the driver was written
+# (tools/macos-probe/README.md); it runs by hand only.
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  probe:
+    name: probe (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the probe
+        run: tools/macos-probe/build.sh
+      - name: Build the BlackHole canary (ad-hoc signed)
+        continue-on-error: true
+        working-directory: tools/macos-probe
+        run: |
+          git clone --depth 1 https://github.com/ExistentialAudio/BlackHole canary/src
+          xcodebuild -project canary/src/BlackHole.xcodeproj -configuration Release \
+            -target BlackHole CONFIGURATION_BUILD_DIR="$PWD/canary/out" CODE_SIGNING_ALLOWED=NO \
+            -quiet
+          codesign --force --deep --sign - --timestamp=none canary/out/BlackHole.driver
+      - name: Install and run the probe
+        timeout-minutes: 10
+        run: tools/macos-probe/run-probe.sh
+      # Self-test of the end-to-end client against BlackHole, whose output
+      # loops straight back to its input.
+      - name: coreaudio-check against BlackHole
+        timeout-minutes: 5
+        working-directory: tools/coreaudio-check
+        run: |
+          cargo build --release
+          target/release/coreaudio-check list
+          target/release/coreaudio-check wait BlackHole2ch_UID 20
+          target/release/coreaudio-check check BlackHole2ch_UID --rate 48000 --inputs 2 --outputs 2
+          target/release/coreaudio-check walk BlackHole2ch_UID
+          # BlackHole runs on the host clock, so its rate is 0 ppm. The x86_64
+          # runner is slow and Core Audio overloads several times per run.
+          target/release/coreaudio-check loopback BlackHole2ch_UID --seconds 3 --rate 48000 \
+            --expect-rate-ppm 0 --rate-tol-ppm 50 --max-jumps 10

@@ -1,0 +1,18 @@
+#!/bin/bash
+# Package preinstall: stops the running daemon, so that the payload can
+# replace its binary and launchd job. Installer passes the target volume as
+# $3; the package installs on the startup disk only (distribution.xml).
+set -u
+[ "${3:-/}" = / ] || exit 0
+HERE=$(cd "$(dirname "$0")" && pwd)
+# build-pkg.sh puts install-lib.sh next to this script.
+# shellcheck source=SCRIPTDIR/../install-lib.sh
+. "$HERE/install-lib.sh"
+
+# A daemon that does not stop is no reason to fail: the payload replaces
+# its files anyway, and postinstall boots it out again.
+ov_bootout || ov_warn "the daemon did not stop"
+# An install under the former name, OpenDante, is replaced; postinstall
+# keeps the configuration moved over here.
+ov_migrate_legacy || ov_warn "could not fully replace the OpenDante install"
+exit 0

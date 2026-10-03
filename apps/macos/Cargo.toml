@@ -1,0 +1,27 @@
+# The OpenVirtualSoundcard app: shows what the daemon is doing and changes its settings
+# through the control socket. Its own workspace, so the main build stays free
+# of GUI dependencies. packaging/macos/build-app.sh makes OpenVirtualSoundcard.app from
+# it. It also builds on Linux (X11), for development.
+[workspace]
+
+[package]
+name = "ovsc-app"
+description = "The OpenVirtualSoundcard app: the daemon's status and settings"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "GPL-3.0-or-later"
+publish = false
+
+[[bin]]
+name = "OpenVirtualSoundcard"
+path = "src/main.rs"
+
+[dependencies]
+ovsc-control = { path = "../../crates/ovsc-control" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "accesskit"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "x11"] }

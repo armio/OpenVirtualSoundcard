@@ -1,0 +1,18 @@
+[package]
+name = "ovsc-proto"
+description = "Wire formats of the Dante-compatible audio-over-IP protocol family (unofficial, reverse-engineered)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+
+[lints]
+workspace = true

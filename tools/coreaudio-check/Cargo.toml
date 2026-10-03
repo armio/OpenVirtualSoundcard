@@ -1,0 +1,17 @@
+# A Core Audio client for testing the OpenVirtualSoundcard driver on a Mac (and in CI).
+# Its own workspace, so the main build stays free of macOS-only code. The
+# analysis module is plain Rust and its tests run on any OS.
+[workspace]
+
+[package]
+name = "coreaudio-check"
+description = "Finds a Core Audio device by UID, plays a test signal through it and checks what comes back"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[dependencies]
+
+[profile.release]
+debug = 1

@@ -1,0 +1,36 @@
+[package]
+name = "ovsc-core"
+description = "OpenVirtualSoundcard device engine: discovery, control servers, audio flows and subscriptions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ovsc-proto.workspace = true
+ovsc-shm.workspace = true
+ovsc-clock.workspace = true
+hex.workspace = true
+netdev.workspace = true
+thread-priority.workspace = true
+rand.workspace = true
+serde.workspace = true
+socket2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

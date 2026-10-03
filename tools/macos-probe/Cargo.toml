@@ -1,0 +1,23 @@
+# The macOS sandbox probe is its own workspace: it only builds for macOS and
+# is not part of the main OpenVirtualSoundcard build.
+[workspace]
+resolver = "3"
+members = ["shim", "plugin", "daemon"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[workspace.dependencies]
+libc = "0.2"
+cc = "1"
+ovprobe-shim = { path = "shim" }
+
+[profile.release]
+debug = 1
+panic = "abort"
+
+[profile.dev]
+panic = "abort"

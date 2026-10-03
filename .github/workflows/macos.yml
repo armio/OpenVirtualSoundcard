@@ -1,0 +1,92 @@
+# macOS: the Core Audio driver and the daemon, checked on every pull request
+# and tested end to end on GitHub's Mac runners when run by hand (Actions >
+# macOS > Run workflow). The end-to-end test also runs on your own Mac with
+# ci/macos/e2e-local.sh (docs/MACOS.md, "Testing"). Results are read from the
+# job logs; nothing is uploaded.
+name: macOS
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'apps/**'
+      - 'packaging/**'
+      - 'ci/macos/**'
+      - 'tools/coreaudio-check/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/macos.yml'
+  workflow_dispatch:
+    inputs:
+      scenarios:
+        description: 'End-to-end scenarios to run (empty: all)'
+        required: false
+        default: ''
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: check (macos-latest)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --no-fail-fast
+      - name: Check the C declarations against the SDK
+        run: |
+          clang -fsyntax-only crates/ovsc-hal/abi_check.c
+          clang -fsyntax-only tools/coreaudio-check/abi_check.c
+      - name: Build the driver bundle
+        run: packaging/macos/build-driver.sh
+      - name: The app (its own workspace)
+        working-directory: apps/macos
+        run: |
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+      - name: Build the app bundle
+        run: packaging/macos/build-app.sh
+
+  # About 15 minutes per macOS version, and it reconfigures the runner's
+  # Core Audio: run by hand only.
+  e2e:
+    name: e2e (${{ matrix.os }})
+    if: github.event_name == 'workflow_dispatch'
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            experimental: false
+          - os: macos-15
+            experimental: false
+          - os: macos-15-intel
+            experimental: true
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: End-to-end scenarios
+        run: ci/macos/e2e.sh ${{ github.event.inputs.scenarios }}
+      - name: Diagnostics
+        if: always()
+        run: ci/macos/diagnostics.sh

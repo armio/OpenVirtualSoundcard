@@ -1,0 +1,45 @@
+# cargo-deny's policy (https://embarkstudios.github.io/cargo-deny/): every
+# dependency's licence must allow distributing it with GPL-3.0-or-later
+# code, crates come from crates.io only, and known advisories fail the
+# check. CI checks the workspace and apps/macos with it.
+
+[advisories]
+version = 2
+ignore = [
+    # paste is unmaintained, not vulnerable: a compile-time macro that
+    # netdev's Linux netlink crates use.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained compile-time macro, via netdev" },
+]
+
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "GPL-3.0-or-later",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+# egui's built-in fonts, compiled into the app. Binary releases of the app
+# must include their licence texts.
+# The policy is shared by two workspaces: a licence one of them never meets
+# is no warning.
+unused-allowed-license = "allow"
+exceptions = [
+    { allow = ["OFL-1.1", "Ubuntu-font-1.0"], crate = "epaint_default_fonts" },
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

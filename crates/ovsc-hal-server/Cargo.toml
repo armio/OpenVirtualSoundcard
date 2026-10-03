@@ -1,0 +1,26 @@
+[package]
+name = "ovsc-hal-server"
+description = "Daemon side of the OpenVirtualSoundcard macOS driver: shared region, clock mirror and XPC service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ovsc-shm.workspace = true
+ovsc-ipc.workspace = true
+ovsc-clock.workspace = true
+ovsc-core.workspace = true
+libc.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+ovsc-hal.workspace = true
+ovsc-proto.workspace = true
+
+[lints]
+workspace = true

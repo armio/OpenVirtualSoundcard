@@ -1,0 +1,64 @@
+# OpenVirtualSoundcard on macOS: the daemon behind the OpenVirtualSoundcard Core Audio device.
+#
+# The installer writes this file to
+# /Library/Application Support/OpenVirtualSoundcard/ovsc.toml when none exists.
+# After editing it, restart the daemon:
+#
+#   sudo launchctl kickstart -k system/org.openvirtualsoundcard.daemon
+#
+# A new sample rate, channel count or latency reaches Core Audio as a device
+# configuration change: applications using the device see it reconfigure.
+# `ovsc example-config` describes the other options.
+
+[device]
+# Name shown in Dante Controller: 1-31 of A-Z a-z 0-9 and inner hyphens.
+name = "ovsc"
+# Network interface name (en0) or IPv4 address. Empty: the interface of the
+# default route, which may be Wi-Fi; name the Dante interface if so.
+interface = ""
+sample_rate = 48000          # 44100, 48000, 88200, 96000, 176400 or 192000
+bits_per_sample = 24         # 16, 24 or 32
+# 1 to 128 of each: receive channels are the device's inputs, transmit
+# channels its outputs. A count, or a list of names: ["Left", "Right"].
+rx_channels = 8
+tx_channels = 8
+latency_ms = 4.0             # receive latency, 0.25 to 40
+# Remember renames and subscriptions made from a controller.
+state_file = "/Library/Application Support/OpenVirtualSoundcard/state.toml"
+
+# Audinate's ConMon service, installed with Dante Controller, Dante Virtual
+# Soundcard and Dante Via, listens on UDP 8800 and 8700 on every interface.
+# Like Dante Virtual Soundcard, the device moves its CMC port to 38800, which
+# it advertises over mDNS, and its settings port to 38700, which it reports
+# in CMC replies. ARC (4440) and flow control (4455) keep Dante's ports.
+[device.ports]
+cmc = 38800
+settings = 38700
+
+[clock]
+# "ptp" follows the Dante network's PTP master. "free" runs on this Mac's
+# own clock, for a network without a master.
+source = "ptp"
+
+[audio]
+backend = "coreaudio"
+
+[coreaudio]
+# User IDs allowed to connect: 202 is Core Audio's driver helper.
+# allowed_uids = [202]
+# Margins added to the safety offsets, in microseconds: more tolerates
+# later packets and a busier Mac, at the cost of latency.
+# input_margin_us = 500
+# output_margin_us = 1000
+# Output latency reported to applications. Default: latency_ms.
+# output_latency_ms = 4.0
+# "safety": the receive latency is part of the input safety offset, so
+# recorded audio lines up with the senders' timestamps. "latency": it is
+# reported as input latency instead, for applications that compensate it.
+# input_latency_mode = "safety"
+# Core Audio's timestamp smoothing: "raw" (none) or "iir".
+# clock_algorithm = "raw"
+# Keep the Mac from idle-sleeping while the engine runs.
+# prevent_idle_sleep = true
+# Seconds between status lines in the log; 0 disables them.
+# status_log_interval_s = 30

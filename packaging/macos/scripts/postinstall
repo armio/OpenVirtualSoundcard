@@ -1,0 +1,30 @@
+#!/bin/bash
+# Package postinstall: the payload is in place, so finish the way install.sh
+# does, with the same install-lib.sh: file modes, a default configuration
+# if there is none, the launchd job, the firewall, a Core Audio restart.
+# Installer passes the target volume as $3, and logs this script's output
+# to /var/log/install.log.
+set -u
+[ "${3:-/}" = / ] || exit 0
+HERE=$(cd "$(dirname "$0")" && pwd)
+# build-pkg.sh puts install-lib.sh and ovsc.toml.default next to this
+# script.
+# shellcheck source=SCRIPTDIR/../install-lib.sh
+. "$HERE/install-lib.sh"
+
+ov_finish_files || ov_die "the installed files are incomplete"
+ov_default_config "$HERE/ovsc.toml.default" || ov_die "could not write $OV_CONFIG"
+ov_unquarantine
+ov_log_mark
+if ! ov_bootstrap; then
+    ov_diagnostics
+    ov_die "the daemon did not start"
+fi
+ov_firewall
+# The files are installed and the daemon runs. A driver that has not loaded
+# yet may still load after a restart of the Mac, so this does not fail the
+# installation; the diagnostics are in the install log.
+ov_restart_coreaudiod || ov_warn "could not restart coreaudiod"
+ov_wait_driver ||
+    ov_warn "the driver has not connected yet; restart the Mac if the OpenVirtualSoundcard device does not appear"
+exit 0

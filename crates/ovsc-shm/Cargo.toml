@@ -1,0 +1,14 @@
+[package]
+name = "ovsc-shm"
+description = "Shared-memory layout, rings, clock block and device timeline shared by the OpenVirtualSoundcard daemon and its macOS driver (no_std)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

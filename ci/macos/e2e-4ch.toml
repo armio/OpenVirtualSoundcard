@@ -1,0 +1,56 @@
+# OpenVirtualSoundcard configuration for the macOS end-to-end test (ci/macos/e2e.sh):
+# one device on 127.0.0.1 whose receive channel n is subscribed to its own
+# transmit channel n, so audio played into the Core Audio device comes
+# straight back through the network engine. The PTP master is
+# `ovsc ptp-master` on ports 10319/10320, run by the test at +50 ppm.
+
+[device]
+name = "odci"
+interface = "127.0.0.1"
+sample_rate = 48000
+bits_per_sample = 24
+tx_channels = 4
+rx_channels = 4
+latency_ms = 4.0
+discovery = false
+
+# Dante's ports plus 20000: the test device then runs beside Dante software
+# on the same Mac (Dante Virtual Soundcard, Dante Via, Dante Controller).
+[device.ports]
+arc = 24440
+cmc = 28800
+flow_control = 24455
+settings = 28700
+
+[[device.subscriptions]]
+rx_channel = 1
+tx_channel = "01"
+tx_device = "odci"
+
+[[device.subscriptions]]
+rx_channel = 2
+tx_channel = "02"
+tx_device = "odci"
+
+[[device.subscriptions]]
+rx_channel = 3
+tx_channel = "03"
+tx_device = "odci"
+
+[[device.subscriptions]]
+rx_channel = 4
+tx_channel = "04"
+tx_device = "odci"
+
+[clock]
+source = "ptp"
+ptp_event_port = 10319
+ptp_general_port = 10320
+
+[audio]
+backend = "coreaudio"
+
+[coreaudio]
+# 0 lets the root self-test (ovsc-hal-selftest) connect too.
+allowed_uids = [202, 0]
+status_log_interval_s = 5

@@ -1,0 +1,47 @@
+name: Interoperability report
+description: How OpenVirtualSoundcard worked, or did not, with real Dante devices or Dante Controller.
+labels: [interop]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Reports from real networks are the most valuable contribution right
+        now, good or bad. Only share captures from networks you may share,
+        and remove anything private from them.
+  - type: textarea
+    id: devices
+    attributes:
+      label: Dante devices
+      description: Models and firmware versions, and the Dante Controller version.
+      placeholder: |
+        Dante AVIO-DAI2, firmware 4.2.x
+        Dante Controller 4.x on macOS
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: OpenVirtualSoundcard commit and platform
+      placeholder: "abc1234, macOS 26.6 on an M1"
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: What worked and what did not
+      description: Discovery, channel lists, routing each way, clock lock, renames, latency, Device View tabs...
+    validations:
+      required: true
+  - type: textarea
+    id: capture
+    attributes:
+      label: Packet capture
+      description: |
+        Attach a zipped capture of the action that failed, filtered to the
+        Dante ports, for example on macOS:
+        `sudo tcpdump -i pktap,lo0,en0 -w dante.pcap 'udp and (port 319 or port 320 or port 4440 or port 4455 or port 5353 or port 8700 or port 8702 or port 8708 or port 8800 or port 38700 or port 38800)'`
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      render: text

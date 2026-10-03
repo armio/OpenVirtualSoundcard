@@ -1,0 +1,11 @@
+[package]
+name = "ovprobe-daemon"
+description = "Test LaunchDaemon that serves the sandbox probe plug-in"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+libc.workspace = true
+ovprobe-shim.workspace = true

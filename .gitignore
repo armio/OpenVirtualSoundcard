@@ -1,0 +1,11 @@
+/target
+/dist
+**/*.rs.bk
+*.wav
+/.ovsc-state
+/.claude/
+/tools/macos-probe/target
+/tools/macos-probe/build
+/tools/macos-probe/canary
+/tools/macos-probe/logs
+/tools/coreaudio-check/target

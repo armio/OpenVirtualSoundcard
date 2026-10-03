@@ -1,0 +1,53 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+exclude = ["tools"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/armio/OpenVirtualSoundcard"
+authors = ["OpenVirtualSoundcard contributors"]
+
+[workspace.dependencies]
+ovsc-proto = { path = "crates/ovsc-proto", version = "0.1.0" }
+ovsc-clock = { path = "crates/ovsc-clock", version = "0.1.0" }
+ovsc-core = { path = "crates/ovsc-core", version = "0.1.0" }
+ovsc-soundcard = { path = "crates/ovsc-soundcard", version = "0.1.0" }
+ovsc-shm = { path = "crates/ovsc-shm", version = "0.1.0" }
+ovsc-ipc = { path = "crates/ovsc-ipc", version = "0.1.0" }
+ovsc-hal = { path = "crates/ovsc-hal", version = "0.1.0" }
+ovsc-hal-server = { path = "crates/ovsc-hal-server", version = "0.1.0" }
+ovsc-control = { path = "crates/ovsc-control", version = "0.1.0" }
+
+anyhow = "1"
+arc-swap = "1"
+cc = "1"
+clap = { version = "4", features = ["derive", "env"] }
+cpal = "0.18"
+hex = "0.4"
+libc = "0.2"
+mach2 = "0.6"
+netdev = "0.36"
+thread-priority = "3"
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+socket2 = { version = "0.6", features = ["all"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal"] }
+toml = "0.9"
+toml_edit = "0.25"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+debug = 1

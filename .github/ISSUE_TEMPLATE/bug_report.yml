@@ -1,0 +1,44 @@
+name: Bug report
+description: Something does not work as described.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! For results with real Dante devices, the
+        "Interoperability report" template asks for what helps most.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Commit or version
+      placeholder: "git rev-parse --short HEAD"
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: "macOS 26.6 on an M1 MacBook Pro / Ubuntu 24.04"
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration
+      description: Your ovsc.toml, or the flags you ran with. Remove anything private.
+      render: toml
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        On macOS: `tail -n 200 /Library/Logs/OpenVirtualSoundcard/ovsc.log`.
+        Elsewhere: the output of `ovsc run --log debug`.
+      render: text

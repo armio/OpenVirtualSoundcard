@@ -1,0 +1,22 @@
+[package]
+name = "ovsc-soundcard"
+description = "OpenVirtualSoundcard sound-card bridge: plays network receive channels on, and captures transmit channels from, local audio devices with drift-compensating resampling"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ovsc-core.workspace = true
+ovsc-clock.workspace = true
+cpal.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+ovsc-proto.workspace = true
+
+[lints]
+workspace = true

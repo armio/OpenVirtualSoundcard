@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The OpenVirtualSoundcard daemon: the Dante network engine behind the Core Audio
+  driver. It owns the Mach service the driver connects to, so launchd must
+  start it, and it runs as root. Installed as
+  /Library/LaunchDaemons/org.openvirtualsoundcard.daemon.plist by install.sh or the
+  package. ProcessType Interactive keeps launchd from throttling it and
+  coalescing its timers. NO_COLOR keeps terminal colour codes out of the log.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>org.openvirtualsoundcard.daemon</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Library/Application Support/OpenVirtualSoundcard/bin/ovsc</string>
+		<string>run</string>
+		<string>--config</string>
+		<string>/Library/Application Support/OpenVirtualSoundcard/ovsc.toml</string>
+	</array>
+	<key>MachServices</key>
+	<dict>
+		<key>org.openvirtualsoundcard.audio</key>
+		<true/>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>5</integer>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>OVSC_LOG</key>
+		<string>info</string>
+		<key>NO_COLOR</key>
+		<string>1</string>
+	</dict>
+	<key>StandardOutPath</key>
+	<string>/Library/Logs/OpenVirtualSoundcard/ovsc.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Library/Logs/OpenVirtualSoundcard/ovsc.log</string>
+</dict>
+</plist>

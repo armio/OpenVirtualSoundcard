@@ -1,0 +1,13 @@
+[package]
+name = "ovprobe-shim"
+description = "XPC and Mach helpers shared by the sandbox probe plug-in and daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+libc.workspace = true
+
+[build-dependencies]
+cc.workspace = true

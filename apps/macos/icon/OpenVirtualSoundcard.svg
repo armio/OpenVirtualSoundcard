@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The OpenVirtualSoundcard app icon: level bars on a network link between two
+     nodes. Drawn on macOS's icon grid: a 824 px tile in a 1024 px canvas.
+     make-icon.sh renders it into OpenVirtualSoundcard.icns. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3346A8"/>
+      <stop offset="1" stop-color="#0E1538"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.16"/>
+      <stop offset="0.45" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="level" gradientUnits="userSpaceOnUse" x1="300" y1="0" x2="728" y2="0">
+      <stop offset="0" stop-color="#46DCFF"/>
+      <stop offset="1" stop-color="#4FF0A8"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#000000" flood-opacity="0.32"/>
+    </filter>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="18"/>
+    </filter>
+  </defs>
+
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#tile)" filter="url(#shadow)"/>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#sheen)"/>
+
+  <!-- The network link and its two nodes. -->
+  <line x1="214" y1="512" x2="810" y2="512" stroke="#9DB0FF" stroke-opacity="0.45"
+        stroke-width="18" stroke-linecap="round"/>
+  <circle cx="214" cy="512" r="40" fill="#E9EEFF"/>
+  <circle cx="810" cy="512" r="40" fill="#E9EEFF"/>
+
+  <!-- The level bars, with a soft glow behind them. -->
+  <g fill="url(#level)" opacity="0.55" filter="url(#glow)">
+    <rect x="300" y="411" width="60" height="202" rx="30"/>
+    <rect x="392" y="325" width="60" height="374" rx="30"/>
+    <rect x="484" y="272" width="60" height="480" rx="30"/>
+    <rect x="576" y="353" width="60" height="318" rx="30"/>
+    <rect x="668" y="426" width="60" height="172" rx="30"/>
+  </g>
+  <g fill="url(#level)">
+    <rect x="300" y="411" width="60" height="202" rx="30"/>
+    <rect x="392" y="325" width="60" height="374" rx="30"/>
+    <rect x="484" y="272" width="60" height="480" rx="30"/>
+    <rect x="576" y="353" width="60" height="318" rx="30"/>
+    <rect x="668" y="426" width="60" height="172" rx="30"/>
+  </g>
+</svg>

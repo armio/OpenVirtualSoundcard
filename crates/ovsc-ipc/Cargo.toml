@@ -1,0 +1,24 @@
+[package]
+name = "ovsc-ipc"
+description = "Protocol and transports (XPC on macOS, in-memory for tests) between the OpenVirtualSoundcard daemon and its macOS driver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ovsc-shm.workspace = true
+libc.workspace = true
+
+[build-dependencies]
+cc.workspace = true
+
+# Forks, so it must not run alongside the test harness's threads.
+[[test]]
+name = "cross_process"
+harness = false
+
+[lints]
+workspace = true
