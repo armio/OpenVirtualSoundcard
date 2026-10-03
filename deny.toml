@@ -5,11 +5,6 @@
 
 [advisories]
 version = 2
-ignore = [
-    # paste is unmaintained, not vulnerable: a compile-time macro that
-    # netdev's Linux netlink crates use.
-    { id = "RUSTSEC-2024-0436", reason = "unmaintained compile-time macro, via netdev" },
-]
 
 [licenses]
 version = 2
