@@ -29,8 +29,9 @@ package as an artifact of the run, without a release.
 ## Signing and notarization
 
 Without signing secrets the package is unsigned: it installs and works,
-but macOS warns that it cannot verify the developer, and users have to
-allow it in System Settings. To sign and notarize it, the project needs an
+but macOS warns that Apple could not verify it is free of malware, and
+users have to allow it in System Settings
+([MACOS.md](MACOS.md#installer-package)). To sign and notarize it, the project needs an
 Apple Developer Program membership and these repository secrets (Settings,
 Secrets and variables, Actions):
 

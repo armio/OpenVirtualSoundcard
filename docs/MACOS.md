@@ -101,9 +101,16 @@ open it. It installs everything `install.sh` does, the app and the
 third-party licence notices included, for Apple silicon and Intel Macs, and
 its postinstall script runs the same steps from the same `install-lib.sh`.
 
-A package that is not signed with a Developer ID makes macOS say it cannot
-verify the developer. Open it anyway from System Settings > Privacy &
-Security (**Open Anyway**, under Security), or install it from Terminal:
+A package that is not signed with a Developer ID makes macOS say *Apple
+could not verify "OpenVirtualSoundcard-&lt;version&gt;.pkg" is free of
+malware*. To install it anyway:
+
+1. Click **Done**, not Move to Trash.
+2. Open System Settings > Privacy & Security. Under Security, it says the
+   package was blocked: click **Open Anyway** (shown for about an hour
+   after the attempt), confirm with your password, then click **Open**.
+
+Or install it from Terminal, which skips the check:
 
 ```sh
 sudo installer -pkg ~/Downloads/OpenVirtualSoundcard-<version>.pkg -target /
