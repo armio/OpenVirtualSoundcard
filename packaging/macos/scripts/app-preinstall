@@ -1,0 +1,27 @@
+#!/bin/bash
+# Preinstall of the app's component package (build-pkg.sh installs it as
+# "preinstall"): deletes the installed OpenVirtualSoundcard app, so that
+# Installer lays down a new bundle instead of writing into the old one.
+# Once an app signed with a Developer ID has been opened, macOS 13 and later
+# (App Management) let only packages signed by the same team write into
+# it, which a package built without INSTALLER_IDENTITY is not; deleting the
+# whole bundle is allowed. A different app at that path never gets here:
+# the distribution's installation check refuses it. Installer passes the
+# target volume as $3; the package installs on the startup disk only
+# (distribution.xml).
+set -u
+[ "${3:-/}" = / ] || exit 0
+HERE=$(cd "$(dirname "$0")" && pwd)
+# build-pkg.sh puts install-lib.sh next to this script.
+# shellcheck source=SCRIPTDIR/../install-lib.sh
+. "$HERE/install-lib.sh"
+
+if [ -e "$OV_APP" ]; then
+    if ov_is_our_app "$OV_APP"; then
+        ov_log "removing the installed $OV_APP"
+        rm -rf "$OV_APP" || ov_warn "could not remove $OV_APP"
+    else
+        ov_warn "$OV_APP is not the OpenVirtualSoundcard app ($OV_APP_ID); leaving it alone"
+    fi
+fi
+exit 0

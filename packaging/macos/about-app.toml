@@ -1,0 +1,50 @@
+# What only the app's licence notices need, added to about.toml by
+# third-party-licenses.sh (cargo-about warns about settings for crates that
+# are not in the graph it reads, and only the app has these). The checksums
+# make a new version of these crates fail the notices until it is checked
+# again.
+
+# egui's built-in fonts, compiled into the app. The crate's licence field
+# leaves out the notices of two of them: Hack (MIT, and the Bitstream Vera
+# licence it inherits) and emoji-icon-font (MIT). deny.toml allows the font
+# licences for this crate only.
+[epaint_default_fonts]
+accepted = ["OFL-1.1", "Ubuntu-font-1.0", "Bitstream-Vera"]
+
+[epaint_default_fonts.clarify]
+license = "(MIT OR Apache-2.0) AND OFL-1.1 AND Ubuntu-font-1.0 AND MIT AND Bitstream-Vera"
+
+[[epaint_default_fonts.clarify.files]]
+path = "fonts/OFL.txt"
+license = "OFL-1.1"
+checksum = "6a73f9541c2de74158c0e7cf6b0a58ef774f5a780bf191f2d7ec9cc53efe2bf2"
+
+[[epaint_default_fonts.clarify.files]]
+path = "fonts/UFL.txt"
+license = "Ubuntu-font-1.0"
+checksum = "2f0015108d68627bd788d313f529c21ff4da2c2c42a5e1f3883acc83480f9002"
+
+[[epaint_default_fonts.clarify.files]]
+path = "fonts/Hack-Regular.txt"
+license = "Bitstream-Vera"
+checksum = "47c0cccbeec7e8614548cc485588b28149e7874188df5f41b36efebcee285c87"
+
+[[epaint_default_fonts.clarify.files]]
+path = "fonts/emoji-icon-font-mit-license.txt"
+license = "MIT"
+checksum = "b9d2c1d909aa149996fd4c91dcb92b2362a04431640c1d200959da94caf8cde1"
+
+# winit's dpi crate carries part of libm under its own MIT notice, which
+# its licence field does not point to.
+[dpi.clarify]
+license = "Apache-2.0 AND MIT"
+
+[[dpi.clarify.files]]
+path = "LICENSE"
+license = "Apache-2.0"
+checksum = "6dc0e068dcf3a5bc8e054205b85b7720e1d49265bbc64bf515d2cf79197df69a"
+
+[[dpi.clarify.files]]
+path = "LICENSE-LIBM-MIT"
+license = "MIT"
+checksum = "9eff396a99bafd208e7126602420d6864f6066c08b84485a5b032320a9c01997"
