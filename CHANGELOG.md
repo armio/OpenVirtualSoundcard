@@ -23,6 +23,9 @@ The first public version, not released yet.
   package, removed with `uninstall.sh`.
 - macOS: the OpenVirtualSoundcard app, for status and settings over the
   daemon's control socket.
+- macOS: an installer package for Apple silicon and Intel Macs, with the
+  app and the third-party licence notices, built by the release workflow
+  for each tag (signed and notarized once the signing secrets are set).
 - Settings from Dante Controller: device and channel names, subscriptions,
   latency, sample rate and encoding.
 - Monitoring in Dante Controller: clock state, signal meters, receive

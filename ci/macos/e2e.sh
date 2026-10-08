@@ -4,7 +4,7 @@
 # your own Mac, run it through ci/macos/e2e-local.sh.
 #
 # It builds everything, starts a development PTP master on 127.0.0.1 at
-# +50 ppm, installs the daemon and the driver with packaging/macos/install.sh
+# +50 ppm, installs the daemon, the driver and the app with packaging/macos/install.sh
 # using ci/macos/e2e.toml (a device whose receive channels are subscribed to
 # its own transmit channels), and then runs scenarios S1-S11 against the
 # Core Audio device with tools/coreaudio-check.
@@ -125,6 +125,7 @@ setup() {
     group "Setup: build"
     cargo build --release --locked -p ovsc -p ovsc-hal --bins || return 1
     packaging/macos/build-driver.sh || return 1
+    packaging/macos/build-app.sh || return 1
     (cd tools/coreaudio-check && cargo build --release) || return 1
     "$CHECK" list
     endgroup
@@ -320,13 +321,45 @@ s10() {
 }
 
 s11() {
-    packaging/macos/build-pkg.sh || return 1
-    local pkgs=(dist/OpenVirtualSoundcard-*.pkg) pkg
-    pkg=${pkgs[${#pkgs[@]}-1]}
+    # A package of this run's builds only, in a directory of its own, so
+    # nothing older in target/macos or dist gets in: the app built in setup,
+    # and licence notices made here (a stand-in without cargo-about).
+    local out=$WORK/pkg notices=$WORK/notices/THIRD-PARTY-LICENSES.html pkgs pkg before after p id
+    rm -rf "$out" "${notices%/*}"
+    if command -v cargo-about >/dev/null; then
+        OUT="${notices%/*}" packaging/macos/third-party-licenses.sh || return 1
+    else
+        mkdir -p "${notices%/*}"
+        echo "<p>A stand-in for the licence notices: no cargo-about here.</p>" >"$notices"
+    fi
+    APP="$ROOT/target/macos/OpenVirtualSoundcard.app" NOTICES="$notices" OUT="$out" \
+        packaging/macos/build-pkg.sh || return 1
+    pkgs=("$out"/OpenVirtualSoundcard-*.pkg)
+    if [ ${#pkgs[@]} -ne 1 ] || [ ! -f "${pkgs[0]}" ]; then
+        echo "expected one package in $out: ${pkgs[*]}"
+        return 1
+    fi
+    pkg=${pkgs[0]}
     echo "package: $pkg"
+    # The package installs over the app install.sh put there in setup, and
+    # must leave /Applications itself as it was. The system's stat: GNU
+    # stat, first in some PATHs, reads -f differently.
+    before=$(/usr/bin/stat -f '%Sp %Su:%Sg' /Applications)
     sudo installer -pkg "$pkg" -target / || return 1
     limit 70 "$CHECK" wait "$DEV" 60 || return 1
+    after=$(/usr/bin/stat -f '%Sp %Su:%Sg' /Applications)
+    if [ "$after" != "$before" ]; then
+        echo "the package changed /Applications from $before to $after"
+        return 1
+    fi
+    for p in /Applications/OpenVirtualSoundcard.app/Contents/MacOS/OpenVirtualSoundcard \
+        /Applications/OpenVirtualSoundcard.app/Contents/Resources/THIRD-PARTY-LICENSES.html \
+        "$APP_SUPPORT/THIRD-PARTY-LICENSES.html"; do
+        [ -f "$p" ] || { echo "the package did not install $p"; return 1; }
+    done
+    codesign --verify --strict /Applications/OpenVirtualSoundcard.app || return 1
     pkgutil --files org.openvirtualsoundcard.pkg 2>/dev/null | head -40
+    pkgutil --files org.openvirtualsoundcard.app.pkg 2>/dev/null | head -5
     # --purge removes the daemon's log; keep it for diagnostics.sh.
     sudo cp "$LOG" "$WORK/ovsc.log" 2>/dev/null
     sudo "$APP_SUPPORT/uninstall.sh" --purge || return 1
@@ -335,14 +368,21 @@ s11() {
         echo "the device is still there after uninstall"
         return 1
     fi
-    if pkgutil --pkgs | grep -q '^org.openvirtualsoundcard.pkg$'; then
-        echo "pkgutil still knows org.openvirtualsoundcard.pkg"
-        return 1
-    fi
-    local p
-    for p in "$PLIST" /Library/Audio/Plug-Ins/HAL/OpenVirtualSoundcard.driver "$APP_SUPPORT"; do
+    for id in org.openvirtualsoundcard.pkg org.openvirtualsoundcard.app.pkg; do
+        if pkgutil --pkgs | grep -qxF "$id"; then
+            echo "pkgutil still knows $id"
+            return 1
+        fi
+    done
+    for p in "$PLIST" /Library/Audio/Plug-Ins/HAL/OpenVirtualSoundcard.driver \
+        /Applications/OpenVirtualSoundcard.app "$APP_SUPPORT"; do
         [ -e "$p" ] && { echo "left behind: $p"; return 1; }
     done
+    after=$(/usr/bin/stat -f '%Sp %Su:%Sg' /Applications)
+    if [ "$after" != "$before" ]; then
+        echo "uninstalling changed /Applications from $before to $after"
+        return 1
+    fi
     return 0
 }
 

@@ -42,8 +42,8 @@ cat <<EOF
 This test changes your Mac while it runs (about 10 to 15 minutes, more the
 first time while it builds):
 
-  * it installs the OpenVirtualSoundcard driver and daemon with sudo, using a test
-    configuration that talks only to this Mac (127.0.0.1);
+  * it installs the OpenVirtualSoundcard driver, daemon and app with sudo, using a
+    test configuration that talks only to this Mac (127.0.0.1);
   * it restarts Core Audio several times: all sound stops for a few seconds
     each time, so quit your DAW, music, video and calls first;
   * it runs a test PTP clock master on 127.0.0.1;

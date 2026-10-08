@@ -1,7 +1,7 @@
 #!/bin/bash
 # Removes OpenVirtualSoundcard from this Mac: the daemon and its launchd job, the Core
 # Audio driver, the OpenVirtualSoundcard app, the command-line link, the log rotation
-# rule and the package receipt. It then restarts Core Audio, so that the OpenVirtualSoundcard device goes
+# rule, the licence notices and the package receipts. It then restarts Core Audio, so that the OpenVirtualSoundcard device goes
 # away. The configuration, the remembered state and the logs stay, for a
 # later install, unless --purge is given.
 #
@@ -18,6 +18,7 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin${PATH:+:$PATH}
 
 LABEL=org.openvirtualsoundcard.daemon
 PKG_ID=org.openvirtualsoundcard.pkg
+APP_PKG_ID=org.openvirtualsoundcard.app.pkg
 DRIVER=/Library/Audio/Plug-Ins/HAL/OpenVirtualSoundcard.driver
 SUPPORT="/Library/Application Support/OpenVirtualSoundcard"
 BIN="$SUPPORT/bin/ovsc"
@@ -119,16 +120,19 @@ main() {
     if [ "$purge" = 1 ]; then
         remove "$SUPPORT" "$LOG_DIR"
     else
-        remove "$SUPPORT/bin" "$SUPPORT/uninstall.sh"
+        remove "$SUPPORT/bin" "$SUPPORT/uninstall.sh" "$SUPPORT/THIRD-PARTY-LICENSES.html"
         if rmdir "$SUPPORT" 2>/dev/null; then
             log "removed the empty $SUPPORT"
         elif [ -d "$SUPPORT" ]; then
             log "keeping the configuration in $SUPPORT and the logs in $LOG_DIR"
         fi
     fi
-    if pkgutil --pkg-info "$PKG_ID" >/dev/null 2>&1; then
-        pkgutil --forget "$PKG_ID" >/dev/null || { warn "pkgutil --forget $PKG_ID failed"; FAILED=1; }
-    fi
+    local id
+    for id in "$PKG_ID" "$APP_PKG_ID"; do
+        if pkgutil --pkg-info "$id" >/dev/null 2>&1; then
+            pkgutil --forget "$id" >/dev/null || { warn "pkgutil --forget $id failed"; FAILED=1; }
+        fi
+    done
     restart_coreaudiod
     if [ "$FAILED" = 1 ]; then
         echo "uninstall.sh: finished with errors" >&2

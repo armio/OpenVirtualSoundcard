@@ -1,9 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   The OpenVirtualSoundcard installer (productbuild, build-pkg.sh): one hidden choice
-  holding the component package org.openvirtualsoundcard.pkg, installed on the startup
-  disk only. build-pkg.sh fills in @VERSION@, and narrows hostArchitectures
-  for a package built for one architecture.
+  holding the component packages org.openvirtualsoundcard.pkg and, after it,
+  org.openvirtualsoundcard.app.pkg (the app, in /Applications), installed on the startup
+  disk only. build-pkg.sh fills in @VERSION@, narrows hostArchitectures for a
+  package built for one architecture, and deletes the lines naming the app's
+  component, and the installation check, when it packages no app.
+
+  The installation check refuses to install over a different app named
+  OpenVirtualSoundcard.app: Installer would put ours in
+  /Applications/OpenVirtualSoundcard.localized instead, whatever the
+  preinstall does, and uninstall.sh would not find it there.
 -->
 <installer-gui-script minSpecVersion="2">
     <title>OpenVirtualSoundcard</title>
@@ -13,6 +20,23 @@
     </allowed-os-versions>
     <options customize="never" require-scripts="false" hostArchitectures="arm64,x86_64"/>
     <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+    <installation-check script="ovscAppPathIsFree()"/>
+    <script><![CDATA[
+function ovscAppPathIsFree() {
+    var path = '/Applications/OpenVirtualSoundcard.app';
+    if (!system.files.fileExistsAtPath(path)) {
+        return true;
+    }
+    var bundle = system.files.bundleAtPath(path);
+    if (bundle && bundle.CFBundleIdentifier == 'org.openvirtualsoundcard.app') {
+        return true;
+    }
+    my.result.type = 'Fatal';
+    my.result.title = 'Another app is in the way';
+    my.result.message = path + ' is not the OpenVirtualSoundcard app. Move or rename it, then install again.';
+    return false;
+}
+]]></script>
     <choices-outline>
         <line choice="default">
             <line choice="org.openvirtualsoundcard.pkg"/>
@@ -21,6 +45,8 @@
     <choice id="default"/>
     <choice id="org.openvirtualsoundcard.pkg" visible="false">
         <pkg-ref id="org.openvirtualsoundcard.pkg"/>
+        <pkg-ref id="org.openvirtualsoundcard.app.pkg"/>
     </choice>
     <pkg-ref id="org.openvirtualsoundcard.pkg" version="@VERSION@" onConclusion="none">OpenVirtualSoundcard-component.pkg</pkg-ref>
+    <pkg-ref id="org.openvirtualsoundcard.app.pkg" version="@VERSION@" onConclusion="none">OpenVirtualSoundcard-app.pkg</pkg-ref>
 </installer-gui-script>
