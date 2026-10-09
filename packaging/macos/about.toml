@@ -1,5 +1,7 @@
 # cargo-about's settings for the licence notices shipped with the macOS
-# package (third-party-licenses.sh). The accepted licences match deny.toml.
+# package (third-party-licenses.sh). The accepted licences are deny.toml's.
+# The app's notices also use about-app.toml, which holds what only the app
+# needs, such as deny.toml's exception for the app's fonts.
 accepted = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
@@ -9,8 +11,6 @@ accepted = [
     "GPL-3.0-or-later",
     "ISC",
     "MIT",
-    "OFL-1.1",
-    "Ubuntu-font-1.0",
     "Unicode-3.0",
     "Unlicense",
     "Zlib",

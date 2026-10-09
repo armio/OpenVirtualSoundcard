@@ -42,7 +42,7 @@ macOS follow-ups:
 
 - ⏳ Run the daemon as a dedicated `_ovsc` user instead of root
 - ✅ Kernel receive timestamps for PTP (`SO_TIMESTAMP_MONOTONIC`): user-space timestamps made the clock step by 2 to 3 ms on a real network
-- 🧪 The OpenVirtualSoundcard app (`apps/macos`, egui) and the daemon's control socket: status, settings and latency. Still to do: put it in the installer package, and run it in CI
+- 🧪 The OpenVirtualSoundcard app (`apps/macos`, egui) and the daemon's control socket: status, settings and latency; the installer package puts it in /Applications. Still to do: run it in CI (CI builds and unit-tests it, and the end-to-end test installs it, but nothing launches it)
 - ⏳ Sleep and wake, not handled or tested yet: `CLOCK_UPTIME_RAW`, the host clock both sides use, stops while the Mac sleeps. Today the daemon only holds an idle-sleep assertion while the engine runs (`prevent_idle_sleep`)
 - ⏳ Report a clock domain derived from the PTP grandmaster (Core Audio treats devices with the same nonzero domain as synchronized; it is 0, unspecified, today)
 - ⏳ Sample-rate and channel changes from Dante Controller, applied without restarting the daemon (today: edit the configuration and restart it)

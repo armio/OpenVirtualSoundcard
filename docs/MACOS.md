@@ -100,10 +100,22 @@ Releases come with an installer package: download
 open it. It installs everything `install.sh` does, the app and the
 third-party licence notices included, for Apple silicon and Intel Macs, and
 its postinstall script runs the same steps from the same `install-lib.sh`.
+The app is a component package of its own, `org.openvirtualsoundcard.app.pkg`,
+installed in `/Applications`; before laying it down, the package deletes
+the app that is there, if it is OpenVirtualSoundcard's. If a different app
+named `OpenVirtualSoundcard.app` is there, the package refuses to install
+until it is moved or renamed.
 
-A package that is not signed with a Developer ID makes macOS say it cannot
-verify the developer. Open it anyway from System Settings > Privacy &
-Security (**Open Anyway**, under Security), or install it from Terminal:
+A package that is not signed with a Developer ID makes macOS say *Apple
+could not verify "OpenVirtualSoundcard-&lt;version&gt;.pkg" is free of
+malware*. To install it anyway:
+
+1. Click **Done**, not Move to Trash.
+2. Open System Settings > Privacy & Security. Under Security, it says the
+   package was blocked: click **Open Anyway** (shown for about an hour
+   after the attempt), confirm with your password, then click **Open**.
+
+Or install it from Terminal, which skips the check:
 
 ```sh
 sudo installer -pkg ~/Downloads/OpenVirtualSoundcard-<version>.pkg -target /
@@ -113,9 +125,13 @@ sudo installer -pkg ~/Downloads/OpenVirtualSoundcard-<version>.pkg -target /
 
 | Command | Builds |
 |---|---|
-| `packaging/macos/build-pkg.sh` | a package of what is already built: the driver and the daemon, plus the app and the notices when `build-app.sh` and `third-party-licenses.sh` made them |
+| `packaging/macos/build-pkg.sh` | a package of what is already built: the driver and the daemon, plus the app and the notices when `build-app.sh` and `third-party-licenses.sh` made them (or `APP` and `NOTICES` name them) |
 | `BUILD=1 packaging/macos/build-pkg.sh` | everything first, for this Mac's architecture |
-| `BUILD=1 UNIVERSAL=1 packaging/macos/build-pkg.sh` | everything for arm64 and x86_64, as releases do (first `rustup target add aarch64-apple-darwin x86_64-apple-darwin` and `cargo install cargo-about --locked --features cli`) |
+| `BUILD=1 UNIVERSAL=1 packaging/macos/build-pkg.sh` | everything for arm64 and x86_64, as releases do (first `rustup target add aarch64-apple-darwin x86_64-apple-darwin`) |
+
+Both `BUILD=1` forms also write the licence notices, which needs
+[cargo-about](https://github.com/EmbarkStudios/cargo-about): first
+`cargo install cargo-about --locked --features cli`.
 
 It writes `dist/OpenVirtualSoundcard-<version>.pkg` (with `-<arch>` for a
 single architecture), names it on its last line (`built <path> ...`), and
@@ -562,8 +578,10 @@ sudo "/Library/Application Support/OpenVirtualSoundcard/uninstall.sh"
 ```
 
 It stops the daemon, removes the launchd job, the driver, the daemon, the
-`/usr/local/bin/ovsc` link, the log rotation rule, the firewall entry and
-the package receipt, then restarts `coreaudiod` so that the device goes away.
+OpenVirtualSoundcard app in `/Applications` (only if its bundle identifier is
+`org.openvirtualsoundcard.app`), the `/usr/local/bin/ovsc` link, the log
+rotation rule, the firewall entry, the licence notices and the package
+receipts, then restarts `coreaudiod` so that the device goes away.
 The configuration, the state and the logs stay for a later install; add
 `--purge` to remove them too.
 
@@ -665,8 +683,10 @@ but S6, whose failure was in the test client. On GitHub's runners, which run
 with SIP disabled, it loads too; `amfid` logs
 `AppleMobileFileIntegrityError -423 ("adhoc signed")`, but that does not stop
 it ([`tools/macos-probe/README.md`](../tools/macos-probe/README.md#results)).
-Packages for download need a Developer ID and notarization ([Installer
-package](#installer-package)), since a downloaded file is quarantined.
+A downloaded package is quarantined: unless it is signed with a Developer ID
+and notarized, users have to allow it with **Open Anyway** in System
+Settings, or install it with `sudo installer` ([Installer
+package](#installer-package)).
 
 ## Architecture
 
@@ -932,7 +952,7 @@ and the device is always selected by its UID.
 | S8 | Channel change | Install `e2e-4ch.toml` and restart the daemon: 4 × 4 within 30 s without a `coreaudiod` restart; 5 s loopback (480 frames may be lost to stalls). |
 | S9 | Rate change | Install `e2e-96k.toml` and restart the daemon: `wait-rate org.openvirtualsoundcard.vsc 96000 30`; once `ppm` has stayed within 2 of +50 for 8 s, a 5 s loopback at +50 ± 3 ppm (960 frames may be lost to stalls); then back to 48 kHz. |
 | S10 | Daemon absent | Once `ppm` has stayed within 2 of +50 for 8 s, `sudo launchctl bootout system/org.openvirtualsoundcard.daemon`: the device stays alive, a 10 s loopback reads exact silence at +50 ± 5 ppm (holdover); after `launchctl bootstrap` it attaches within 30 s and a 5 s loopback passes (480 frames may be lost to stalls). |
-| S11 | Package and uninstall | `build-pkg.sh`; `sudo installer -pkg <package> -target /` over the install; the device is present; `uninstall.sh --purge` removes it and the package receipt, and leaves no launchd job file, driver bundle or `/Library/Application Support/OpenVirtualSoundcard`. |
+| S11 | Package and uninstall | `build-pkg.sh` packages this run's build, the app included, with licence notices (a stand-in without cargo-about), into its own directory; `sudo installer -pkg <package> -target /` over the install; the device, the app and the notices are present, and `/Applications` keeps its owner and mode; `uninstall.sh --purge` removes it and both package receipts, and leaves no launchd job file, driver bundle, `/Applications/OpenVirtualSoundcard.app` or `/Library/Application Support/OpenVirtualSoundcard`. |
 
 The GitHub macOS runners are small VMs whose scheduling stalls sometimes
 outlast the 4 ms network latency or a Core Audio cycle; the daemon then logs
@@ -967,8 +987,10 @@ It says what it will change and asks before going ahead (`--yes` skips the
 question), then asks for your password once and keeps `sudo` fresh while
 `e2e.sh` runs. While it runs:
 
-* it installs the driver and the daemon with the test configuration, which
-  talks only to this Mac (127.0.0.1), and a test PTP master on 127.0.0.1;
+* it installs the driver, the daemon and the app with the test
+  configuration, which talks only to this Mac (127.0.0.1), and a test PTP
+  master on 127.0.0.1; an OpenVirtualSoundcard app already in `/Applications`
+  is replaced by this build;
 * Core Audio restarts several times, and all sound stops for a few seconds
   each time;
 * the first time, macOS asks whether your terminal app may use the
@@ -976,7 +998,7 @@ question), then asks for your password once and keeps `sudo` fresh while
   the loopback scenarios fail with `every input channel was silent`. If you
   missed the question, turn it on in System Settings > Privacy & Security >
   Microphone and run again;
-* S11 ends by uninstalling OpenVirtualSoundcard with `--purge`. If OpenVirtualSoundcard was
+* S11 ends by uninstalling OpenVirtualSoundcard, the app included, with `--purge`. If OpenVirtualSoundcard was
   installed before, its configuration is copied to
   `target/e2e/ovsc.toml.before` first.
 
