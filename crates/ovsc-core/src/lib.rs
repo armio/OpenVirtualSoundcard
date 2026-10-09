@@ -30,8 +30,8 @@ mod tx;
 
 pub use config::{Channels, DeviceConfig, InitialSubscription, Ports};
 pub use device::{
-    AudioIo, Device, DeviceObserver, DeviceStats, ExternalRings, RxChannelStatus, StartOptions,
-    TxFlowStatus,
+    AudioIo, Device, DeviceObserver, DeviceStats, ExternalRings, ReceiveOverride, RxChannelStatus,
+    StartOptions, TransmitOverride, TxFlowStatus,
 };
 pub use info::DeviceInfo;
 pub use persist::SavedState;

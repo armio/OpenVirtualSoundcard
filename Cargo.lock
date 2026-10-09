@@ -815,6 +815,7 @@ dependencies = [
 name = "ovsc-core"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "hex",
  "libc",
  "mach2",

@@ -4,6 +4,7 @@ mod backend;
 mod config;
 mod control;
 mod coreaudio;
+mod playback;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;

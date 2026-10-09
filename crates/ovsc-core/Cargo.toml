@@ -13,6 +13,7 @@ ovsc-proto.workspace = true
 ovsc-shm.workspace = true
 ovsc-clock.workspace = true
 hex.workspace = true
+arc-swap.workspace = true
 netdev.workspace = true
 thread-priority.workspace = true
 rand.workspace = true
