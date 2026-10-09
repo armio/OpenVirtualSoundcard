@@ -10,7 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ovsc_control::{
-    Client, InterfaceInfo, Request, Response, Restart, Settings, SettingsChange, Status,
+    Client, InterfaceInfo, PlaybackStatus, RecordingStatus, Request, Response, Restart, Settings,
+    SettingsChange, Status,
 };
 
 use crate::logic::Problem;
@@ -24,6 +25,8 @@ pub enum Command {
     /// Read the settings and the interfaces again.
     Reload,
     Apply(SettingsChange),
+    Recording(Request),
+    Playback(Request),
 }
 
 /// What the worker learned.
@@ -37,6 +40,10 @@ pub enum Event {
     Interfaces(Vec<InterfaceInfo>),
     /// The answer to [`Command::Apply`]: what restarts, or why it failed.
     Applied(Result<Restart, String>),
+    Recording(RecordingStatus),
+    Recorded(Result<RecordingStatus, String>),
+    Playback(PlaybackStatus),
+    Played(Result<PlaybackStatus, String>),
 }
 
 /// The UI's end of the worker. The thread ends when this is dropped.
@@ -58,6 +65,8 @@ impl Worker {
             wake: Box::new(wake),
             status: None,
             problem: None,
+            recording: None,
+            playback: None,
         };
         thread::Builder::new()
             .name("control".into())
@@ -108,6 +117,8 @@ struct Link {
     status: Option<Box<Status>>,
     /// The last problem sent, to skip repeats.
     problem: Option<Problem>,
+    recording: Option<RecordingStatus>,
+    playback: Option<PlaybackStatus>,
 }
 
 impl Link {
@@ -139,6 +150,10 @@ impl Link {
         let mut next = Instant::now() + POLL;
         loop {
             match self.commands.recv_timeout(next.saturating_duration_since(Instant::now())) {
+                Ok(Command::Playback(request)) if usable => self.playback(client, request)?,
+                Ok(Command::Playback(_)) => self.send(Event::Played(Err(self.not_usable()))),
+                Ok(Command::Recording(request)) if usable => self.record(client, request)?,
+                Ok(Command::Recording(_)) => self.send(Event::Recorded(Err(self.not_usable()))),
                 Ok(Command::Reload) if usable => self.reload(client)?,
                 Ok(Command::Reload) => {}
                 Ok(Command::Apply(change)) if usable => self.apply(client, change)?,
@@ -163,6 +178,24 @@ impl Link {
             Response::Status(status) => match Problem::check(&status) {
                 None => {
                     self.status(status);
+                    match client.request(&Request::RecordingStatus)? {
+                        Response::Recording(status) => {
+                            if self.recording.as_ref() != Some(&status) {
+                                self.recording = Some(status.clone());
+                                self.send(Event::Recording(status));
+                            }
+                        }
+                        other => return Err(unexpected(&other)),
+                    }
+                    match client.request(&Request::PlaybackStatus)? {
+                        Response::Playback(status) => {
+                            if self.playback.as_ref() != Some(&status) {
+                                self.playback = Some(status.clone());
+                                self.send(Event::Playback(status));
+                            }
+                        }
+                        other => return Err(unexpected(&other)),
+                    }
                     Ok(true)
                 }
                 Some(problem) => {
@@ -190,6 +223,46 @@ impl Link {
         Ok(())
     }
 
+    fn record(&mut self, client: &mut Client, request: Request) -> Result<(), End> {
+        match client.request(&request) {
+            Ok(Response::Recording(status)) => self.send(Event::Recorded(Ok(status))),
+            Ok(Response::Error { message }) => self.send(Event::Recorded(Err(message))),
+            Ok(other) => {
+                self.send(Event::Recorded(Err("Unexpected recording response.".into())));
+                return Err(unexpected(&other));
+            }
+            Err(e) => {
+                self.send(Event::Recorded(Err(format!(
+                    "{} Check the recording status after reconnecting.",
+                    Problem::from_io(&e).message()
+                ))));
+                return Err(e.into());
+            }
+        }
+        self.poll(client)?;
+        Ok(())
+    }
+
+    fn playback(&mut self, client: &mut Client, request: Request) -> Result<(), End> {
+        match client.request(&request) {
+            Ok(Response::Playback(status)) => self.send(Event::Played(Ok(status))),
+            Ok(Response::Error { message }) => self.send(Event::Played(Err(message))),
+            Ok(other) => {
+                self.send(Event::Played(Err("Unexpected playback response.".into())));
+                return Err(unexpected(&other));
+            }
+            Err(e) => {
+                self.send(Event::Played(Err(format!(
+                    "{} Check playback status after reconnecting.",
+                    Problem::from_io(&e).message()
+                ))));
+                return Err(e.into());
+            }
+        }
+        self.poll(client)?;
+        Ok(())
+    }
+
     fn apply(&mut self, client: &mut Client, change: SettingsChange) -> Result<(), End> {
         match client.request(&Request::Apply { change }) {
             Ok(Response::Applied { restart }) => {
@@ -205,7 +278,9 @@ impl Link {
                 Ok(())
             }
             Ok(other) => {
-                self.applied(Err("OpenVirtualSoundcard gave an answer this app does not understand.".into()));
+                self.applied(Err(
+                    "OpenVirtualSoundcard gave an answer this app does not understand.".into(),
+                ));
                 Err(unexpected(&other))
             }
             Err(e) => {
@@ -225,6 +300,8 @@ impl Link {
         loop {
             match self.commands.recv_timeout(until.saturating_duration_since(Instant::now())) {
                 Ok(Command::Apply(_)) => self.applied(Err(self.not_usable())),
+                Ok(Command::Recording(_)) => self.send(Event::Recorded(Err(self.not_usable()))),
+                Ok(Command::Playback(_)) => self.send(Event::Played(Err(self.not_usable()))),
                 Ok(Command::Reload) => {}
                 Err(RecvTimeoutError::Timeout) => return true,
                 Err(RecvTimeoutError::Disconnected) => return false,
@@ -249,6 +326,8 @@ impl Link {
 
     fn problem(&mut self, problem: Problem) {
         self.status = None;
+        self.recording = None;
+        self.playback = None;
         if self.problem.as_ref() != Some(&problem) {
             self.problem = Some(problem.clone());
             self.send(Event::Problem(problem));
@@ -344,6 +423,27 @@ mod tests {
                         Request::Settings => Response::Settings(settings()),
                         Request::Interfaces => Response::Interfaces { interfaces: vec![] },
                         Request::Apply { .. } => applied.clone(),
+                        Request::StartRecording { .. }
+                            if matches!(applied, Response::Error { .. }) =>
+                        {
+                            applied.clone()
+                        }
+                        Request::RecordingStatus
+                        | Request::StartRecording { .. }
+                        | Request::StopRecording
+                        | Request::AddMarker { .. } => {
+                            Response::Recording(RecordingStatus::default())
+                        }
+                        Request::PlaybackStatus
+                        | Request::OpenPlayback { .. }
+                        | Request::Play
+                        | Request::Pause
+                        | Request::StopPlayback
+                        | Request::UnloadPlayback
+                        | Request::SeekPlayback { .. }
+                        | Request::ConfigurePlayback { .. } => {
+                            Response::Playback(PlaybackStatus::default())
+                        }
                     };
                     log.lock().unwrap().push(request);
                     if writer.write_all(encode_line(&response).as_bytes()).is_err() {
@@ -364,18 +464,83 @@ mod tests {
             counter.fetch_add(1, Ordering::SeqCst);
         });
         assert!(matches!(worker.next(), Event::Status(s) if *s == status(PROTOCOL_VERSION)));
+        assert!(matches!(worker.next(), Event::Recording(_)));
+        assert!(matches!(worker.next(), Event::Playback(_)));
         assert!(matches!(worker.next(), Event::Settings(s) if s == settings()));
         assert!(matches!(worker.next(), Event::Interfaces(i) if i.is_empty()));
         // The worker wakes the UI just after queueing each event.
         let deadline = Instant::now() + Duration::from_secs(1);
-        while wakes.load(Ordering::SeqCst) < 3 && Instant::now() < deadline {
+        while wakes.load(Ordering::SeqCst) < 5 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(wakes.load(Ordering::SeqCst), 3);
+        assert_eq!(wakes.load(Ordering::SeqCst), 5);
         // An unchanged status is not sent again.
         thread::sleep(POLL * 2);
         assert!(worker.events().next().is_none());
-        assert_eq!(wakes.load(Ordering::SeqCst), 3);
+        assert_eq!(wakes.load(Ordering::SeqCst), 5);
+    }
+
+    #[test]
+    fn recording_commands_return_status() {
+        let (path, seen) =
+            daemon("record", PROTOCOL_VERSION, Response::Applied { restart: Restart::None });
+        let worker = Worker::start(path, || {});
+        for _ in 0..5 {
+            worker.next();
+        }
+        let request = Request::StartRecording { path: "/tmp/take.wav".into() };
+        worker.send(Command::Recording(request.clone()));
+        assert!(matches!(worker.next(), Event::Recorded(Ok(_))));
+        worker.send(Command::Recording(Request::StopRecording));
+        assert!(matches!(worker.next(), Event::Recorded(Ok(_))));
+        assert!(seen.lock().unwrap().contains(&request));
+        assert!(seen.lock().unwrap().contains(&Request::StopRecording));
+    }
+
+    #[test]
+    fn recording_errors_are_reported_without_losing_the_connection() {
+        let (path, _) = daemon(
+            "record-error",
+            PROTOCOL_VERSION,
+            Response::Error { message: "file exists".into() },
+        );
+        let worker = Worker::start(path, || {});
+        for _ in 0..5 {
+            worker.next();
+        }
+        worker.send(Command::Recording(Request::StartRecording { path: "/tmp/take.wav".into() }));
+        assert!(matches!(worker.next(), Event::Recorded(Err(m)) if m == "file exists"));
+        worker.send(Command::Reload);
+        assert!(matches!(worker.next(), Event::Settings(_)));
+    }
+
+    #[test]
+    fn markers_and_playback_commands_reach_the_daemon() {
+        let (path, seen) =
+            daemon("soundcheck", PROTOCOL_VERSION, Response::Applied { restart: Restart::None });
+        let worker = Worker::start(path, || {});
+        for _ in 0..5 {
+            worker.next();
+        }
+        worker.send(Command::Recording(Request::AddMarker { label: "Verse".into() }));
+        assert!(matches!(worker.next(), Event::Recorded(Ok(_))));
+        let open = Request::OpenPlayback {
+            path: "/tmp/take.wav".into(),
+            target: ovsc_control::PlaybackTarget::Receive,
+        };
+        for request in [
+            open.clone(),
+            Request::Play,
+            Request::Pause,
+            Request::SeekPlayback { frame: 48000 },
+            Request::StopPlayback,
+            Request::UnloadPlayback,
+        ] {
+            worker.send(Command::Playback(request.clone()));
+            assert!(matches!(worker.next(), Event::Played(Ok(_))));
+            assert!(seen.lock().unwrap().contains(&request));
+        }
+        assert!(seen.lock().unwrap().contains(&Request::AddMarker { label: "Verse".into() }));
     }
 
     #[test]
@@ -383,7 +548,7 @@ mod tests {
         let (path, seen) =
             daemon("apply", PROTOCOL_VERSION, Response::Applied { restart: Restart::Device });
         let worker = Worker::start(path, || {});
-        for _ in 0..3 {
+        for _ in 0..5 {
             worker.next();
         }
         let change = SettingsChange { latency_ms: Some(2.0), ..Default::default() };
@@ -399,7 +564,7 @@ mod tests {
         let (path, _) =
             daemon("refuse", PROTOCOL_VERSION, Response::Error { message: "bad name".into() });
         let worker = Worker::start(path, || {});
-        for _ in 0..3 {
+        for _ in 0..5 {
             worker.next();
         }
         worker

@@ -125,6 +125,8 @@ fn engine(
         let now = ns_to_samples(snap.media_ns_at(local), rate);
         let mut next_due: Option<u64> = None;
 
+        let override_rings = shared.tx_override.load();
+        let tx_rings = override_rings.as_ref().map_or(&shared.tx_rings, |r| r.as_ref());
         for flow in flows.iter_mut().filter(|f| !f.expired) {
             // Anything the receiver sends us counts as a keepalive.
             while flow.socket.recv(&mut scratch).is_ok() {
@@ -147,8 +149,8 @@ fn engine(
             while *next + guard <= now {
                 let ts = *next;
                 let missing = flow.channels.iter().flatten().any(|&ch| {
-                    shared.tx_rings[ch].read_one(ts).is_none()
-                        || shared.tx_rings[ch].read_one(ts + fpp - 1).is_none()
+                    tx_rings[ch].read_one(ts).is_none()
+                        || tx_rings[ch].read_one(ts + fpp - 1).is_none()
                 });
                 if missing {
                     let underruns = counters.tx_underruns.fetch_add(1, Ordering::Relaxed) + 1;
@@ -166,7 +168,7 @@ fn engine(
                     flow.channels.len(),
                     fpp as usize,
                     |frame, slot| match flow.channels[slot] {
-                        Some(ch) => shared.tx_rings[ch].read_one(ts + frame as u64).unwrap_or(0),
+                        Some(ch) => tx_rings[ch].read_one(ts + frame as u64).unwrap_or(0),
                         None => 0,
                     },
                 );

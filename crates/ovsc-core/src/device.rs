@@ -295,6 +295,40 @@ impl Device {
     }
 
     /// Handle for audio backends.
+    /// Feed playback into the same rings the native driver exposes as inputs.
+    /// Live receive workers keep their flows alive but suppress their writes.
+    pub fn override_receive(&self) -> Result<(AudioIo, ReceiveOverride)> {
+        let mut active = self.shared.rx_override.write().unwrap_or_else(|e| e.into_inner());
+        if *active {
+            return Err(Error::Config("receive audio is already overridden".into()));
+        }
+        *active = true;
+        drop(active);
+        for ring in &self.shared.rx_rings {
+            ring.clear();
+        }
+        let mut io = self.audio();
+        io.tx = self.shared.rx_rings.clone();
+        Ok((io, ReceiveOverride { shared: self.shared.clone() }))
+    }
+
+    /// Exclusively replace the network transmit source. Core Audio keeps
+    /// writing its own rings; it cannot overwrite this source's samples.
+    pub fn override_transmit(&self) -> Result<(AudioIo, TransmitOverride)> {
+        let mut io = self.audio();
+        io.tx =
+            self.shared.tx_rings.iter().map(|r| Arc::new(TimedRing::new(r.capacity()))).collect();
+        let rings = Arc::new(io.tx.clone());
+        let previous = self
+            .shared
+            .tx_override
+            .compare_and_swap(&None::<Arc<Vec<Arc<TimedRing>>>>, Some(rings.clone()));
+        if previous.is_some() {
+            return Err(Error::Config("the transmit source is already overridden".into()));
+        }
+        Ok((io, TransmitOverride { shared: self.shared.clone(), rings }))
+    }
+
     pub fn audio(&self) -> AudioIo {
         AudioIo {
             clock: self.shared.clock.clone(),
@@ -587,6 +621,32 @@ async fn advertise(shared: Arc<Shared>, mdns: Mdns) {
         if watch.changed().await.is_err() {
             return;
         }
+    }
+}
+
+/// Exclusive receive ownership, released when dropped.
+pub struct ReceiveOverride {
+    shared: Arc<Shared>,
+}
+
+impl Drop for ReceiveOverride {
+    fn drop(&mut self) {
+        for ring in &self.shared.rx_rings {
+            ring.clear();
+        }
+        *self.shared.rx_override.write().unwrap_or_else(|e| e.into_inner()) = false;
+    }
+}
+
+/// Exclusive transmit ownership, released when dropped.
+pub struct TransmitOverride {
+    shared: Arc<Shared>,
+    rings: Arc<Vec<Arc<TimedRing>>>,
+}
+
+impl Drop for TransmitOverride {
+    fn drop(&mut self) {
+        self.shared.tx_override.compare_and_swap(&Some(self.rings.clone()), None);
     }
 }
 

@@ -60,7 +60,9 @@ pub fn interruption(restart: Restart) -> Option<&'static str> {
         Restart::Device => {
             Some("Audio stops for a second or two while the network engine restarts.")
         }
-        Restart::Daemon => Some("Audio stops for 10–20 seconds while OpenVirtualSoundcard restarts."),
+        Restart::Daemon => {
+            Some("Audio stops for 10–20 seconds while OpenVirtualSoundcard restarts.")
+        }
     }
 }
 
@@ -331,16 +333,24 @@ impl Problem {
             Problem::NotRunning => "The OpenVirtualSoundcard daemon is not running.".to_owned(),
             Problem::NotAdmin => "Only administrators can control OpenVirtualSoundcard.".to_owned(),
             Problem::NoAnswer => "The OpenVirtualSoundcard daemon does not answer.".to_owned(),
-            Problem::Lost => "The connection to the OpenVirtualSoundcard daemon was lost.".to_owned(),
+            Problem::Lost => {
+                "The connection to the OpenVirtualSoundcard daemon was lost.".to_owned()
+            }
             Problem::Version { daemon: Some((version, protocol)) } => format!(
                 "This app and the OpenVirtualSoundcard daemon (version {version}) are different versions: \
                  the app speaks control protocol {PROTOCOL_VERSION}, the daemon {protocol}."
             ),
-            Problem::Version { daemon: None } => "This app cannot read the OpenVirtualSoundcard daemon's \
+            Problem::Version { daemon: None } => {
+                "This app cannot read the OpenVirtualSoundcard daemon's \
                 answers: the app and the daemon are probably different versions."
-                .to_owned(),
-            Problem::Daemon(message) => format!("The OpenVirtualSoundcard daemon reports: {message}"),
-            Problem::Other(message) => format!("Cannot reach the OpenVirtualSoundcard daemon: {message}"),
+                    .to_owned()
+            }
+            Problem::Daemon(message) => {
+                format!("The OpenVirtualSoundcard daemon reports: {message}")
+            }
+            Problem::Other(message) => {
+                format!("Cannot reach the OpenVirtualSoundcard daemon: {message}")
+            }
         }
     }
 
@@ -598,9 +608,15 @@ mod tests {
         assert_eq!(problem(io::ErrorKind::WouldBlock), Problem::NoAnswer);
         assert_eq!(problem(io::ErrorKind::UnexpectedEof), Problem::Lost);
         assert_eq!(problem(io::ErrorKind::InvalidData), Problem::Version { daemon: None });
-        assert_eq!(Problem::NotRunning.message(), "The OpenVirtualSoundcard daemon is not running.");
+        assert_eq!(
+            Problem::NotRunning.message(),
+            "The OpenVirtualSoundcard daemon is not running."
+        );
         assert_eq!(Problem::NotRunning.command(), Some(START_COMMAND));
-        assert_eq!(Problem::NotAdmin.message(), "Only administrators can control OpenVirtualSoundcard.");
+        assert_eq!(
+            Problem::NotAdmin.message(),
+            "Only administrators can control OpenVirtualSoundcard."
+        );
         assert_eq!(Problem::NotAdmin.command(), None);
         assert!(matches!(problem(io::ErrorKind::OutOfMemory), Problem::Other(_)));
     }
@@ -617,6 +633,7 @@ mod tests {
         let Response::Status(mut status) = decode_line(&line).unwrap() else {
             panic!("not a status");
         };
+        status.protocol = PROTOCOL_VERSION;
         assert_eq!(Problem::check(&status), None);
         status.protocol = PROTOCOL_VERSION + 1;
         status.version = "9.0.0".into();

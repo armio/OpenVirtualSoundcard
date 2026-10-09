@@ -29,6 +29,7 @@ const LOCK_WARNING_AFTER: Duration = Duration::from_secs(20);
 /// A request from a control connection, and where its answer goes.
 pub struct Call {
     pub request: Request,
+    pub uid: u32,
     pub reply: oneshot::Sender<Response>,
 }
 
@@ -118,13 +119,15 @@ async fn accept(listener: UnixListener, calls: mpsc::Sender<Call>) {
 
 /// Answers one connection's requests, one line each, until it closes.
 async fn connection(stream: UnixStream, calls: mpsc::Sender<Call>) {
+    let Ok(credentials) = stream.peer_cred() else { return };
+    let uid = credentials.uid();
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         let response = match ctl::decode_line::<Request>(&line) {
             Ok(request) => {
                 let (reply, answer) = oneshot::channel();
-                if calls.send(Call { request, reply }).await.is_err() {
+                if calls.send(Call { request, uid, reply }).await.is_err() {
                     break;
                 }
                 answer.await.unwrap_or_else(|_| Response::Error {
@@ -164,6 +167,20 @@ pub struct View<'a> {
 /// Answers `call`.
 pub fn answer(call: Call, view: &View<'_>) -> After {
     let (response, after) = match &call.request {
+        Request::RecordingStatus
+        | Request::StartRecording { .. }
+        | Request::StopRecording
+        | Request::AddMarker { .. }
+        | Request::PlaybackStatus
+        | Request::OpenPlayback { .. }
+        | Request::Play
+        | Request::Pause
+        | Request::StopPlayback
+        | Request::UnloadPlayback
+        | Request::SeekPlayback { .. }
+        | Request::ConfigurePlayback { .. } => {
+            (Response::Error { message: "recording is unavailable".into() }, After::Nothing)
+        }
         Request::Status => (Response::Status(Box::new(status(view))), After::Nothing),
         Request::Settings => (Response::Settings(settings(view)), After::Nothing),
         Request::Interfaces => (Response::Interfaces { interfaces: interfaces() }, After::Nothing),
@@ -476,6 +493,70 @@ fn write_config(path: &Path, text: &str) -> anyhow::Result<()> {
     std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))
 }
 
+/// Open only regular files belonging to the control socket's caller. The
+/// privileged daemon must not expose arbitrary root-readable files.
+pub fn playback_file(path: &Path, uid: u32) -> anyhow::Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    anyhow::ensure!(path.is_absolute(), "choose an absolute WAV path");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .context("opening the playback file")?;
+    let meta = file.metadata()?;
+    anyhow::ensure!(
+        meta.is_file() && meta.uid() == uid,
+        "choose a regular WAV file owned by your user account"
+    );
+    Ok(file)
+}
+
+/// Creates a new recording in a directory owned by the connected user.
+/// The daemon runs as root; pinning the directory and using openat with
+/// O_EXCL prevents symlink swaps and overwrites of existing files.
+pub fn recording_file(path: &Path, uid: u32) -> anyhow::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    anyhow::ensure!(path.is_absolute(), "choose an absolute recording path");
+    let parent = path.parent().context("choose a recording folder")?;
+    let name = path.file_name().context("choose a WAV filename")?;
+    anyhow::ensure!(
+        path.extension().is_some_and(|e| e.eq_ignore_ascii_case("wav")),
+        "the recording filename must end in .wav"
+    );
+    let dir = std::fs::File::open(parent).context("opening the recording folder")?;
+    let metadata = dir.metadata()?;
+    anyhow::ensure!(
+        metadata.is_dir() && metadata.uid() == uid,
+        "choose a recording folder owned by your user account"
+    );
+    let name = std::ffi::CString::new(name.as_bytes())?;
+    // SAFETY: the directory fd and NUL-terminated filename remain valid.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error())
+            .context("creating the recording (use a new filename)");
+    }
+    // SAFETY: openat returned a new owned file descriptor.
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    // SAFETY: file's descriptor is valid; -1 leaves the group unchanged.
+    if unsafe { libc::fchown(file.as_raw_fd(), uid, !0 as libc::gid_t) } != 0 {
+        let error = io::Error::last_os_error();
+        // SAFETY: the same pinned directory and filename used for creation.
+        unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) };
+        return Err(error).context("giving you ownership of the recording");
+    }
+    Ok(file)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,6 +610,29 @@ backend = "coreaudio"
         assert_eq!(subscription_words(SubscriptionStatus::ReceivingUnicast), "receiving");
         assert_eq!(subscription_words(SubscriptionStatus::Unresolved), "transmitter not found");
         assert_eq!(subscription_words(SubscriptionStatus::None), "");
+    }
+
+    #[test]
+    fn recording_files_are_owned_by_the_caller_and_never_overwrite() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        let dir = std::env::temp_dir().join(format!("ovsc-record-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let uid = std::fs::metadata(&dir).unwrap().uid();
+        let path = dir.join("take.wav");
+        let _ = std::fs::remove_file(&path);
+        let file = recording_file(&path, uid).unwrap();
+        assert_eq!(file.metadata().unwrap().uid(), uid);
+        drop(file);
+        std::fs::write(&path, b"keep me").unwrap();
+        assert!(recording_file(&path, uid).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep me");
+        let link = dir.join("link.wav");
+        symlink(&path, &link).unwrap();
+        assert!(recording_file(&link, uid).is_err());
+        assert!(recording_file(&dir.join("wrong-owner.wav"), uid.wrapping_add(1)).is_err());
+        assert!(recording_file(Path::new("relative.wav"), uid).is_err());
+        assert!(recording_file(&dir.join("take.txt"), uid).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

@@ -28,7 +28,9 @@ use tracing::{debug, error, info, warn};
 
 use ovsc_clock::ptp::{PtpConfig, PtpFollower};
 use ovsc_clock::{MediaClock, free_running_clock_with_rate};
-use ovsc_control::{Restart, SettingsChange};
+use ovsc_control::{
+    PlaybackStatus, PlaybackTarget, RecordingStatus, Request, Response, Restart, SettingsChange,
+};
 use ovsc_core::net::Interface;
 use ovsc_core::{Device, FormatRequest, StartOptions};
 use ovsc_hal_server::{EngineInfo, HalRegion, HalServer, ShmClockMirror};
@@ -153,6 +155,9 @@ async fn serve(
         listener: &mut listener,
         status: &mut status,
         control: &mut control,
+        recorder: None,
+        recording: RecordingStatus::default(),
+        player: None,
     };
 
     let mut engine = match start_engine(&mut ctx, stop).await {
@@ -175,6 +180,8 @@ async fn serve(
                     "restarting the network engine for a receive latency of {} ms",
                     engine.device.configured_latency_ns() as f64 / 1e6
                 );
+                ctx.stop_recording();
+                ctx.player = None;
                 server.engine_stopped();
                 engine = match engine.restart_device(&cfg, &region).await {
                     Ok(engine) => engine,
@@ -206,6 +213,8 @@ async fn serve(
             }
         }
     };
+    ctx.stop_recording();
+    ctx.player = None;
     server.shutdown().await;
     engine.shutdown().await;
     result
@@ -228,11 +237,110 @@ struct Ctx<'a> {
     listener: &'a mut ListenerCheck,
     status: &'a mut StatusTimer,
     control: &'a mut Control,
+    recorder: Option<crate::backend::Running>,
+    recording: RecordingStatus,
+    player: Option<crate::playback::Player>,
 }
 
 impl Ctx<'_> {
     /// Answers a control call; whether the daemon must restart.
-    fn answer(&self, call: control::Call, engine: Option<&Engine>, error: &str) -> bool {
+    fn answer(&mut self, call: control::Call, engine: Option<&Engine>, error: &str) -> bool {
+        let response = match &call.request {
+            Request::AddMarker { label } => Some(
+                match self
+                    .recorder
+                    .as_ref()
+                    .context("recording is not running")
+                    .and_then(|r| r.add_marker(label))
+                {
+                    Ok(()) => Response::Recording(self.recording_status()),
+                    Err(e) => Response::Error { message: format!("{e:#}") },
+                },
+            ),
+            Request::PlaybackStatus => Some(Response::Playback(
+                self.player.as_ref().map_or_else(PlaybackStatus::default, |p| p.status()),
+            )),
+            Request::UnloadPlayback => {
+                self.player = None;
+                Some(Response::Playback(PlaybackStatus::default()))
+            }
+            Request::OpenPlayback { path, target } => {
+                let result = (|| -> anyhow::Result<()> {
+                    let device = &engine.context("the network engine is not running")?.device;
+                    anyhow::ensure!(
+                        !self.recording_status().recording
+                            || self.recording_status().path.as_deref() != Some(path),
+                        "stop this recording before opening it for playback"
+                    );
+                    let file = control::playback_file(Path::new(path), call.uid)?;
+                    // Parse and validate before releasing an existing soundcheck.
+                    let wave = crate::playback::Wave::open(file.try_clone()?)?;
+                    anyhow::ensure!(
+                        wave.rate == device.info().sample_rate,
+                        "set the device to the WAV sample rate ({} Hz) before opening it",
+                        wave.rate
+                    );
+                    use std::io::Seek;
+                    let mut file = file;
+                    file.rewind()?;
+                    self.player = None;
+                    self.player = Some(crate::playback::Player::open(device, file, path, *target)?);
+                    Ok(())
+                })();
+                Some(match result {
+                    Ok(()) => Response::Playback(self.player.as_ref().unwrap().status()),
+                    Err(e) => Response::Error { message: format!("{e:#}") },
+                })
+            }
+            Request::Play
+            | Request::Pause
+            | Request::StopPlayback
+            | Request::SeekPlayback { .. }
+            | Request::ConfigurePlayback { .. } => {
+                let result = (|| -> anyhow::Result<()> {
+                    let device = &engine.context("the network engine is not running")?.device;
+                    let player = self.player.as_ref().context("open a recording first")?;
+                    let outputs = match player.status().target {
+                        PlaybackTarget::Receive => device.audio().rx.len(),
+                        PlaybackTarget::Transmit => device.audio().tx.len(),
+                    };
+                    player.command(&call.request, outputs)
+                })();
+                Some(match result {
+                    Ok(()) => Response::Playback(self.player.as_ref().unwrap().status()),
+                    Err(e) => Response::Error { message: format!("{e:#}") },
+                })
+            }
+            Request::RecordingStatus => Some(Response::Recording(self.recording_status())),
+            Request::StopRecording => {
+                self.stop_recording();
+                Some(Response::Recording(self.recording_status()))
+            }
+            Request::StartRecording { path } => {
+                let result = (|| -> anyhow::Result<()> {
+                    anyhow::ensure!(
+                        !self.recording_status().recording,
+                        "a recording is already running"
+                    );
+                    self.stop_recording();
+                    let engine = engine.context("the network engine is not running")?;
+                    let path = Path::new(path);
+                    let file = control::recording_file(path, call.uid)?;
+                    self.recorder =
+                        Some(crate::backend::record_file(engine.device.audio(), path, file)?);
+                    Ok(())
+                })();
+                Some(match result {
+                    Ok(()) => Response::Recording(self.recording_status()),
+                    Err(e) => Response::Error { message: format!("{e:#}") },
+                })
+            }
+            _ => None,
+        };
+        if let Some(response) = response {
+            let _ = call.reply.send(response);
+            return false;
+        }
         let view = control::View {
             cfg: self.cfg,
             config_path: self.config_path,
@@ -241,6 +349,16 @@ impl Ctx<'_> {
             engine_error: Some(error),
         };
         control::answer(call, &view) == control::After::RestartDaemon
+    }
+
+    fn recording_status(&self) -> RecordingStatus {
+        self.recorder.as_ref().map_or_else(|| self.recording.clone(), |r| r.recording_status())
+    }
+
+    fn stop_recording(&mut self) {
+        if let Some(recorder) = self.recorder.take() {
+            self.recording = recorder.finish_recording();
+        }
     }
 
     /// Saves a sample rate or bit depth that a controller asked for;
@@ -752,6 +870,16 @@ mod tests {
             let running = || d.flags.load(Ordering::Acquire) & DAEMON_ENGINE_RUNNING != 0;
             wait_for("the engine", running).await;
             assert_eq!(latency_ms(&socket).await, Some(4.0));
+            let wav = dir.join("first.wav");
+            let start = Request::StartRecording { path: wav.to_str().unwrap().into() };
+            assert!(matches!(ask(&socket, start.clone()).await,
+                Response::Recording(s) if s.recording && s.channels == 3));
+            assert!(matches!(ask(&socket, start).await, Response::Error { .. }));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(matches!(ask(&socket, Request::AddMarker { label: "Verse".into() }).await,
+                Response::Recording(s) if s.markers.len() == 1 && s.markers[0].label == "Verse"));
+            assert!(matches!(ask(&socket, Request::RecordingStatus).await,
+                Response::Recording(s) if s.recording && s.bytes > 0));
 
             let change = SettingsChange { latency_ms: Some(2.0), ..Default::default() };
             match ask(&socket, Request::Apply { change }).await {
@@ -764,6 +892,32 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             wait_for("the engine again", running).await;
+            let first = match ask(&socket, Request::RecordingStatus).await {
+                Response::Recording(s) => s,
+                other => panic!("no recording status: {other:?}"),
+            };
+            assert!(!first.recording);
+            assert!(first.error.is_none());
+            let bytes = std::fs::read(&wav).unwrap();
+            assert!(bytes.len() as u64 > 44 + first.bytes);
+            let wave = crate::playback::Wave::open(std::fs::File::open(&wav).unwrap()).unwrap();
+            assert_eq!(wave.frames, first.frames);
+            assert_eq!(wave.markers.len(), 1);
+            assert_eq!(wave.markers[0].label, "Verse");
+            assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()) as u64, first.bytes);
+            assert!(matches!(
+                ask(&socket, Request::StartRecording { path: wav.to_str().unwrap().into() }).await,
+                Response::Error { .. }
+            ));
+            let second = dir.join("second.wav");
+            assert!(
+                matches!(ask(&socket, Request::StartRecording { path: second.to_str().unwrap().into() }).await,
+                Response::Recording(s) if s.recording)
+            );
+            assert!(matches!(ask(&socket, Request::StopRecording).await,
+                Response::Recording(s) if !s.recording && s.error.is_none()));
+            assert!(matches!(ask(&socket, Request::StopRecording).await,
+                Response::Recording(s) if !s.recording));
             // The driver stayed attached to the same region throughout.
             assert!(!received.got_bye());
             match ask(&socket, Request::Settings).await {

@@ -10,6 +10,12 @@ The first public version, not released yet.
 
 ### Added
 
+- macOS recording controls, live subscription capture, dropout reporting and
+  bounded disk buffering, with labeled WAV markers.
+- Virtual soundcheck playback through soundcard inputs or Dante transmit
+  channels, with transport, mapping, level/mute and marker-based loop controls.
+  Control protocol 3 requires the updated app and daemon together.
+
 - A Dante-compatible device engine in Rust: mDNS discovery, the ARC, CMC,
   conmon and flow-control protocols, unicast audio flows both ways, and an
   in-process PTPv1 clock follower with kernel receive timestamps on macOS.

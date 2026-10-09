@@ -103,6 +103,8 @@ pub struct Shared {
     pub clock: MediaClock,
     pub rx_rings: Vec<Arc<TimedRing>>,
     pub tx_rings: Vec<Arc<TimedRing>>,
+    pub rx_override: Arc<std::sync::RwLock<bool>>,
+    pub tx_override: arc_swap::ArcSwapOption<Vec<Arc<TimedRing>>>,
     /// Shared with the receive threads, which don't hold the rest.
     pub counters: Arc<Counters>,
     notify: mpsc::UnboundedSender<Notify>,
@@ -142,6 +144,8 @@ impl Shared {
         let shared = Arc::new(Self {
             rx_rings,
             tx_rings,
+            tx_override: arc_swap::ArcSwapOption::empty(),
+            rx_override: Arc::new(std::sync::RwLock::new(false)),
             info,
             state: Mutex::new(state),
             generation: watch::channel(0).0,

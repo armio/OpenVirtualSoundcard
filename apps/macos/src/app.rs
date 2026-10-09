@@ -1,12 +1,13 @@
 //! The window: the device and its status lights at the top, then a Status
-//! tab and a Settings tab.
+//! tab, a Settings tab, and recording controls.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align, Color32, Layout, RichText, Ui, vec2};
 use ovsc_control::{
-    DeviceStatus, InterfaceInfo, MAX_CHANNELS, Restart, Settings, SettingsChange, Status,
+    DeviceStatus, InterfaceInfo, MAX_CHANNELS, PlaybackSettings, PlaybackStatus, PlaybackTarget,
+    RecordingStatus, Request, Restart, Settings, SettingsChange, Status,
 };
 
 use crate::logic::{self, Light, Problem};
@@ -23,6 +24,8 @@ const INDICATOR_WIDTH: f32 = 112.0;
 enum Tab {
     Status,
     Settings,
+    Recording,
+    Playback,
 }
 
 /// The connection, as far as the UI knows.
@@ -41,6 +44,21 @@ struct Form {
 
 pub struct App {
     worker: Worker,
+    recording: RecordingStatus,
+    recording_path: String,
+    recording_pending: bool,
+    recording_error: Option<String>,
+    marker_label: String,
+    playback: PlaybackStatus,
+    playback_path: String,
+    playback_target: PlaybackTarget,
+    playback_edit: PlaybackSettings,
+    playback_pending: bool,
+    playback_error: Option<String>,
+    loop_enabled: bool,
+    loop_start: f64,
+    loop_end: f64,
+    seek_preview: Option<f64>,
     tab: Tab,
     connection: Connection,
     interfaces: Vec<InterfaceInfo>,
@@ -64,6 +82,23 @@ impl App {
         let ctx = cc.egui_ctx.clone();
         App {
             worker: Worker::start(socket, move || ctx.request_repaint()),
+            recording: RecordingStatus::default(),
+            recording_path: std::env::var("HOME")
+                .map(|home| format!("{home}/Music/recording.wav"))
+                .unwrap_or_default(),
+            recording_pending: false,
+            recording_error: None,
+            marker_label: String::new(),
+            playback: PlaybackStatus::default(),
+            playback_path: String::new(),
+            playback_target: PlaybackTarget::Receive,
+            playback_edit: PlaybackSettings::default(),
+            playback_pending: false,
+            playback_error: None,
+            loop_enabled: false,
+            loop_start: 0.0,
+            loop_end: 0.0,
+            seek_preview: None,
             tab: Tab::Status,
             connection: Connection::Connecting,
             interfaces: Vec::new(),
@@ -78,6 +113,44 @@ impl App {
 
     fn handle(&mut self, event: Event) {
         match event {
+            Event::Playback(status) => {
+                if self.playback.path != status.path {
+                    self.playback_edit = status.settings.clone();
+                    self.playback_target = status.target;
+                    self.loop_end = status.frames as f64 / f64::from(status.sample_rate.max(1));
+                }
+                self.playback = status;
+            }
+            Event::Played(result) => {
+                self.playback_pending = false;
+                match result {
+                    Ok(status) => {
+                        if self.playback.path != status.path
+                            || self.playback.settings != status.settings
+                        {
+                            self.playback_edit = status.settings.clone();
+                            self.loop_enabled = status.settings.loop_range.is_some();
+                            let range = status.settings.loop_range.unwrap_or((0, status.frames));
+                            self.loop_start = range.0 as f64 / f64::from(status.sample_rate.max(1));
+                            self.loop_end = range.1 as f64 / f64::from(status.sample_rate.max(1));
+                        }
+                        self.playback = status;
+                        self.playback_error = None;
+                    }
+                    Err(error) => self.playback_error = Some(error),
+                }
+            }
+            Event::Recording(status) => self.recording = status,
+            Event::Recorded(result) => {
+                self.recording_pending = false;
+                match result {
+                    Ok(status) => {
+                        self.recording = status;
+                        self.recording_error = None;
+                    }
+                    Err(error) => self.recording_error = Some(error),
+                }
+            }
             Event::Problem(problem) => self.connection = Connection::Down(problem),
             Event::Status(status) => {
                 if matches!(self.connection, Connection::Down(_)) {
@@ -158,6 +231,16 @@ impl App {
             let was = self.tab;
             ui.selectable_value(&mut self.tab, Tab::Status, RichText::new("Status").size(14.0));
             ui.selectable_value(&mut self.tab, Tab::Settings, RichText::new("Settings").size(14.0));
+            ui.selectable_value(
+                &mut self.tab,
+                Tab::Recording,
+                RichText::new("Recording").size(14.0),
+            );
+            ui.selectable_value(
+                &mut self.tab,
+                Tab::Playback,
+                RichText::new("Soundcheck").size(14.0),
+            );
             if self.tab == Tab::Settings && was != Tab::Settings {
                 // The interfaces may have changed since.
                 self.worker.send(Command::Reload);
@@ -369,6 +452,341 @@ impl App {
         }
     }
 
+    fn recording_tab(&mut self, ui: &mut Ui) {
+        section(ui, "Record received audio", |ui| {
+            ui.label("Save all receive channels into one 24-bit WAV file while the soundcard stays available to your apps.");
+            ui.add_space(8.0);
+            let connected = matches!(self.connection, Connection::Up(_));
+            let engine_running = matches!(&self.connection, Connection::Up(s) if s.engine_running);
+            ui.label("Destination (.wav)");
+            ui.add_enabled(
+                !self.recording.recording && !self.recording_pending,
+                egui::TextEdit::singleline(&mut self.recording_path).desired_width(f32::INFINITY),
+            );
+            ui.label(RichText::new("Use a new filename in an existing folder you own. Existing files are never overwritten.").small().weak());
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        connected
+                            && engine_running
+                            && !self.recording.recording
+                            && !self.recording_pending
+                            && !self.recording_path.trim().is_empty(),
+                        egui::Button::new("Start recording"),
+                    )
+                    .clicked()
+                {
+                    self.recording_pending = true;
+                    self.recording_error = None;
+                    self.worker.send(Command::Recording(Request::StartRecording {
+                        path: self.recording_path.trim().to_owned(),
+                    }));
+                }
+                if ui
+                    .add_enabled(
+                        connected && self.recording.recording && !self.recording_pending,
+                        egui::Button::new("Stop recording"),
+                    )
+                    .clicked()
+                {
+                    self.recording_pending = true;
+                    self.worker.send(Command::Recording(Request::StopRecording));
+                }
+                if self.recording_pending {
+                    ui.spinner();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.marker_label)
+                        .hint_text("Marker label (optional)")
+                        .desired_width(220.0),
+                );
+                if ui
+                    .add_enabled(
+                        connected && self.recording.recording && !self.recording_pending,
+                        egui::Button::new("Add marker"),
+                    )
+                    .clicked()
+                {
+                    self.recording_pending = true;
+                    self.worker.send(Command::Recording(Request::AddMarker {
+                        label: self.marker_label.clone(),
+                    }));
+                    self.marker_label.clear();
+                }
+            });
+            for marker in &self.recording.markers {
+                ui.label(format!(
+                    "{} · {}",
+                    format_time(marker.frame, self.recording.sample_rate),
+                    marker.label
+                ));
+            }
+            if !self.recording.recording
+                && self.recording.path.is_some()
+                && ui.button("Use this take for soundcheck").clicked()
+            {
+                self.playback_path = self.recording.path.clone().unwrap();
+                self.tab = Tab::Playback;
+            }
+            let status = if !connected {
+                "Status unavailable"
+            } else if self.recording.waiting_for_clock && self.recording.frames > 0 {
+                "Recording · network clock unavailable"
+            } else if self.recording.waiting_for_clock {
+                "Waiting for the network clock"
+            } else if self.recording.recording {
+                "Recording"
+            } else if self.recording.path.is_some() {
+                "Stopped"
+            } else {
+                "Ready"
+            };
+            ui.add_space(8.0);
+            ui.label(RichText::new(status).strong());
+            if let Some(path) = &self.recording.path {
+                ui.label(path);
+                let seconds = self.recording.frames / u64::from(self.recording.sample_rate.max(1));
+                ui.label(format!(
+                    "{:02}:{:02}:{:02} · {:.1} MiB · {} channels",
+                    seconds / 3600,
+                    seconds / 60 % 60,
+                    seconds % 60,
+                    self.recording.bytes as f64 / 1_048_576.0,
+                    self.recording.channels
+                ));
+            }
+            if self.recording.missing_samples > 0 {
+                ui.colored_label(
+                    color(Light::Amber),
+                    format!(
+                        "{} missing channel samples saved as silence (includes unrouted channels).",
+                        self.recording.missing_samples
+                    ),
+                );
+            }
+            if self.recording.capture_lost_frames > 0 || self.recording.disk_lost_frames > 0 {
+                ui.colored_label(color(Light::Amber), format!("Audio gaps: {} frames lost before capture; {} frames lost while the disk was busy. Gaps are saved as silence.", self.recording.capture_lost_frames, self.recording.disk_lost_frames));
+            }
+            if self.recording.clock_resets > 0 {
+                ui.colored_label(color(Light::Amber), format!("{} clock changes recovered. Audio at those boundaries may be discontinuous.", self.recording.clock_resets));
+            }
+            if self.recording.recording && self.recording.bytes > 3 * 1024 * 1024 * 1024 {
+                ui.colored_label(color(Light::Amber), "This WAV is approaching its 4 GiB limit. Stop and start a new file for a longer session.");
+            }
+            if let Some(error) = self.recording_error.as_ref().or(self.recording.error.as_ref()) {
+                ui.colored_label(color(Light::Red), error);
+            }
+            ui.add_space(8.0);
+            ui.label(RichText::new("Subscribe or change sources in Dante Controller while recording. All configured receive channels are included from the start; a new subscription replaces silence with audio in that channel. Late packets have extra time to arrive.").small().weak());
+            ui.label(RichText::new("Recording continues when this app closes. It stops at approximately 4 GiB, or when the device restarts or its audio settings change.").small().weak());
+        });
+    }
+
+    fn send_playback(&mut self, request: Request) {
+        self.playback_pending = true;
+        self.playback_error = None;
+        self.worker.send(Command::Playback(request));
+    }
+
+    fn playback_tab(&mut self, ui: &mut Ui) {
+        section(ui, "Virtual soundcheck", |ui| {
+            ui.label("Replay a take through the soundcard inputs, as if it were arriving from the network, or send it back to a Dante console.");
+            let connected = matches!(&self.connection, Connection::Up(s) if s.engine_running);
+            ui.label("Recording (.wav)");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.playback_path).desired_width(f32::INFINITY),
+            );
+            ui.horizontal(|ui| {
+                ui.selectable_value(
+                    &mut self.playback_target,
+                    PlaybackTarget::Receive,
+                    "Soundcard inputs",
+                );
+                ui.selectable_value(
+                    &mut self.playback_target,
+                    PlaybackTarget::Transmit,
+                    "Dante outputs",
+                );
+                if ui
+                    .add_enabled(
+                        connected
+                            && !self.playback_pending
+                            && !self.playback_path.trim().is_empty(),
+                        egui::Button::new("Open recording"),
+                    )
+                    .clicked()
+                {
+                    self.send_playback(Request::OpenPlayback {
+                        path: self.playback_path.trim().to_owned(),
+                        target: self.playback_target,
+                    });
+                }
+            });
+            ui.label(RichText::new("Opening a take replaces live audio on that side. Paused and unmapped channels are silent. Choose Return to live to restore network inputs or application outputs.").small().weak());
+            if let Some(path) = self.playback.path.clone() {
+                ui.add_space(8.0);
+                ui.label(path);
+                let active = connected && !self.playback_pending;
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            active,
+                            egui::Button::new(if self.playback.playing { "Pause" } else { "Play" }),
+                        )
+                        .clicked()
+                    {
+                        self.send_playback(if self.playback.playing {
+                            Request::Pause
+                        } else {
+                            Request::Play
+                        });
+                    }
+                    if ui.add_enabled(active, egui::Button::new("Stop")).clicked() {
+                        self.send_playback(Request::StopPlayback);
+                    }
+                    if ui.add_enabled(active, egui::Button::new("Return to live")).clicked() {
+                        self.send_playback(Request::UnloadPlayback);
+                    }
+                    if self.playback_pending {
+                        ui.spinner();
+                    }
+                });
+                if self.playback.waiting_for_clock {
+                    ui.label("Waiting for the network clock…");
+                }
+                let rate = f64::from(self.playback.sample_rate.max(1));
+                let duration = self.playback.frames as f64 / rate;
+                let mut position =
+                    self.seek_preview.unwrap_or(self.playback.position as f64 / rate);
+                let slider = ui.add_enabled(
+                    active,
+                    egui::Slider::new(&mut position, 0.0..=duration).suffix(" s").text("Position"),
+                );
+                if slider.dragged() {
+                    self.seek_preview = Some(position);
+                }
+                if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
+                    self.seek_preview = None;
+                    self.send_playback(Request::SeekPlayback {
+                        frame: ((position * rate).round() as u64).min(self.playback.frames),
+                    });
+                }
+                ui.label(format!(
+                    "{} / {} · {} tracks · {} Hz",
+                    format_time(self.playback.position, self.playback.sample_rate),
+                    format_time(self.playback.frames, self.playback.sample_rate),
+                    self.playback.channels,
+                    self.playback.sample_rate
+                ));
+                ui.add_enabled_ui(active, |ui| {
+                    ui.add(
+                        egui::Slider::new(&mut self.playback_edit.level_db, -60.0..=0.0)
+                            .suffix(" dB")
+                            .text("Playback level"),
+                    );
+                    ui.checkbox(&mut self.playback_edit.muted, "Mute playback");
+                    let outputs = match &self.connection {
+                        Connection::Up(s) => {
+                            s.device.as_ref().map_or(0, |d| match self.playback.target {
+                                PlaybackTarget::Receive => d.rx_channels.len(),
+                                PlaybackTarget::Transmit => d.tx_channels.len(),
+                            })
+                        }
+                        _ => 0,
+                    };
+                    ui.label(if self.playback.target == PlaybackTarget::Receive {
+                        "Map recorded tracks to receive/input channels"
+                    } else {
+                        "Map recorded tracks to Dante transmit channels"
+                    });
+                    egui::Grid::new("playback-map").num_columns(2).show(ui, |ui| {
+                        for (ch, destination) in
+                            self.playback_edit.destinations.iter_mut().enumerate()
+                        {
+                            ui.label(format!("Track {}", ch + 1));
+                            egui::ComboBox::from_id_salt(("playback-destination", ch))
+                                .selected_text(if *destination == 0 {
+                                    "Muted".into()
+                                } else {
+                                    format!("Channel {destination}")
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(destination, 0, "Muted");
+                                    for output in 1..=outputs {
+                                        ui.selectable_value(
+                                            destination,
+                                            output as u16,
+                                            format!("Channel {output}"),
+                                        );
+                                    }
+                                });
+                            ui.end_row();
+                        }
+                    });
+                    ui.checkbox(&mut self.loop_enabled, "Loop section");
+                    ui.horizontal(|ui| {
+                        ui.label("Start");
+                        ui.add(
+                            egui::DragValue::new(&mut self.loop_start)
+                                .range(0.0..=duration)
+                                .suffix(" s"),
+                        );
+                        ui.label("End");
+                        ui.add(
+                            egui::DragValue::new(&mut self.loop_end)
+                                .range(0.0..=duration)
+                                .suffix(" s"),
+                        );
+                    });
+                    for marker in self.playback.markers.clone() {
+                        ui.horizontal(|ui| {
+                            ui.label(format!(
+                                "{} · {}",
+                                format_time(marker.frame, self.playback.sample_rate),
+                                marker.label
+                            ));
+                            if ui.button("Go").clicked() {
+                                self.send_playback(Request::SeekPlayback { frame: marker.frame });
+                            }
+                            if ui.button("Loop start").clicked() {
+                                self.loop_start = marker.frame as f64 / rate;
+                                self.loop_enabled = true;
+                            }
+                            if ui.button("Loop end").clicked() {
+                                self.loop_end = marker.frame as f64 / rate;
+                                self.loop_enabled = true;
+                            }
+                        });
+                    }
+                    if ui.button("Apply playback settings").clicked() {
+                        self.playback_edit.loop_range = self.loop_enabled.then_some((
+                            (self.loop_start * rate).round() as u64,
+                            (self.loop_end * rate).round() as u64,
+                        ));
+                        self.send_playback(Request::ConfigurePlayback {
+                            settings: self.playback_edit.clone(),
+                        });
+                    }
+                });
+            }
+            if let Some(error) = self.playback_error.as_ref().or(self.playback.error.as_ref()) {
+                ui.colored_label(color(Light::Red), error);
+            }
+            ui.add_space(8.0);
+            ui.label(RichText::new("Starts at −12 dB. Match the device sample rate to the WAV. For a Dante console, route the transmit channels in Dante Controller and avoid sending the console return back into its playback inputs.").small().weak());
+            ui.label(
+                RichText::new(
+                    "Playback continues when the app closes; it stops when the device restarts.",
+                )
+                .small()
+                .weak(),
+            );
+        });
+    }
+
     /// Asks before a change that restarts the daemon.
     fn confirm_restart(&mut self, ctx: &egui::Context) {
         if self.confirm.is_none() {
@@ -421,9 +839,17 @@ impl eframe::App for App {
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                 ui.add_space(4.0);
                 self.connection_notice(ui);
+                if matches!(self.connection, Connection::Up(_)) && self.playback.path.is_some() {
+                    notice(ui, Light::Amber, |ui| {
+                        let side = if self.playback.target == PlaybackTarget::Receive { "receive/input channels" } else { "Dante transmit channels" };
+                        ui.label(format!("Soundcheck owns the {side}. Live audio resumes after Return to live in the Soundcheck tab."));
+                    });
+                }
                 match self.tab {
                     Tab::Status => self.status_tab(ui),
                     Tab::Settings => self.settings_tab(ui),
+                    Tab::Recording => self.recording_tab(ui),
+                    Tab::Playback => self.playback_tab(ui),
                 }
                 ui.add_space(8.0);
             });
@@ -679,4 +1105,9 @@ fn style(ctx: &egui::Context) {
             small.size = 11.0;
         }
     });
+}
+
+fn format_time(frame: u64, rate: u32) -> String {
+    let seconds = frame as f64 / f64::from(rate.max(1));
+    format!("{:02}:{:02}:{:06.3}", seconds as u64 / 3600, seconds as u64 / 60 % 60, seconds % 60.0)
 }

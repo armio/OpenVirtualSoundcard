@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! → {"op":"status"}
-//! ← {"result":"status","protocol":1,"version":"0.1.0",...}
+//! ← {"result":"status","protocol":3,"version":"0.1.0",...}
 //! → {"op":"apply","change":{"latency_ms":2.0}}
 //! ← {"result":"applied","restart":"device"}
 //! ```
@@ -21,7 +21,7 @@ pub const SOCKET_PATH: &str = "/var/run/ovsc/control.sock";
 
 /// Version of these messages. The daemon reports it in
 /// [`Status::protocol`]; it changes only with incompatible changes.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Receive latencies offered for selection, in milliseconds. Any value in
 /// [`LATENCY_MIN_MS`]..=[`LATENCY_MAX_MS`] is accepted.
@@ -51,7 +51,32 @@ pub enum Request {
     Interfaces,
     /// Changes settings: answered by [`Response::Applied`] or
     /// [`Response::Error`]. Fields left out keep their value.
-    Apply { change: SettingsChange },
+    Apply {
+        change: SettingsChange,
+    },
+    RecordingStatus,
+    StartRecording {
+        path: String,
+    },
+    StopRecording,
+    AddMarker {
+        label: String,
+    },
+    PlaybackStatus,
+    OpenPlayback {
+        path: String,
+        target: PlaybackTarget,
+    },
+    Play,
+    Pause,
+    StopPlayback,
+    UnloadPlayback,
+    SeekPlayback {
+        frame: u64,
+    },
+    ConfigurePlayback {
+        settings: PlaybackSettings,
+    },
 }
 
 /// The daemon's answer.
@@ -59,6 +84,8 @@ pub enum Request {
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Response {
     Status(Box<Status>),
+    Recording(RecordingStatus),
+    Playback(PlaybackStatus),
     Settings(Settings),
     Interfaces {
         interfaces: Vec<InterfaceInfo>,
@@ -71,6 +98,80 @@ pub enum Response {
     Error {
         message: String,
     },
+}
+
+/// A recording belongs to the daemon and continues when the app closes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingStatus {
+    pub recording: bool,
+    pub waiting_for_clock: bool,
+    pub path: Option<String>,
+    pub frames: u64,
+    pub bytes: u64,
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub error: Option<String>,
+    /// Missing sample values across all channels, including unrouted channels.
+    #[serde(default)]
+    pub missing_samples: u64,
+    /// Frames overwritten in the receive rings before capture could read them.
+    #[serde(default)]
+    pub capture_lost_frames: u64,
+    /// Frames replaced with silence because the disk queue was full.
+    #[serde(default)]
+    pub disk_lost_frames: u64,
+    #[serde(default)]
+    pub clock_resets: u64,
+    #[serde(default)]
+    pub captured_frames: u64,
+    #[serde(default)]
+    pub markers: Vec<Marker>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Marker {
+    pub id: u32,
+    pub frame: u64,
+    pub label: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaybackTarget {
+    #[default]
+    Receive,
+    Transmit,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PlaybackSettings {
+    /// One destination transmit channel per file channel; 0 means muted.
+    pub destinations: Vec<u16>,
+    pub level_db: f64,
+    pub muted: bool,
+    /// Inclusive start and exclusive end, in file frames.
+    pub loop_range: Option<(u64, u64)>,
+}
+
+impl Default for PlaybackSettings {
+    fn default() -> Self {
+        Self { destinations: Vec::new(), level_db: -12.0, muted: false, loop_range: None }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PlaybackStatus {
+    pub target: PlaybackTarget,
+    pub path: Option<String>,
+    pub playing: bool,
+    pub position: u64,
+    pub frames: u64,
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub markers: Vec<Marker>,
+    pub settings: PlaybackSettings,
+    pub waiting_for_clock: bool,
+    pub error: Option<String>,
 }
 
 /// What restarts to apply a change.
@@ -316,6 +417,30 @@ mod tests {
         };
         assert_eq!(encode_line(&apply), "{\"op\":\"apply\",\"change\":{\"latency_ms\":2.0}}\n");
         assert_eq!(decode_line::<Request>(&encode_line(&apply)).unwrap(), apply);
+        for request in [
+            Request::RecordingStatus,
+            Request::StartRecording { path: "/Users/me/Music/take.wav".into() },
+            Request::StopRecording,
+            Request::AddMarker { label: "Verse".into() },
+            Request::OpenPlayback {
+                path: "/Users/me/Music/take.wav".into(),
+                target: PlaybackTarget::Receive,
+            },
+            Request::Play,
+            Request::Pause,
+            Request::StopPlayback,
+            Request::UnloadPlayback,
+            Request::SeekPlayback { frame: 48000 },
+            Request::ConfigurePlayback {
+                settings: PlaybackSettings {
+                    destinations: vec![1, 0, 2],
+                    loop_range: Some((480, 48000)),
+                    ..Default::default()
+                },
+            },
+        ] {
+            assert_eq!(decode_line::<Request>(&encode_line(&request)).unwrap(), request);
+        }
         assert_eq!(
             decode_line::<Request>("{\"op\":\"apply\",\"change\":{}}").unwrap(),
             Request::Apply { change: SettingsChange::default() }
@@ -325,6 +450,21 @@ mod tests {
     #[test]
     fn responses_round_trip() {
         let responses = [
+            Response::Playback(PlaybackStatus {
+                path: Some("/tmp/take.wav".into()),
+                playing: true,
+                markers: vec![Marker { id: 1, frame: 48000, label: "Verse".into() }],
+                ..Default::default()
+            }),
+            Response::Recording(RecordingStatus {
+                recording: true,
+                path: Some("/tmp/take.wav".into()),
+                frames: 48000,
+                bytes: 288000,
+                sample_rate: 48000,
+                channels: 2,
+                ..Default::default()
+            }),
             Response::Applied { restart: Restart::Device },
             Response::Error { message: "no".into() },
             Response::Interfaces {

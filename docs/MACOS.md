@@ -286,6 +286,57 @@ without it.
   receive channels with what each one is subscribed to, the transmit flows
   and the packet counters. Warnings from the daemon, such as a clock that
   does not lock, come first.
+* **Recording** saves all receive channels to one 24-bit WAV file alongside
+  the Core Audio device. Enter an absolute `.wav` path in an existing folder
+  owned by your account, then choose **Start recording**. Existing files are
+  never overwritten. The tab shows the current file, recorded audio duration,
+  size, channel count, waiting-for-clock status and errors. **Stop recording**
+  finalizes the file. **Add marker** stores the captured audio position and
+  an optional label; markers are shown in the app and embedded as standard
+  WAV `cue ` and `LIST/adtl/labl` chunks on checkpoints and stop. Editors
+  differ in how they display imported WAV markers. Routing still comes from Dante Controller; channels
+  without audio record silence. All configured receive channels are included
+  from the start: new subscriptions and source changes take effect during
+  the same recording, without restarting the take. Unsubscribing returns
+  that channel to silence. Increasing the configured channel count still
+  restarts the device and stops the take, because a WAV has a fixed channel
+  layout. Recording continues if the app closes, but
+  stops when the device or daemon restarts or the WAV reaches about 4 GiB.
+  The app and daemon must both be rebuilt and installed together (control
+  protocol 3).
+  Capture has an extra 50 ms grace for late packets (bounded by ring size)
+  and a separate disk writer with a queue capped at two seconds and 64 MiB.
+  Missing channel samples and capture/disk overruns are reported in the tab;
+  overruns leave silence at the original position rather than shortening the
+  take. While the network clock is unavailable, capture uses elapsed local
+  time and resumes automatically when it returns. Large clock steps start a
+  new timestamp epoch and are reported as discontinuities. WAV headers and
+  data are checkpointed to disk every second and on stop; disk errors stop
+  the take and attempt to finalize the complete frames already saved.
+  The tab warns above 3 GiB; the 4 GiB WAV limit still applies. Buffering
+  cannot recover packets that never arrived or protect against indefinitely
+  stalled storage, sudden power loss, or a killed daemon.
+* **Soundcheck** opens a completed WAV owned by your account. The default
+  **Soundcard inputs** mode feeds its tracks into the device's receive rings,
+  replacing live received audio so applications see the take as incoming
+  audio. **Dante outputs** instead replaces application output on the network
+  transmit side; route those transmit channels to the console in Dante
+  Controller. Live flows stay connected during input playback and resume
+  after **Return to live**. Opening a take takes ownership of the selected
+  side immediately; unmapped channels, paused playback, and the end of a
+  take stay silent. **Stop** rewinds, and **Return to live** releases the
+  playback source. Playback continues if the app closes, and is unloaded
+  when the device restarts.
+  Play/Pause, Stop, the timeline, and marker **Go** buttons control transport.
+  Map each recorded track to a distinct device channel (or mute it), set
+  level or mute, and press **Apply playback settings**. Playback starts at
+  −12 dB. Enable a loop and set its bounds in seconds or with marker
+  **Loop start/end** buttons, then apply. WAV and device sample rates must
+  match; playback supports PCM 16/24/32-bit and Float32, including extensible
+  WAV formats. Files stream from disk rather than being loaded into memory.
+  Position displays follow the presented audio timeline; pause and resume
+  preserve that position rather than skipping buffered audio. Avoid console
+  return routing that feeds the soundcheck audio back into its playback inputs.
 * **Settings** changes the device name, the network interface, the sample
   rate, the bit depth, the receive and transmit channel counts and the
   latency. **Apply** sends only what changed. A new name applies at once,

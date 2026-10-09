@@ -446,6 +446,7 @@ impl RxManager {
                 last_packet_ns: last_packet_ns.clone(),
                 counters: self.shared.counters.clone(),
                 stats: stats.clone(),
+                override_gate: self.shared.rx_override.clone(),
             },
             self.threads.clone(),
         )?;
@@ -592,6 +593,7 @@ struct Probes {
     counters: Arc<Counters>,
     /// The flow's arrival times.
     stats: Arc<FlowStats>,
+    override_gate: Arc<RwLock<bool>>,
 }
 
 impl Worker {
@@ -655,7 +657,7 @@ fn receive(
     format: SampleFormat,
     sample_rate: u32,
     (clock, latency_samples): (ovsc_clock::MediaClock, u64),
-    Probes { last_packet_ns, counters, stats }: Probes,
+    Probes { last_packet_ns, counters, stats, override_gate }: Probes,
     stop: Arc<AtomicBool>,
 ) {
     let mut buf = vec![0u8; 2048];
@@ -702,8 +704,13 @@ fn receive(
                         );
                     }
                 }
+                // Hold the read guard through writing, so handoff to playback
+                // cannot race an in-flight live packet into the shared rings.
+                let overridden = override_gate.read().unwrap_or_else(|e| e.into_inner());
                 let routes = routing.read().unwrap_or_else(|e| e.into_inner());
-                for (slot, targets) in routes.iter().enumerate().take(slots) {
+                for (slot, targets) in
+                    routes.iter().enumerate().take(slots).filter(|_| !*overridden)
+                {
                     if targets.is_empty() {
                         continue;
                     }

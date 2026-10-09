@@ -254,6 +254,9 @@ impl AppConfig {
         self.device.validate()?;
         rate_from_ppm(self.clock.free_rate_ppm).context("clock.free_rate_ppm")?;
         match self.audio.backend {
+            BackendKind::Record if self.device.rx_channels.names().is_empty() => {
+                bail!("the record backend needs at least one receive channel")
+            }
             BackendKind::Soundcard
                 if self.audio.output_device.is_none() && self.audio.input_device.is_none() =>
             {
@@ -357,6 +360,16 @@ backend = "none"
 mod tests {
     use super::*;
     use ovsc_core::Channels;
+
+    #[test]
+    fn record_requires_receive_channels() {
+        let mut cfg = AppConfig::default();
+        cfg.audio.backend = BackendKind::Record;
+        cfg.device.rx_channels = Channels::Count(0);
+        assert!(cfg.validate().is_err());
+        cfg.device.rx_channels = Channels::Count(1);
+        cfg.validate().unwrap();
+    }
 
     #[test]
     fn example_parses() {
