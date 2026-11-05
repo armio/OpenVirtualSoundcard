@@ -628,6 +628,25 @@ mod tests {
         assert_eq!(err.to_string(), "the coreaudio backend needs macOS");
     }
 
+    /// A latency below the least in the configuration file (an earlier
+    /// version took 0.5 ms) is raised as the file is loaded, before any
+    /// check: it stops neither daemon. Here only the platform does.
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn a_low_latency_in_the_configuration_does_not_stop_the_daemon() {
+        let dir = std::env::temp_dir().join(format!("ovsc-main-low-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ovsc.toml");
+        std::fs::write(&path, "[device]\nlatency_ms = 0.5\n[audio]\nbackend = \"coreaudio\"\n")
+            .unwrap();
+        let cli = Cli::try_parse_from(["ovsc", "run", "--config", path.to_str().unwrap()]).unwrap();
+        let Command::Run(args) = cli.command else { panic!("not run") };
+        let err = run(args).await.unwrap_err();
+        assert_eq!(err.to_string(), "the coreaudio backend needs macOS");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn the_ptp_master_runs_at_its_rate() {
         let parse = |args: &[&str]| -> f64 {
