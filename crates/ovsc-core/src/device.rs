@@ -96,6 +96,29 @@ pub struct DeviceStats {
     pub rx_packets: u64,
     /// Received packets that were already older than the receive latency.
     pub rx_late_packets: u64,
+    /// Audio packets the network stack refused to send or reported
+    /// undeliverable.
+    pub tx_send_errors: u64,
+    /// The OS error code of the latest send error, 0 if none.
+    pub tx_last_send_error: i32,
+    /// Audio packets sent more than 250 µs after their send time
+    /// (timestamp + guard).
+    pub tx_late_packets: u64,
+    /// The latest an audio packet left after its send time, in ns.
+    pub tx_max_lateness_ns: u64,
+    /// Audio packets never sent: too old for any receiver after a stall of
+    /// the transmit thread or a media clock step.
+    pub tx_skipped_packets: u64,
+    /// Times a transmit flow's timeline restarted after such a stall or
+    /// step.
+    pub tx_resyncs: u64,
+    /// Transmit flows removed after 4 s without keepalives.
+    pub tx_expired_flows: u64,
+    /// The transmit thread runs without real-time scheduling.
+    pub tx_not_realtime: bool,
+    /// The transmit thread has stopped: no flow sends audio until the
+    /// device restarts.
+    pub tx_engine_failed: bool,
 }
 
 impl Device {
@@ -490,6 +513,15 @@ fn stats(shared: &Shared) -> DeviceStats {
         tx_underruns: c.tx_underruns.load(Ordering::Relaxed),
         rx_packets: c.rx_packets.load(Ordering::Relaxed),
         rx_late_packets: c.rx_late_packets.load(Ordering::Relaxed),
+        tx_send_errors: c.tx_send_errors.load(Ordering::Relaxed),
+        tx_last_send_error: c.tx_last_send_error.load(Ordering::Relaxed),
+        tx_late_packets: c.tx_late_packets.load(Ordering::Relaxed),
+        tx_max_lateness_ns: c.tx_max_lateness_ns.load(Ordering::Relaxed),
+        tx_skipped_packets: c.tx_skipped_packets.load(Ordering::Relaxed),
+        tx_resyncs: c.tx_resyncs.load(Ordering::Relaxed),
+        tx_expired_flows: c.tx_expired_flows.load(Ordering::Relaxed),
+        tx_not_realtime: c.tx_not_realtime.load(Ordering::Relaxed),
+        tx_engine_failed: c.tx_engine_failed.load(Ordering::Relaxed),
     }
 }
 

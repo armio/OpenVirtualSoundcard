@@ -96,10 +96,13 @@ pub fn max_fpp(channels: usize, format: SampleFormat) -> usize {
     MAX_PAYLOAD / (channels.max(1) * format.bytes())
 }
 
-/// Encodes a media packet into `out` and returns its length.
+/// Encodes a media packet into `out` and returns its length,
+/// `HEADER_LEN + frames * channels * format.bytes()`.
 ///
-/// `sample(frame, channel)` supplies each sample. `out` must hold at least
-/// `HEADER_LEN + frames * channels * format.bytes()` bytes.
+/// `sample(frame, channel)` supplies each sample. Returns `None`, and
+/// leaves `out` alone, if the packet does not fit in `out` or
+/// `sample_rate` is 0. It never panics: the transmit thread calls it for
+/// every flow, and a panic there would stop all of them.
 pub fn encode_packet(
     out: &mut [u8],
     timestamp: u64,
@@ -108,20 +111,28 @@ pub fn encode_packet(
     channels: usize,
     frames: usize,
     mut sample: impl FnMut(usize, usize) -> Sample,
-) -> usize {
-    let (sec, sub) = split_timestamp(timestamp, sample_rate);
-    out[0] = VERSION;
-    out[1..5].copy_from_slice(&sec.to_be_bytes());
-    out[5..9].copy_from_slice(&sub.to_be_bytes());
+) -> Option<usize> {
     let width = format.bytes();
-    let mut pos = HEADER_LEN;
+    let len = frames.checked_mul(channels)?.checked_mul(width)?.checked_add(HEADER_LEN)?;
+    if sample_rate == 0 {
+        return None;
+    }
+    let out = out.get_mut(..len)?;
+    let (sec, sub) = split_timestamp(timestamp, sample_rate);
+    let (header, payload) = out.split_at_mut(HEADER_LEN);
+    header[0] = VERSION;
+    header[1..5].copy_from_slice(&sec.to_be_bytes());
+    header[5..9].copy_from_slice(&sub.to_be_bytes());
+    // Exactly frames * channels slots, by the length computed above.
+    let mut slots = payload.chunks_exact_mut(width);
     for frame in 0..frames {
         for ch in 0..channels {
-            format.write(&mut out[pos..pos + width], sample(frame, ch));
-            pos += width;
+            if let Some(slot) = slots.next() {
+                format.write(slot, sample(frame, ch));
+            }
         }
     }
-    pos
+    Some(len)
 }
 
 /// A parsed media packet.
@@ -215,7 +226,8 @@ mod tests {
         let len =
             encode_packet(&mut buf, ts, 96_000, SampleFormat::S24, channels, frames, |f, c| {
                 ((f * 10 + c) as i32) << 8
-            });
+            })
+            .unwrap();
         assert_eq!(len, HEADER_LEN + frames * channels * 3);
         assert_eq!(buf[0], VERSION);
         let p = AudioPacket::parse(&buf[..len], channels, SampleFormat::S24).unwrap();
@@ -225,6 +237,28 @@ mod tests {
         let mut ch1 = [0; 32];
         assert_eq!(p.read_channel(1, &mut ch1), frames);
         assert_eq!(ch1[15], (151 << 8));
+    }
+
+    #[test]
+    fn a_packet_that_does_not_fit_is_refused_without_panicking() {
+        // 16 frames of 8 slots at 32 bit: 9 + 512 bytes.
+        let mut buf = [0xaau8; 520];
+        let encode = |buf: &mut [u8], frames: usize, rate: u32| {
+            encode_packet(buf, 48_000, rate, SampleFormat::S32, 8, frames, |_, _| -1)
+        };
+        assert_eq!(encode(&mut buf, 16, 48_000), None);
+        assert!(buf.iter().all(|&b| b == 0xaa), "nothing written");
+        assert_eq!(encode(&mut buf, usize::MAX / 2, 48_000), None);
+        assert_eq!(encode(&mut buf, 1, 0), None);
+        // One byte more and it fits exactly.
+        let mut buf = [0u8; 521];
+        assert_eq!(encode(&mut buf, 16, 48_000), Some(521));
+        assert!(buf[HEADER_LEN..].iter().all(|&b| b == 0xff));
+        // No slots: a header only.
+        assert_eq!(
+            encode_packet(&mut buf, 0, 48_000, SampleFormat::S16, 0, 32, |_, _| 0),
+            Some(HEADER_LEN)
+        );
     }
 
     #[test]

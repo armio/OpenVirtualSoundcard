@@ -212,6 +212,39 @@ pub fn bind_udp(ip: Ipv4Addr, port: u16) -> io::Result<UdpSocket> {
     Ok(s.into())
 }
 
+/// The IPv4 type-of-service byte of audio packets: DSCP 46, Expedited
+/// Forwarding, with ECN off. Audinate's published QoS settings for Dante
+/// networks put audio at EF (and PTP at CS7). Switches with DSCP-based
+/// priority queues forward EF ahead of bulk traffic, so an unmarked audio
+/// packet waits behind file copies and video on a shared or congested
+/// link while marked Dante hardware on the same path does not. Networks
+/// without QoS ignore the marking.
+pub const MEDIA_TOS: u32 = 46 << 2;
+
+/// Marks the packets `socket` sends as audio ([`MEDIA_TOS`]).
+#[cfg(not(any(
+    target_os = "fuchsia",
+    target_os = "redox",
+    target_os = "solaris",
+    target_os = "haiku",
+    target_os = "wasi",
+)))]
+pub fn mark_media(socket: &UdpSocket) -> io::Result<()> {
+    socket2::SockRef::from(socket).set_tos_v4(MEDIA_TOS)
+}
+
+/// Marks the packets `socket` sends as audio: not supported on this OS.
+#[cfg(any(
+    target_os = "fuchsia",
+    target_os = "redox",
+    target_os = "solaris",
+    target_os = "haiku",
+    target_os = "wasi",
+))]
+pub fn mark_media(_socket: &UdpSocket) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
 /// Binds `0.0.0.0:port` with address reuse and joins `group` on the
 /// interface `iface_ip`.
 pub fn bind_multicast(group: Ipv4Addr, port: u16, iface_ip: Ipv4Addr) -> io::Result<UdpSocket> {
@@ -277,6 +310,19 @@ mod tests {
     fn ephemeral_bind() {
         let s = bind_udp(Ipv4Addr::LOCALHOST, 0).unwrap();
         assert_ne!(s.local_addr().unwrap().port(), 0);
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn media_sockets_are_marked_expedited_forwarding() {
+        let s = bind_udp(Ipv4Addr::LOCALHOST, 0).unwrap();
+        assert_eq!(socket2::SockRef::from(&s).tos_v4().unwrap(), 0, "unmarked by default");
+        mark_media(&s).unwrap();
+        assert_eq!(socket2::SockRef::from(&s).tos_v4().unwrap(), 0xb8);
+        // The marking survives what a flow socket does next.
+        s.connect((Ipv4Addr::LOCALHOST, 9)).unwrap();
+        s.set_nonblocking(true).unwrap();
+        assert_eq!(socket2::SockRef::from(&s).tos_v4().unwrap(), 0xb8);
     }
 
     #[test]

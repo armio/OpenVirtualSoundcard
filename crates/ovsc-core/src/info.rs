@@ -25,11 +25,10 @@ pub const MAX_TX_FLOWS: usize = 32;
 pub const MAX_RX_FLOWS: usize = 32;
 /// Channels per transmit flow we advertise.
 pub const MAX_CHANNELS_PER_TX_FLOW: u16 = 8;
-/// Frames-per-packet range we advertise for transmit flows.
+/// Frames-per-packet range we advertise for transmit flows, and accept in
+/// flow requests.
 pub const FPP_MAX: u16 = 32;
 pub const FPP_MIN: u16 = 2;
-/// Largest frames-per-packet value we accept in flow requests.
-pub const FPP_LIMIT: u16 = 256;
 /// PCM type of current Dante devices.
 pub const PCM_TYPE: u8 = 0x0e;
 

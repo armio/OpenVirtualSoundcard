@@ -7,7 +7,9 @@
 //! thread that runs for about a second without blocking, and the thread then
 //! competes with everything else again.
 
-use tracing::{debug, info};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use tracing::{debug, warn};
 
 /// What a real-time thread does. On macOS it selects the thread's
 /// time-constraint contract with the scheduler; elsewhere every class gets
@@ -50,28 +52,33 @@ impl RtClass {
     }
 }
 
-/// Asks the OS to schedule the calling thread as real-time (best effort).
+/// Asks the OS to schedule the calling thread as real-time (best effort),
+/// and returns whether it did.
 ///
 /// Without it, a busy machine can delay the audio threads long enough for
 /// receivers to drop audio. On macOS the thread gets the time-constraint
-/// policy for its `class`, which needs no privileges; if that fails, and on
-/// every other OS, it asks for the highest priority instead. Linux needs
-/// `CAP_SYS_NICE` (or rtkit) for that; macOS and Windows allow raised
-/// priorities for normal users.
-pub fn raise_priority(what: &str, class: RtClass) {
+/// policy for its `class`, which needs no privileges; if that fails (it is
+/// not expected to), the thread gets a raised priority that is not
+/// real-time. Other Unix systems get `SCHED_FIFO`, which Linux grants only
+/// with `CAP_SYS_NICE` (or through rtkit); failing that, the thread gets
+/// the highest normal priority it may have. Whenever the thread ends up
+/// without real-time scheduling the function warns (once per process) and
+/// returns false, so that the caller can record it where the status shows
+/// it. Elsewhere (Windows) the highest priority is the best there is, and
+/// counts as real-time.
+pub fn raise_priority(what: &str, class: RtClass) -> bool {
     #[cfg(target_os = "macos")]
     match macos::set_time_constraint(class.time_constraint()) {
         Ok(()) => {
             debug!("{what} thread runs with the real-time time-constraint policy");
-            return;
+            return true;
         }
         Err(kr) => {
-            use std::sync::atomic::{AtomicBool, Ordering};
             static WARNED: AtomicBool = AtomicBool::new(false);
             if !WARNED.swap(true, Ordering::Relaxed) {
-                tracing::warn!(
+                warn!(
                     "cannot give the {what} thread the real-time time-constraint policy \
-                     (thread_policy_set returned {kr}); raising its priority instead"
+                     (thread_policy_set returned {kr}); trying a raised priority instead"
                 );
             }
         }
@@ -88,23 +95,30 @@ pub fn raise_priority(what: &str, class: RtClass) {
         };
         let fifo = ThreadSchedulePolicy::Realtime(RealtimeThreadSchedulePolicy::Fifo);
         if set_thread_priority_and_policy(thread_native_id(), ThreadPriority::Max, fifo).is_ok() {
-            debug!("{what} thread runs with real-time priority");
-            return;
+            debug!("{what} thread runs with the SCHED_FIFO policy");
+            // On macOS only the time-constraint policy is real-time:
+            // SCHED_FIFO there is a fixed priority below the real-time band
+            // that Core Audio's threads run in, and the warning above said so.
+            return cfg!(not(target_os = "macos"));
         }
     }
-    match set_current_thread_priority(ThreadPriority::Max) {
-        Ok(()) => debug!("{what} thread runs with raised priority"),
-        Err(e) => {
-            use std::sync::atomic::{AtomicBool, Ordering};
-            static WARNED: AtomicBool = AtomicBool::new(false);
-            if !WARNED.swap(true, Ordering::Relaxed) {
-                info!(
-                    "audio threads run at normal priority ({e:?}); on a busy host this can \
-                     cause dropouts. Grant real-time scheduling (e.g. CAP_SYS_NICE) to avoid it."
-                );
-            }
-        }
+    let raised = set_current_thread_priority(ThreadPriority::Max);
+    if cfg!(not(unix)) && raised.is_ok() {
+        debug!("{what} thread runs with the highest priority");
+        return true;
     }
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        let how = match raised {
+            Ok(()) => "a raised but not real-time priority".to_string(),
+            Err(e) => format!("normal priority ({e:?})"),
+        };
+        warn!(
+            "the {what} thread runs at {how}; on a busy host this can cause dropouts. \
+             Grant real-time scheduling (e.g. CAP_SYS_NICE) to avoid it."
+        );
+    }
+    false
 }
 
 /// Blocks the calling thread until [`ovsc_clock::local_now_ns`]
@@ -286,7 +300,18 @@ mod tests {
     fn raise_priority_is_best_effort() {
         for class in [RtClass::Transmit, RtClass::Receive] {
             std::thread::spawn(move || {
-                raise_priority("test", class);
+                let realtime = raise_priority("test", class);
+                // What it reports is what the thread got: SCHED_FIFO with
+                // CAP_SYS_NICE (root in a container), normal scheduling
+                // without.
+                #[cfg(target_os = "linux")]
+                {
+                    // SAFETY: no pointers; 0 is the calling thread.
+                    let policy = unsafe { libc::sched_getscheduler(0) };
+                    let policy = policy & !libc::SCHED_RESET_ON_FORK;
+                    assert_eq!(realtime, policy == libc::SCHED_FIFO, "policy {policy}");
+                }
+                let _ = realtime;
                 sleep_until(local_now_ns() + 1_000_000);
             })
             .join()
