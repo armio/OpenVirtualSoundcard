@@ -63,8 +63,9 @@ pub struct DirectionStats {
     /// ring may already have reused its slots.
     pub overruns: u64,
     /// Times the stream jumped back onto its target (a device gap or xrun,
-    /// a stall, a media-clock step, a larger callback) or realigned: each
-    /// is a dip of a few milliseconds.
+    /// a stall, a media-clock step, a larger callback), each a dip of a few
+    /// milliseconds, or realigned after it had been running (clock loss, a
+    /// large step before the loop locked), each a mute of about 100 ms.
     pub realigns: u64,
     /// Errors reported by the audio backend (xruns, disconnects, ...).
     pub device_errors: u64,

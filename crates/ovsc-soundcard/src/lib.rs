@@ -84,13 +84,16 @@
 //!   clock at every callback, jitter filtered out) and steers the ratio,
 //!   within ±1000 ppm. It locks in a few seconds and then holds the ratio
 //!   within a ppm or two of the true clock ratio, an inaudible pitch
-//!   modulation. A device gap or xrun, a stall or a media-clock step makes
-//!   the stream jump back onto its target within a few callbacks (at once
-//!   for an xrun the backend reports), with a dip of a few milliseconds:
-//!   the audio before the break ramps down over up to 2 ms, the audio after
-//!   it fades in over 5 ms. Only start-up, the loss of the media clock and
-//!   a step beyond 50 ms before the loop has locked mute the stream while
-//!   it settles (100 ms).
+//!   modulation. When a device gap or xrun, a stall or a media-clock step
+//!   leaves the stream where it loses audio (beyond its margin), it jumps
+//!   back onto its target once three callbacks agree (at once for a capture
+//!   xrun the backend reports). On the other side, a backlog of more than a
+//!   callback plus the margin is dropped by a jump after 50 ms; a smaller
+//!   one is slewed away. A jump is a dip of a few milliseconds: the audio
+//!   before the break ramps down over up to 2 ms, the audio after it fades
+//!   in over 5 ms. Only start-up, the loss of the media clock and a step
+//!   beyond 50 ms before the loop has locked mute the stream while it
+//!   settles (100 ms).
 //! * The resampler is a 64-tap Kaiser-windowed sinc interpolator with 1024
 //!   tabulated phases, accurate to better than −100 dB up to 20 kHz at
 //!   48 kHz; it reads the rings (or a short capture history) at arbitrary
@@ -106,10 +109,10 @@
 //! CoreAudio runs callbacks on its real-time IO thread, and WASAPI threads
 //! join the MMCSS "Audio" class (cpal's `realtime` feature). On Linux the
 //! bridge raises each callback thread to `SCHED_FIFO` itself from its first
-//! callback, for every ALSA device except those served by a sound server
-//! (`default`, `pulse`, `pipewire`, `jack`); that needs `CAP_SYS_NICE` (or
-//! root), and [`DirectionStats::realtime`] and a warning say when it was
-//! refused. Without it a busy machine causes xruns at small buffers.
+//! callback, for every ALSA device except `null` and those served by a
+//! sound server (`default`, `pulse`, `pipewire`, `jack`); that needs
+//! `CAP_SYS_NICE` (or root, or an `rtprio` limit of at least 90), and
+//! [`DirectionStats::realtime`] and a warning say when it was refused. Without it a busy machine causes xruns at small buffers.
 //!
 //! # Latency
 //!

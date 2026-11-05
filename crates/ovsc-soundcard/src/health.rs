@@ -50,7 +50,10 @@ impl Counter {
                  this keeps growing)"
             }
             Counter::Overruns => "overruns (audio too far from the network's edge)",
-            Counter::Realigns => "jumps back onto the timeline (each a dip of a few ms)",
+            Counter::Realigns => {
+                "jumps back onto the timeline (each a dip of a few ms, or a 100 ms mute while \
+                 the stream settles again)"
+            }
         }
     }
 }

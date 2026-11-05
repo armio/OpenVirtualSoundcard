@@ -6,8 +6,9 @@
 //! `realtime` feature WASAPI's threads join the MMCSS "Audio" class. cpal's
 //! ALSA threads would only be promoted through rtkit, and only for `hw:`
 //! devices (not the `plughw:` names the documentation recommends), so on
-//! Linux and the BSDs the bridge raises each callback thread to `SCHED_FIFO`
-//! itself, from its first callback.
+//! Linux the bridge raises each callback thread to `SCHED_FIFO` itself,
+//! from its first callback. (The BSDs get the same attempt; where their
+//! real-time priorities stop below 90 it is refused.)
 
 /// `SCHED_FIFO` priority of the callback threads: above typical audio
 /// applications and sound servers (PipeWire's data threads use 88), below
