@@ -30,12 +30,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
+use tokio::sync::oneshot;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 
 use ovsc_clock::ptp::{PtpConfig, PtpFollower};
 use ovsc_clock::{MediaClock, free_running_clock_with_rate};
-use ovsc_control::{Restart, SettingsChange};
+use ovsc_control::{Request, Response, Restart, SettingsChange};
 use ovsc_core::net::Interface;
 use ovsc_core::{Device, FormatRequest, RemoteChanges, SavedState, StartOptions};
 use ovsc_hal_server::{
@@ -334,6 +335,31 @@ impl Ctx<'_> {
         control::answer(call, &self.view(engine, Some(error))) == control::After::RestartDaemon
     }
 
+    /// Answers a control call while no engine runs, the last start having
+    /// failed with `error`; whether the daemon must restart. A change the
+    /// app applies meanwhile, saved in the state file, also goes into
+    /// `carry`, the state the next device starts from (see
+    /// [`Carry::take_app_change`]).
+    fn answer_idle(&self, mut call: control::Call, error: &str, carry: Option<&mut Carry>) -> bool {
+        let (Request::Apply { change }, Some(carry), Some(path)) =
+            (&call.request, carry, self.cfg.device.state_file.as_deref())
+        else {
+            return self.answer(call, None, error);
+        };
+        let change = change.clone();
+        // The answer passes through here, to see whether it was applied.
+        let (reply, mut answer) = oneshot::channel();
+        let app = std::mem::replace(&mut call.reply, reply);
+        let restart = self.answer(call, None, error);
+        if let Ok(response) = answer.try_recv() {
+            if matches!(response, Response::Applied { .. }) {
+                carry.take_app_change(&change, path);
+            }
+            let _ = app.send(response);
+        }
+        restart
+    }
+
     /// Saves a sample rate or bit depth that a controller asked for;
     /// whether the daemon must restart to apply it.
     fn apply_format(&self, engine: &Engine, request: FormatRequest) -> bool {
@@ -364,9 +390,15 @@ impl Ctx<'_> {
 /// Starts the engine, retrying until it runs, or returns why it stopped
 /// trying first. While it waits, the status line carries the driver's
 /// status and the last failure, and the app's calls are answered.
+///
+/// The app's changes of the name, latency and show lock go to the state
+/// file meanwhile, since no device runs to take them, and into `carry`
+/// too (see [`Ctx::answer_idle`]): a device started from `carry` does not
+/// read the state file, and would run without them and save the carried
+/// state over them.
 async fn start_engine(
     ctx: &mut Ctx<'_>,
-    carry: Option<Carry>,
+    mut carry: Option<Carry>,
     stop: &mut impl Stop,
 ) -> anyhow::Result<Result<Engine, Next>> {
     let mut delay = RETRY_FIRST;
@@ -413,7 +445,7 @@ async fn start_engine(
                     );
                 }
                 call = ctx.control.next() => {
-                    if ctx.answer(call, None, &last_error) {
+                    if ctx.answer_idle(call, &last_error, carry.as_mut()) {
                         return Ok(Err(Next::RestartDaemon));
                     }
                 }
@@ -542,6 +574,27 @@ struct Carry {
 impl From<&Device> for Carry {
     fn from(device: &Device) -> Self {
         Carry { state: device.saved_state(), remote_changes: device.remote_changes() }
+    }
+}
+
+impl Carry {
+    /// Takes in `change`, which the app applied while no engine ran:
+    /// [`control::apply`] saved its name, latency and show lock in the
+    /// state file at `path` then, and they are read back from there, as
+    /// saved. Only what `change` set: the rest stays the carried state,
+    /// which holds even if the last save of the device that stopped
+    /// failed.
+    fn take_app_change(&mut self, change: &SettingsChange, path: &Path) {
+        let Some(saved) = SavedState::load(path) else { return };
+        if change.name.is_some() {
+            self.state.name = saved.name;
+        }
+        if change.latency_ms.is_some() {
+            self.state.latency_ns = saved.latency_ns;
+        }
+        if change.lock_remote_settings.is_some() {
+            self.state.lock_remote_settings = saved.lock_remote_settings;
+        }
     }
 }
 
@@ -1200,6 +1253,101 @@ mod tests {
         assert!(engine.device.remote_settings_locked());
         assert_eq!(engine.device.saved_state().subscriptions.len(), 1);
         engine.shutdown().await;
+    }
+
+    /// While the engine cannot start again after a restart, the app's
+    /// changes go to the state file. The device that starts at last takes
+    /// them in, rather than run on the carried state and save it over them,
+    /// and still has what only the carry holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_apps_changes_while_the_engine_restarts_are_kept() {
+        const PORT: u16 = 24946;
+        let dir = std::env::temp_dir().join(format!("ovsc-ca-carry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let socket = dir.join("control.sock");
+        let state = dir.join("state.toml");
+        let mut cfg = app_config("127.0.0.1", PORT);
+        cfg.coreaudio.control_socket = socket.to_str().unwrap().into();
+        cfg.device.state_file = Some(state.clone());
+        cfg.device.latency_ms = 4.0;
+        let region = HalRegion::create(VERSION).unwrap();
+        let registry = MemRegistry::new();
+        let initial = EngineInfo::from_config(&cfg.device).unwrap();
+        let transport = Box::new(registry.bind(SERVICE));
+        let server =
+            HalServer::start(cfg.coreaudio.hal_options(), region.clone(), transport, initial)
+                .unwrap();
+
+        // The engine ran, with a subscription and a new name, and stopped:
+        // the interface changed under it, say.
+        let engine = Engine::start(&cfg, &region, None).await.unwrap();
+        engine.device.subscribe(1, "01", "console").unwrap();
+        engine.device.rename("stage-left").unwrap();
+        let carry = Carry::from(&engine.device);
+        engine.shutdown().await;
+        // As if its last save had failed: the file holds an older name.
+        SavedState::update(&state, |s| s.name = Some("older".into())).unwrap();
+        // Something holds the device's ARC port: it cannot start yet.
+        let blocker = std::net::UdpSocket::bind(("127.0.0.1", PORT)).unwrap();
+
+        let mut listener =
+            ListenerCheck { invalid: Box::new(|| false), service: SERVICE.into(), reported: false };
+        let mut status = StatusTimer::new(Duration::ZERO);
+        let mut control = Control::listen(&cfg.coreaudio.control_socket);
+        let health = Mutex::new(Health::new());
+        let mut ctx = Ctx {
+            cfg: &cfg,
+            config_path: None,
+            region: &region,
+            server: &server,
+            listener: &mut listener,
+            status: &mut status,
+            control: &mut control,
+            health: &health,
+            sup: quiet(),
+        };
+        let (_stop_tx, mut stop) = mpsc::unbounded_channel();
+        let restart = start_engine(&mut ctx, Some(carry), &mut stop);
+        let app = async {
+            // Refused: nothing changes.
+            let change = SettingsChange {
+                latency_ms: Some(80.0),
+                name: Some("refused".into()),
+                ..Default::default()
+            };
+            let refused = ask(&socket, Request::Apply { change }).await;
+            assert!(matches!(refused, Response::Error { .. }), "{refused:?}");
+            // Meanwhile the operator turns the show lock on and sets 2 ms:
+            // saved in the state file, as the app is told.
+            let change = SettingsChange {
+                lock_remote_settings: Some(true),
+                latency_ms: Some(2.0),
+                ..Default::default()
+            };
+            assert_eq!(apply(&socket, change).await, Restart::None);
+            let saved = SavedState::load(&state).unwrap();
+            assert_eq!(
+                (saved.lock_remote_settings, saved.latency_ns),
+                (Some(true), Some(2_000_000))
+            );
+            // The network is back: the next attempt starts the engine.
+            drop(blocker);
+        };
+        let (started, ()) = tokio::join!(restart, app);
+        let Ok(Ok(engine)) = started else { panic!("the engine did not start") };
+        assert!(engine.device.remote_settings_locked());
+        assert_eq!(engine.device.info().latency_ns, 2_000_000);
+        // What the app did not change is the carried state's.
+        assert_eq!(engine.device.name(), "stage-left");
+        assert_eq!(engine.device.saved_state().subscriptions.len(), 1);
+        // The state file keeps all of it.
+        engine.shutdown().await;
+        let saved = SavedState::load(&state).unwrap();
+        assert_eq!((saved.lock_remote_settings, saved.latency_ns), (Some(true), Some(2_000_000)));
+        assert_eq!(saved.name.as_deref(), Some("stage-left"));
+        assert_eq!(saved.subscriptions.len(), 1);
+        server.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A daemon that starts again (launchd starts a new one after a panic)
