@@ -27,7 +27,8 @@ tx_channels = 8
 latency_ms = 4.0             # receive latency, 1 to 40
 # Transmit latency, 1 to 40 ms: receivers of the transmit channels (the
 # console) play them at the larger of this and their own latency. Unset:
-# latency_ms, so a longer receive latency also delays the returns. For live
+# latency_ms above, so a longer latency_ms here also delays the returns (a
+# latency set from the app or Dante Controller does not change it). For live
 # use, 1.0 (or the console's latency) keeps the returns as early as the
 # console allows. Both latencies must be at least 1 ms: packets leave
 # 0.5 ms after their time.

@@ -31,8 +31,8 @@ pub const MAX_LATENCY_MS: f64 = 40.0;
 /// its own latency and the one its transmitter advertises (docs/PROTOCOL.md
 /// 2.2 and 8.4; `flow_latency` in `rx.rs`). The floor on our own receive
 /// latency guards our transmit latency while `tx_latency_ms` is unset (it
-/// is the receive latency then), and flows from transmitters that send
-/// later than they advertise.
+/// is the configured receive latency then), and flows from transmitters
+/// that send later than they advertise.
 pub const LATENCY_HEADROOM_US: u32 = 500;
 
 /// UDP ports of the device's services.
@@ -118,7 +118,9 @@ pub struct DeviceConfig {
     /// Transmit latency: the least receive latency the device asks of the
     /// receivers of its transmit channels (TXT `latency_ns`). They play its
     /// audio at the larger of this and their own latency (docs/PROTOCOL.md
-    /// 2.2 and 8.4). `None`: `latency_ms`.
+    /// 2.2 and 8.4). `None`: `latency_ms` as configured; a receive latency
+    /// set by a controller or the app does not change it (see
+    /// [`DeviceConfig::with_saved`]).
     pub tx_latency_ms: Option<f64>,
     /// How late (after its timestamp) a transmit packet is sent, in µs.
     /// Keeps receivers from seeing timestamps from "the future" when clocks
@@ -130,11 +132,11 @@ pub struct DeviceConfig {
     /// Advertise over mDNS and send conmon multicasts. Disable for tests on
     /// hosts without multicast.
     pub discovery: bool,
-    /// Show lock: refuse controllers' changes of the latency, sample rate
-    /// and encoding (they interrupt audio both ways) and of the device and
-    /// channel names (other devices subscribe by them). Subscriptions stay
-    /// open. The owner's app can turn it on and off; its choice is saved in
-    /// `state_file` and then replaces this.
+    /// Show lock: refuse controllers' changes of the latency (it pauses the
+    /// inputs), the sample rate and the encoding (they interrupt audio both
+    /// ways) and of the device and channel names (other devices subscribe
+    /// by them). Subscriptions stay open. The owner's app can turn it on and
+    /// off; its choice is saved in `state_file` and then replaces this.
     pub lock_remote_settings: bool,
     /// Where names and subscriptions are persisted. `None` disables it.
     pub state_file: Option<PathBuf>,
@@ -253,6 +255,12 @@ impl DeviceConfig {
     /// which are the device's own; the device shows the saved ones (see
     /// [`SavedState::channel_names`]).
     ///
+    /// A saved receive latency is the receive side's only: the transmit
+    /// latency stays the configured one (`tx_latency_ms`, or else the
+    /// configured `latency_ms`), as it does when the latency changes while
+    /// the device runs ([`crate::Device::restart_rx`]). Otherwise a restart
+    /// would quietly change what the device asks of its receivers.
+    ///
     /// The daemon of the macOS driver offers the driver this before the
     /// device runs, so that the device's start changes nothing Core Audio
     /// sees.
@@ -260,6 +268,7 @@ impl DeviceConfig {
         if let Some(ns) = saved.latency_ns {
             let ms = ns as f64 / 1e6;
             if check_latency_ms("latency", ms, self.tx_guard_us).is_ok() {
+                self.tx_latency_ms.get_or_insert(self.latency_ms);
                 self.latency_ms = ms;
             }
         }
@@ -274,6 +283,14 @@ impl DeviceConfig {
 
 fn ms_to_samples(ms: f64, rate: u32) -> u64 {
     (ms * rate as f64 / 1000.0).round() as u64
+}
+
+/// A receive latency of `ns` in samples at `rate`, rounded as for a device
+/// started with it ([`DeviceConfig::latency_samples`] of a configuration
+/// [`DeviceConfig::with_saved`] gave it): a latency that changes while the
+/// device runs comes to the same samples as at the next start.
+pub fn latency_samples(ns: u32, rate: u32) -> u64 {
+    ms_to_samples(ns as f64 / 1e6, rate)
 }
 
 fn ms_to_ns(ms: f64) -> u32 {
@@ -419,8 +436,12 @@ mod tests {
         };
         let s = c.clone().with_saved(&saved);
         assert_eq!((s.name.as_str(), s.latency_ms, s.latency_ns()), ("vocal-fx", 2.0, 2_000_000));
+        // The transmit latency stays the configured one, now said outright.
+        assert_eq!((s.tx_latency_ms, s.tx_latency_ns()), (Some(4.0), 4_000_000));
         // The rest, the channel names included, is the configuration's.
-        assert_eq!(DeviceConfig { name: "studio".into(), latency_ms: 4.0, ..s }, c);
+        let back =
+            DeviceConfig { name: "studio".into(), latency_ms: 4.0, tx_latency_ms: None, ..s };
+        assert_eq!(back, c);
         // Nothing saved, or nothing valid: the configuration as it is.
         assert_eq!(c.clone().with_saved(&SavedState::default()), c);
         let bad = SavedState {
@@ -433,6 +454,37 @@ mod tests {
         let guarded = DeviceConfig { tx_guard_us: 800, ..c.clone() };
         let saved = SavedState { latency_ns: Some(1_200_000), ..Default::default() };
         assert_eq!(guarded.clone().with_saved(&saved), guarded);
+    }
+
+    /// A receive latency set by a controller or the app is the receive
+    /// side's: what the device asks of the receivers of its own channels
+    /// stays as configured, set or not.
+    #[test]
+    fn a_saved_latency_leaves_the_transmit_latency_alone() {
+        let saved = SavedState { latency_ns: Some(2_000_000), ..Default::default() };
+        let unset = DeviceConfig { latency_ms: 4.0, ..Default::default() };
+        assert_eq!(unset.tx_latency_ns(), 4_000_000);
+        let s = unset.with_saved(&saved);
+        assert_eq!((s.latency_ns(), s.tx_latency_ns()), (2_000_000, 4_000_000));
+        assert_eq!((s.latency_samples(), s.tx_latency_samples()), (96, 192));
+        let set = DeviceConfig { latency_ms: 4.0, tx_latency_ms: Some(1.0), ..Default::default() };
+        let s = set.with_saved(&saved);
+        assert_eq!((s.latency_ns(), s.tx_latency_ns()), (2_000_000, 1_000_000));
+    }
+
+    /// A latency applied while the device runs comes to the samples a
+    /// device started with it computes.
+    #[test]
+    fn a_latency_in_samples_is_rounded_as_at_a_start() {
+        for rate in SAMPLE_RATES {
+            for ns in [1_000_000, 1_300_000, 2_000_000, 4_000_000, 6_666_667, 40_000_000] {
+                let saved = SavedState { latency_ns: Some(ns), ..Default::default() };
+                let c = DeviceConfig { sample_rate: rate, ..Default::default() }.with_saved(&saved);
+                assert_eq!(latency_samples(ns, rate), c.latency_samples(), "{ns} ns at {rate} Hz");
+            }
+        }
+        assert_eq!(latency_samples(1_300_000, 44_100), 57);
+        assert_eq!(latency_samples(4_000_000, 48_000), 192);
     }
 
     #[test]

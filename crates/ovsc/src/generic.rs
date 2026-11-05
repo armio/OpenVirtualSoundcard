@@ -8,8 +8,11 @@
 //!   a machine that boots before its network switch waits for it;
 //! * the interface is watched ([`crate::netwatch`]): a new address or an
 //!   adapter that came back restarts the engine on it;
-//! * a receive latency set by a controller or the app restarts the device
-//!   with it, as on macOS, instead of being acknowledged and ignored;
+//! * a receive latency set by a controller or the app restarts the device's
+//!   receive side with it at once, as on macOS (`Device::restart_rx`): the
+//!   receive flows are requested again and the audio backend reads the
+//!   receive rings at the new latency, while the transmit flows, the
+//!   backend and the device itself run on;
 //! * a sound card whose stream died (unplugged, invalidated by a format
 //!   change, a restart of the system's audio service) is reopened, with
 //!   back-off, while the device stays on the network ([`BridgeKeeper`]);
@@ -63,23 +66,6 @@ pub async fn run(cfg: AppConfig, sup: Supervision, stop: &mut impl Stop) -> anyh
                 engine.shutdown().await;
                 return Ok(());
             }
-            Next::RestartDevice => {
-                info!(
-                    "restarting the device for a receive latency of {} ms",
-                    engine.device.configured_latency_ns() as f64 / 1e6
-                );
-                let carry = Carry::from(&engine.device);
-                match engine.restart_device(&cfg).await {
-                    Ok(engine) => engine,
-                    Err(e) => {
-                        warn!("cannot restart the device: {e:#}; restarting the engine");
-                        match start_engine(&cfg, Some(carry), sup, stop).await? {
-                            Some(engine) => engine,
-                            None => return Ok(()),
-                        }
-                    }
-                }
-            }
             Next::RestartEngine => {
                 let carry = Carry::from(&engine.device);
                 engine.shutdown().await;
@@ -104,15 +90,13 @@ pub async fn run(cfg: AppConfig, sup: Supervision, stop: &mut impl Stop) -> anyh
 #[derive(Debug, PartialEq, Eq)]
 enum Next {
     Stop(&'static str),
-    /// A controller or the app set a new receive latency.
-    RestartDevice,
     /// The network interface changed under the engine.
     RestartEngine,
 }
 
-/// Runs until a stop, a new latency or an interface change, supervising
-/// the audio backend, following the device's health and logging the
-/// status every 30 s. A fault is an error.
+/// Runs until a stop or an interface change, supervising the audio
+/// backend, following the device's health, applying new receive latencies
+/// in place and logging the status every 30 s. A fault is an error.
 async fn run_engine(
     cfg: &AppConfig,
     engine: &Engine,
@@ -133,10 +117,9 @@ async fn run_engine(
     let mut latency = engine.device.latency_requests();
     latency.mark_unchanged();
     // A latency set between the device's start and this subscription
-    // was not seen as a change: apply it now.
-    if engine.device.configured_latency_ns() != engine.device.info().latency_ns {
-        return Ok(Next::RestartDevice);
-    }
+    // was not seen as a change: apply it now. The backend follows it by
+    // itself (`AudioIo::latency_samples`).
+    engine.device.restart_rx();
     let iface = &engine.device.info().iface;
     let mut watch = sup.probe.watch(&iface.name, iface.ip);
     loop {
@@ -172,9 +155,7 @@ async fn run_engine(
                 audio.supervise(&engine.device).await;
             }
             Ok(()) = latency.changed() => {
-                if engine.device.configured_latency_ns() != engine.device.info().latency_ns {
-                    return Ok(Next::RestartDevice);
-                }
+                engine.device.restart_rx();
             }
         }
     }
@@ -274,26 +255,6 @@ impl Engine {
             }
         };
         match start_device(cfg, &clock, carried).await {
-            Ok(device) => Ok(Engine { device, clock, follower }),
-            Err(e) => {
-                if let Some(f) = follower {
-                    f.shutdown();
-                }
-                Err(e)
-            }
-        }
-    }
-
-    /// Stops the device and starts it again with the latency a controller
-    /// or the app set, on the same clock, which stays locked. On failure
-    /// the clock is stopped too.
-    async fn restart_device(self, cfg: &AppConfig) -> anyhow::Result<Engine> {
-        let Engine { device, clock, follower } = self;
-        let mut cfg = cfg.clone();
-        cfg.device.latency_ms = device.configured_latency_ns() as f64 / 1e6;
-        let carry = Carry::from(&device);
-        device.shutdown().await;
-        match start_device(&cfg, &clock, Some(carry)).await {
             Ok(device) => Ok(Engine { device, clock, follower }),
             Err(e) => {
                 if let Some(f) = follower {
@@ -729,10 +690,11 @@ mod tests {
         engine.device.name_conflict().is_some_and(|c| c.renamed_to.is_none())
     }
 
-    /// A restart for a new latency, and one of the whole engine, keep the
-    /// name the device announced while another device announces it too:
-    /// it is handed on, not probed for again, so the device never renames
-    /// itself mid-show. The conflict is reported.
+    /// A new latency, and a restart of the whole engine, keep the name the
+    /// device announced while another device announces it too: the first
+    /// restarts nothing that announces, the second hands the name on
+    /// rather than probe for it again, so the device never renames itself
+    /// mid-show. The conflict is reported.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restarts_keep_the_announced_name_through_a_live_conflict() {
         let name = format!("gen-keep{}", std::process::id());
@@ -756,8 +718,7 @@ mod tests {
         eventually("the conflict", || live_conflict(&engine)).await;
 
         engine.device.request_latency(2_000_000).unwrap();
-        let engine = engine.restart_device(&cfg).await.unwrap();
-        eventually("the conflict after the restart", || live_conflict(&engine)).await;
+        assert!(engine.device.restart_rx());
         // Longer than a probe takes.
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert_eq!(engine.device.name(), name);
@@ -774,8 +735,11 @@ mod tests {
         holder.shutdown().await;
     }
 
+    /// A controller's latency restarts only the device's receive side: the
+    /// device, and with it the audio backend, runs on at the new latency.
+    /// A new address restarts the whole engine.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_controllers_latency_and_a_new_address_restart_the_device() {
+    async fn a_controllers_latency_restarts_the_receive_side_and_a_new_address_the_engine() {
         let base = 26140;
         let dir = std::env::temp_dir().join(format!("ovsc-generic-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -795,20 +759,21 @@ mod tests {
             eventually("the first recording", || takes(1).exists()).await;
             eventually_runs_at(base, 4, "the device did not start at 4 ms").await;
 
-            // A controller sets 2 ms: the device restarts at 2 ms.
+            // A controller sets 2 ms: the device runs at 2 ms, and the
+            // recording goes on.
             let seq = ovsc_core::client::next_seq();
             let r = ask(base, arc::encode_set_latency_request(seq, 2_000_000, 16)).await.unwrap();
             let result = Frame::parse(&r).unwrap().header.result;
             assert_eq!(result, ovsc_proto::frame::result::SUCCESS);
-            eventually("a restart", || takes(2).exists()).await;
-            eventually_runs_at(base, 2, "the device did not restart at 2 ms").await;
-            assert_eq!(count(), 2);
+            eventually_runs_at(base, 2, "the device did not change to 2 ms").await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(count(), 1, "the device restarted");
 
             // The interface's address moves: the engine restarts (and goes
             // on restarting while the address is elsewhere). Back on it,
             // the engine runs on at 2 ms and stays.
             MOVED.store(true, std::sync::atomic::Ordering::SeqCst);
-            eventually("a restart on the new address", || takes(3).exists()).await;
+            eventually("a restart on the new address", || takes(2).exists()).await;
             MOVED.store(false, std::sync::atomic::Ordering::SeqCst);
             eventually_runs_at(base, 2, "the engine did not come back at 2 ms").await;
             let settled = count();

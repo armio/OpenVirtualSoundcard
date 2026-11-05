@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::SystemTime;
 
@@ -45,14 +45,15 @@ pub struct State {
     pub rx_flow_stats: Vec<(u16, Arc<FlowStats>)>,
     /// A receive latency set by a controller or the app, in ns, in place of
     /// the configured one. The running device keeps its latency
-    /// ([`DeviceInfo::latency_ns`]); a new one takes effect when the device
-    /// restarts, which [`Shared::latency_requests`] asks for.
+    /// ([`DeviceInfo::latency`]) until [`Shared::restart_rx`] applies the new
+    /// one, which [`Shared::latency_requests`] listeners call.
     pub latency_override_ns: Option<u32>,
     /// The show lock: while it is on, controllers may not change the
-    /// latency, the sample rate or the encoding, which interrupt audio both
-    /// ways, nor the device or channel names, which other devices'
-    /// subscriptions depend on. Subscriptions stay open, and the app's
-    /// changes still apply. See [`Shared::lock_remote_settings`].
+    /// latency, which pauses the inputs, the sample rate or the encoding,
+    /// which interrupt audio both ways, nor the device or channel names,
+    /// which other devices' subscriptions depend on. Subscriptions stay
+    /// open, and the app's changes still apply. See
+    /// [`Shared::lock_remote_settings`].
     pub remote_settings_locked: bool,
     /// The lock as the app last set it, saved with the state so that it
     /// survives restarts; `None` until then, when the configuration's
@@ -210,6 +211,53 @@ impl RemoteChanges {
     }
 }
 
+/// The receive latency a device runs at: received audio plays this long
+/// after its timestamp. Unlike the rest of [`DeviceInfo`], it changes while
+/// the device runs ([`crate::Device::restart_rx`]), and only the receive side
+/// follows it: the receive flows, and audio backends, which read the receive
+/// rings this far behind the media clock. Clones share the value. Reading it
+/// neither locks nor allocates, so real-time threads may.
+#[derive(Clone, Debug)]
+pub struct RxLatency(Arc<AtomicU64>);
+
+impl RxLatency {
+    /// A latency of `ns`, which is `samples` at the device's sample rate
+    /// ([`crate::config::latency_samples`]).
+    pub fn new(ns: u32, samples: u64) -> Self {
+        Self(Arc::new(AtomicU64::new(pack_latency(ns, samples))))
+    }
+
+    /// The latency in ns and in samples, read together.
+    pub fn get(&self) -> (u32, u64) {
+        let v = self.0.load(Ordering::Relaxed);
+        ((v >> 32) as u32, v & u64::from(u32::MAX))
+    }
+
+    /// The latency in ns.
+    pub fn ns(&self) -> u32 {
+        self.get().0
+    }
+
+    /// The latency in samples at the device's sample rate.
+    pub fn samples(&self) -> u64 {
+        self.get().1
+    }
+
+    /// Sets the latency. Only for one you made yourself (to test an audio
+    /// backend, say): a device's own is set by
+    /// [`crate::Device::restart_rx`], which also requests its receive flows
+    /// again for it.
+    pub fn set(&self, ns: u32, samples: u64) {
+        self.0.store(pack_latency(ns, samples), Ordering::Relaxed);
+    }
+}
+
+/// Both halves of a latency in one word, so that they are read together:
+/// ns above, samples below (40 ms at 192 kHz is 7680 samples).
+fn pack_latency(ns: u32, samples: u64) -> u64 {
+    u64::from(ns) << 32 | samples.min(u64::from(u32::MAX))
+}
+
 /// A sample rate or bit depth that a controller asked for, applied when the
 /// device next starts; see [`Shared::request_format`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -233,6 +281,9 @@ pub struct Shared {
     notify: mpsc::UnboundedSender<Notify>,
     /// The latest latency asked for, in ns; see [`Shared::request_latency`].
     latency_request: watch::Sender<Option<u32>>,
+    /// Bumped whenever [`Shared::restart_rx`] changes the receive latency,
+    /// to wake the receive manager.
+    rx_restart: watch::Sender<u64>,
     /// Whether controllers may change the sample rate and the bit depth:
     /// only when something listens to [`Shared::format_requests`].
     pub format_configurable: bool,
@@ -277,6 +328,7 @@ impl Shared {
             counters: Arc::default(),
             notify,
             latency_request: watch::channel(None).0,
+            rx_restart: watch::channel(0).0,
             format_configurable,
             format_request: watch::channel(FormatRequest::default()).0,
             remote_changes,
@@ -296,11 +348,11 @@ impl Shared {
         r
     }
 
-    /// Sets the receive latency to `ns` from the next start of the device on,
-    /// saves it with the other state, and tells [`Shared::latency_requests`]
-    /// listeners, who restart the device to apply it.
+    /// Sets the receive latency to `ns`, saved with the other state for the
+    /// next start of the device, and tells [`Shared::latency_requests`]
+    /// listeners, who apply it with [`Shared::restart_rx`].
     pub fn request_latency(&self, ns: u32) -> crate::Result<()> {
-        // The rule the device checks when it restarts with this latency.
+        // The rule the device checks when it starts with this latency.
         let guard_us = (self.info.tx_guard_ns / 1000) as u32;
         crate::config::check_latency_ms("the latency", ns as f64 / 1e6, guard_us)?;
         self.modify(|s| s.latency_override_ns = Some(ns));
@@ -313,9 +365,33 @@ impl Shared {
         self.latency_request.subscribe()
     }
 
-    /// The latency the device will run at from its next start, in ns.
+    /// The receive latency asked for last, in ns: the one the device runs
+    /// at once [`Shared::restart_rx`] has applied it, and starts with next.
+    /// Without a request, the one it runs at.
     pub fn configured_latency_ns(&self) -> u32 {
-        self.state().latency_override_ns.unwrap_or(self.info.latency_ns)
+        self.state().latency_override_ns.unwrap_or_else(|| self.info.latency.ns())
+    }
+
+    /// Applies the receive latency asked for last
+    /// ([`Shared::configured_latency_ns`]) to the receive side: from now on
+    /// [`DeviceInfo::latency`] holds it, and the receive manager requests
+    /// every receive flow again with it. Nothing else changes: the transmit
+    /// flows, flow control and the mDNS records go on as they are. Returns
+    /// whether the latency changed.
+    pub fn restart_rx(&self) -> bool {
+        let ns = self.configured_latency_ns();
+        let samples = crate::config::latency_samples(ns, self.info.sample_rate);
+        if self.info.latency.get() == (ns, samples) {
+            return false;
+        }
+        self.info.latency.set(ns, samples);
+        self.rx_restart.send_modify(|n| *n += 1);
+        true
+    }
+
+    /// Wakes up whenever [`Shared::restart_rx`] changes the receive latency.
+    pub fn rx_restarts(&self) -> watch::Receiver<u64> {
+        self.rx_restart.subscribe()
     }
 
     /// Asks for a new sample rate or bit depth, for [`Shared::format_requests`]

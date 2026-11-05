@@ -77,7 +77,11 @@ has been coming from) and holds whole frames of the flow's slots (the frame
 count is read from the length, PROTOCOL.md §8.2), splits it per slot, and writes
 each slot's samples into the ring of every local channel routed to that slot,
 at the packet's timestamp, plus the extra latency the flow needs when its
-transmitter demands more than ours. Backends read at `now − latency`.
+transmitter demands more than ours. Backends read at `now − latency`. The
+receive latency can change while the device runs (`Device::restart_rx`, for
+a latency set by a controller or the app): the subscription manager then
+requests every receive flow again for it and backends read at the new
+latency, while the transmit side carries on untouched.
 
 **Transmit.** Backends write at `now + lead`. The transmit thread wakes when
 the next packet is due. It reads `fpp` frames per channel at the packet

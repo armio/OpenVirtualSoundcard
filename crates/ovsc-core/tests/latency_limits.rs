@@ -38,7 +38,7 @@ async fn a_longer_guard_raises_the_least_latency_on_every_path() {
     // guard rules out is ignored: the device starts at its configured one.
     SavedState::update(&state, |s| s.latency_ns = Some(1_000_000)).unwrap();
     let dev = Device::start(config(&dir), system_clock()).await.unwrap();
-    assert_eq!(dev.info().latency_ns, 4_000_000);
+    assert_eq!(dev.latency_ns(), 4_000_000);
     assert_eq!(dev.info().tx_latency_ns, 1_500_000);
 
     // Controllers and the app go through request_latency.
@@ -52,12 +52,16 @@ async fn a_longer_guard_raises_the_least_latency_on_every_path() {
         assert!(std::time::Instant::now() < deadline, "the latency was not saved");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // Applied while the device runs: the receive side only.
+    assert!(dev.restart_rx());
+    assert_eq!((dev.latency_ns(), dev.latency_samples()), (1_300_000, 62));
+    assert_eq!(dev.info().tx_latency_ns, 1_500_000);
     dev.shutdown().await;
 
     // The saved latency applies on the next start; the transmit latency
     // stays the configured one.
     let dev = Device::start(config(&dir), system_clock()).await.unwrap();
-    assert_eq!(dev.info().latency_ns, 1_300_000);
+    assert_eq!(dev.latency_ns(), 1_300_000);
     assert_eq!(dev.info().tx_latency_ns, 1_500_000);
     dev.shutdown().await;
     std::fs::remove_dir_all(&dir).unwrap();

@@ -23,7 +23,8 @@
 //! [`crate::netwatch`]), and a failed part of the daemon (a panic, a device
 //! task or the driver heartbeat that stopped; see [`crate::supervise`])
 //! ends the daemon with an error after the driver's goodbye, for launchd to
-//! start a fresh one.
+//! start a fresh one. A new receive latency restarts nothing but the
+//! device's receive side ([`Ctx::apply_latency`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -77,8 +78,6 @@ pub async fn run(cfg: AppConfig, config_path: Option<PathBuf>) -> anyhow::Result
 enum Next {
     /// A stop was requested, for this reason.
     Stop(&'static str),
-    /// A controller or the app set a new latency: restart the device.
-    RestartDevice,
     /// The network interface changed under the engine: restart all of it,
     /// the clock included, on the interface as it is now.
     RestartEngine,
@@ -191,29 +190,6 @@ async fn serve(
     control::restarted(&health);
     let result = loop {
         match run_engine(&engine, &mut ctx, stop).await {
-            Ok(Next::RestartDevice) => {
-                info!(
-                    "restarting the network engine for a receive latency of {} ms",
-                    engine.device.configured_latency_ns() as f64 / 1e6
-                );
-                server.engine_stopped();
-                let carry = Carry::from(&engine.device);
-                engine = match engine.restart_device(&cfg, &region).await {
-                    Ok(engine) => engine,
-                    Err(e) => {
-                        error!("cannot restart the network engine: {e:#}");
-                        match start_again(&mut ctx, carry, stop).await {
-                            Ok(engine) => engine,
-                            Err(end) => {
-                                server.shutdown().await;
-                                return end;
-                            }
-                        }
-                    }
-                };
-                server.engine_started(&engine.device);
-                control::restarted(&health);
-            }
             Ok(Next::RestartEngine) => {
                 // The driver keeps the region and its configuration; it
                 // reads silence until the engine runs again.
@@ -265,7 +241,7 @@ fn log_next(next: &Next) {
     match next {
         Next::Stop(why) => info!("{why}: shutting down"),
         Next::RestartDaemon => info!("restarting to apply the new settings"),
-        Next::RestartDevice | Next::RestartEngine => {}
+        Next::RestartEngine => {}
     }
 }
 
@@ -358,6 +334,19 @@ impl Ctx<'_> {
             let _ = app.send(response);
         }
         restart
+    }
+
+    /// Applies the receive latency a controller or the app set last, if the
+    /// device does not run at it yet: the device restarts its receive side
+    /// at it (its receive flows, `Device::restart_rx`), then the driver is
+    /// offered the configuration with the new input offsets. The engine
+    /// keeps running throughout, so the driver keeps its gate open and the
+    /// transmit flows, the mDNS records and the clock go on; Core Audio
+    /// sees one configuration change, for the new safety offset.
+    fn apply_latency(&self, engine: &Engine) {
+        if engine.device.restart_rx() {
+            self.server.engine_changed(&engine.device);
+        }
     }
 
     /// Saves a sample rate or bit depth that a controller asked for;
@@ -459,9 +448,9 @@ pub(crate) fn next_retry_delay(delay: Duration) -> Duration {
     (delay + Duration::from_secs(1)).min(RETRY_MAX)
 }
 
-/// Runs until a stop, a new latency or a restart is asked for, or the
-/// network interface changes, logging the status line at its cadence and
-/// answering the app's calls. A fault is an error.
+/// Runs until a stop or a restart is asked for, or the network interface
+/// changes, logging the status line at its cadence, answering the app's
+/// calls and applying new receive latencies in place. A fault is an error.
 async fn run_engine(
     engine: &Engine,
     ctx: &mut Ctx<'_>,
@@ -475,9 +464,7 @@ async fn run_engine(
     latency.mark_unchanged();
     // A latency set between the device's start and this subscription
     // was not seen as a change: apply it now.
-    if engine.device.configured_latency_ns() != engine.device.info().latency_ns {
-        return Ok(Next::RestartDevice);
-    }
+    ctx.apply_latency(engine);
     let mut format = engine.device.format_requests();
     format.mark_unchanged();
     loop {
@@ -506,11 +493,7 @@ async fn run_engine(
                     }
                 }
             }
-            Ok(()) = latency.changed() => {
-                if engine.device.configured_latency_ns() != engine.device.info().latency_ns {
-                    return Ok(Next::RestartDevice);
-                }
-            }
+            Ok(()) = latency.changed() => ctx.apply_latency(engine),
             Ok(()) = format.changed() => {
                 let request = *format.borrow_and_update();
                 if ctx.apply_format(engine, request) {
@@ -678,34 +661,6 @@ impl Engine {
             ..Default::default()
         };
         Ok(Device::start_with_options(d.clone(), clock.clone(), options).await?)
-    }
-
-    /// Stops the device and starts it again with the latency a controller
-    /// or the app set, on the same clock: the clock stays locked. On
-    /// failure the clock is stopped too.
-    async fn restart_device(
-        self,
-        cfg: &AppConfig,
-        region: &Arc<HalRegion>,
-    ) -> anyhow::Result<Engine> {
-        let Engine { device, clock, follower, started } = self;
-        let mut cfg = cfg.clone();
-        cfg.device.latency_ms = device.configured_latency_ns() as f64 / 1e6;
-        // The show lock and the list of controllers' changes carry over: the
-        // state file keeps the lock, but there may be none, and the list
-        // explains the very dropout this restart causes.
-        cfg.device.lock_remote_settings = device.remote_settings_locked();
-        let carry = Carry::from(&device);
-        device.shutdown().await;
-        match Self::start_device(&cfg, region, &clock, Some(carry)).await {
-            Ok(device) => Ok(Engine { device, clock, follower, started }),
-            Err(e) => {
-                if let Some(f) = follower {
-                    f.shutdown();
-                }
-                Err(e)
-            }
-        }
     }
 
     async fn shutdown(self) {
@@ -959,8 +914,45 @@ mod tests {
         }
     }
 
+    /// Pushed configurations a driver received.
+    fn configs(received: &Received) -> Vec<ovsc_ipc::protocol::DriverConfig> {
+        let messages = received.0.lock().unwrap();
+        messages
+            .iter()
+            .filter_map(|m| match m {
+                ToPlugin::Config(c) => Some(c.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Counts, from a thread of its own, how often the engine is not
+    /// running as a driver sees it in the region of `w`, until `watching`
+    /// is cleared.
+    fn count_engine_stops(w: &Welcome, watching: Arc<AtomicBool>) -> std::thread::JoinHandle<u64> {
+        let handle = w.region.clone();
+        std::thread::spawn(move || {
+            let mapped = handle.map().unwrap();
+            // SAFETY: the mapping lives until the end of the thread.
+            let view = unsafe { RegionRef::from_raw(mapped.as_ptr(), mapped.len()) }.unwrap();
+            let mut stops = 0;
+            while watching.load(Ordering::Relaxed) {
+                let flags = view.daemon().flags.load(Ordering::Acquire);
+                if flags & DAEMON_ENGINE_RUNNING == 0 {
+                    stops += 1;
+                }
+                std::thread::sleep(Duration::from_micros(100));
+            }
+            stops
+        })
+    }
+
+    /// A latency from the app restarts only the device's receive side: the
+    /// engine never stops as the driver sees it (its gate stays open, and
+    /// the transmit flows go on), the clock is the same, and the driver is
+    /// offered the new input safety offset, with the output side as it was.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_app_sets_the_latency_and_the_device_restarts_on_the_same_region() {
+    async fn the_app_sets_the_latency_and_only_the_receive_side_restarts() {
         let dir = std::env::temp_dir().join(format!("ovsc-ca-control-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let socket = dir.join("control.sock");
@@ -978,6 +970,12 @@ mod tests {
             let running = || d.flags.load(Ordering::Acquire) & DAEMON_ENGINE_RUNNING != 0;
             wait_for("the engine", running).await;
             assert_eq!(latency_ms(&socket).await, Some(4.0));
+            // 4 ms in and out: the transmit latency follows the configured
+            // receive latency.
+            assert_eq!((w.config.input_safety_offset, w.config.output_latency), (216, 192));
+            let clock = clock_ref(&view);
+            let watching = Arc::new(AtomicBool::new(true));
+            let stops = count_engine_stops(&w, watching.clone());
 
             // The running device saves the name and latency itself: the
             // control socket does not write the state file behind its back.
@@ -987,16 +985,26 @@ mod tests {
                 ..Default::default()
             };
             match ask(&socket, Request::Apply { change }).await {
-                Response::Applied { restart } => assert_eq!(restart, Restart::Device),
+                Response::Applied { restart } => assert_eq!(restart, Restart::Receive),
                 other => panic!("not applied: {other:?}"),
             }
             let deadline = Instant::now() + Duration::from_secs(10);
             while latency_ms(&socket).await != Some(2.0) {
-                assert!(Instant::now() < deadline, "the device did not restart at 2 ms");
+                assert!(Instant::now() < deadline, "the device did not change to 2 ms");
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            wait_for("the engine again", running).await;
-            // The driver stayed attached to the same region throughout.
+            let pushed = || configs(&received).into_iter().find(|c| c.input_safety_offset == 120);
+            wait_for("the new input safety offset", || pushed().is_some()).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            watching.store(false, Ordering::Relaxed);
+            assert_eq!(stops.join().unwrap(), 0, "the driver saw the engine stop");
+            // 2 ms in; out, still the configured 4 ms.
+            let pushed = pushed().unwrap();
+            assert_eq!((pushed.input_safety_offset, pushed.output_latency), (120, 192));
+            assert_eq!(pushed.output_safety_offset, w.config.output_safety_offset);
+            // The same clock, and the driver stayed attached to the same
+            // region throughout.
+            assert_eq!(clock_ref(&view), clock);
             assert!(!received.got_bye());
             match ask(&socket, Request::Settings).await {
                 Response::Settings(s) => assert_eq!(s.latency_ms, 2.0),
@@ -1137,9 +1145,9 @@ mod tests {
     }
 
     /// The show lock, set from the app, refuses Dante Controller's latency
-    /// write, so nothing restarts; it holds across a restart the app asks
-    /// for; and the app lists what controllers did, also after the restart
-    /// a controller's change causes.
+    /// write, so nothing changes; it holds across a new latency the app
+    /// sets; and the app lists what controllers did, also after a change a
+    /// controller made.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_show_lock_refuses_a_controller_and_survives_restarts() {
         use ovsc_proto::frame::result;
@@ -1180,26 +1188,26 @@ mod tests {
             let refused = "tried to change the receive latency to 2 ms";
             assert!(status(&socket).await.warnings.iter().any(|w| w.contains(refused)));
 
-            // The app's own change applies; the device restarts locked and
-            // still lists the refusal.
+            // The app's own change applies, to the receive side; the device
+            // stays locked and still lists the refusal.
             let change = SettingsChange { latency_ms: Some(2.0), ..Default::default() };
-            assert_eq!(apply(&socket, change).await, Restart::Device);
+            assert_eq!(apply(&socket, change).await, Restart::Receive);
             let deadline = Instant::now() + Duration::from_secs(10);
             while latency_ms(&socket).await != Some(2.0) {
-                assert!(Instant::now() < deadline, "the device did not restart at 2 ms");
+                assert!(Instant::now() < deadline, "the device did not change to 2 ms");
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             let s = status(&socket).await;
             assert!(locked(&s));
             assert!(s.warnings.iter().any(|w| w.contains(refused)), "{:?}", s.warnings);
 
-            // Unlocked, the controller's change restarts the device, and is
-            // listed afterwards.
+            // Unlocked, the controller's change applies too, and is listed
+            // afterwards.
             assert_eq!(apply(&socket, lock(false)).await, Restart::None);
             assert_eq!(controller_sets_latency(PORT, 3_000_000).await, result::SUCCESS);
             let deadline = Instant::now() + Duration::from_secs(10);
             while latency_ms(&socket).await != Some(3.0) {
-                assert!(Instant::now() < deadline, "the device did not restart at 3 ms");
+                assert!(Instant::now() < deadline, "the device did not change to 3 ms");
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             let s = status(&socket).await;
@@ -1219,9 +1227,10 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Without a state file the lock, the name and the subscriptions live
-    /// only in the running device, so the restart for a new latency hands
-    /// them on, with the list of controllers' changes.
+    /// Without a state file the lock, the name, the subscriptions and the
+    /// latency live only in the running device: a new latency keeps the
+    /// device, and so all of them, and a restart of the whole engine (a new
+    /// address) hands them on, with the list of controllers' changes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_device_restart_keeps_the_lock_and_the_remote_changes() {
         let cfg = app_config("127.0.0.1", 24866);
@@ -1239,10 +1248,12 @@ mod tests {
         engine.device.rename("stage-left").unwrap();
         engine.device.subscribe(1, "01", "console").unwrap();
         engine.device.request_latency(2_000_000).unwrap();
-        let engine = engine.restart_device(&cfg, &region).await.unwrap();
-        assert_eq!(engine.device.info().latency_ns, 2_000_000);
+        assert!(engine.device.restart_rx());
+        assert_eq!(engine.device.latency_ns(), 2_000_000);
+        // The transmit latency stays the configured 4 ms.
+        assert_eq!(engine.device.info().tx_latency_ns, 4_000_000);
         assert!(engine.device.remote_settings_locked());
-        assert_eq!(engine.device.remote_changes().recent(), [change]);
+        assert_eq!(engine.device.remote_changes().recent(), std::slice::from_ref(&change));
         assert_eq!(engine.device.name(), "stage-left");
         let saved = engine.device.saved_state();
         assert_eq!(saved.subscriptions.len(), 1);
@@ -1251,13 +1262,16 @@ mod tests {
             ("01", "console")
         );
 
-        // A restart of the whole engine (a new address) carries them too.
+        // A restart of the whole engine (a new address) carries them all,
+        // and the transmit latency stays as it was.
         let carry = Carry::from(&engine.device);
         engine.shutdown().await;
         let engine = Engine::start(&cfg, &region, Some(carry)).await.unwrap();
         assert_eq!(engine.device.name(), "stage-left");
-        assert_eq!(engine.device.info().latency_ns, 2_000_000);
+        assert_eq!(engine.device.latency_ns(), 2_000_000);
+        assert_eq!(engine.device.info().tx_latency_ns, 4_000_000);
         assert!(engine.device.remote_settings_locked());
+        assert_eq!(engine.device.remote_changes().recent(), [change]);
         assert_eq!(engine.device.saved_state().subscriptions.len(), 1);
         engine.shutdown().await;
     }
@@ -1343,7 +1357,7 @@ mod tests {
         let (started, ()) = tokio::join!(restart, app);
         let Ok(Ok(engine)) = started else { panic!("the engine did not start") };
         assert!(engine.device.remote_settings_locked());
-        assert_eq!(engine.device.info().latency_ns, 2_000_000);
+        assert_eq!(engine.device.latency_ns(), 2_000_000);
         // What the app did not change is the carried state's.
         assert_eq!(engine.device.name(), "stage-left");
         assert_eq!(engine.device.saved_state().subscriptions.len(), 1);
@@ -1391,8 +1405,9 @@ mod tests {
             assert_eq!(now.config, w.config);
             assert_eq!(now.config.config_gen, 1);
             assert!(!received.0.lock().unwrap().iter().any(|m| matches!(m, ToPlugin::Config(_))));
-            // 2 ms at 48 kHz, reported as the output latency.
-            assert_eq!(w.config.output_latency, 96);
+            // 2 ms at 48 kHz in, plus the 24-frame margin; out, the
+            // configured 4 ms, which a saved receive latency leaves alone.
+            assert_eq!((w.config.input_safety_offset, w.config.output_latency), (120, 192));
             assert_eq!(w.config.device_name, "vocal-fx");
             assert_eq!(w.config.input_names, ["Vox", "02", "03"]);
             stop_tx.send("test").unwrap();
@@ -1441,10 +1456,11 @@ mod tests {
         Device::start_with_options(cfg, ovsc_clock::system_clock(), options).await.unwrap()
     }
 
-    /// A restart for a new latency, and one of the whole engine, keep the
-    /// name the device announced while another device announces it too:
-    /// it is handed on, not probed for again, so the device never renames
-    /// itself mid-show. The conflict is reported.
+    /// A new latency, and a restart of the whole engine, keep the name the
+    /// device announced while another device announces it too: the first
+    /// restarts nothing that announces, the second hands the name on
+    /// rather than probe for it again, so the device never renames itself
+    /// mid-show. The conflict is reported.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restarts_keep_the_announced_name_through_a_live_conflict() {
         let name = format!("ca-keep{}", std::process::id());
@@ -1458,8 +1474,7 @@ mod tests {
         wait_for("the conflict", || engine_conflict(&engine)).await;
 
         engine.device.request_latency(2_000_000).unwrap();
-        let engine = engine.restart_device(&cfg, &region).await.unwrap();
-        wait_for("the conflict after the restart", || engine_conflict(&engine)).await;
+        assert!(engine.device.restart_rx());
         // Longer than a probe takes.
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert_eq!(engine.device.name(), name);

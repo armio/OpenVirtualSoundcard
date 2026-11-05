@@ -16,6 +16,7 @@
 
 use std::sync::Arc;
 
+use ovsc_core::RxLatency;
 use ovsc_core::buffer::TimedRing;
 
 use crate::controller::{DriftController, Limits, MAX_PPM, Side, Steer};
@@ -252,10 +253,15 @@ fn sanitize(v: f32) -> f32 {
 /// The read position trails the media clock by `latency + safety`, where
 /// `safety` is one device callback, the interpolator's look-ahead and the
 /// margin: every sample the callback touches has arrived (the device then
-/// adds its own output latency on top).
+/// adds its own output latency on top). The receive latency is the
+/// device's, which may change while the stream plays: the stream moves to
+/// the new position then.
 pub struct Playout {
     kernel: &'static Kernel,
     rate: u32,
+    /// The device's receive latency, read at every callback.
+    device_latency: RxLatency,
+    /// The receive latency the stream plays at, media samples.
     latency: u64,
     capacity: u64,
     /// Ring feeding each device channel.
@@ -271,11 +277,11 @@ pub struct Playout {
 
 impl Playout {
     /// `sources[i]` is the ring played on device channel `i` (`None`:
-    /// silence); `latency` the network receive latency and `margin` the
-    /// extra safety margin, both in media samples.
+    /// silence); `latency` the device's network receive latency, followed
+    /// as it changes, and `margin` the extra safety margin in media samples.
     pub fn new(
         rate: u32,
-        latency: u64,
+        latency: RxLatency,
         sources: Vec<Option<Arc<TimedRing>>>,
         margin: u64,
         stats: Arc<StatsCell>,
@@ -285,7 +291,8 @@ impl Playout {
         Playout {
             kernel: Kernel::get(),
             rate,
-            latency,
+            latency: latency.samples(),
+            device_latency: latency,
             capacity: capacity as u64,
             sources,
             timing: Timing::new(rate, margin, 0, capacity, true, stats),
@@ -305,17 +312,22 @@ impl Playout {
             return;
         }
         self.timing.begin(frames);
+        // A new receive latency moves the target, and the position with it
+        // by as much, so the controller sees no step.
+        let moved = self.follow_latency();
         let now = now_ns.map(|ns| MediaPos::from_ns(ns, self.rate));
-        let steer = match now {
+        let mut steer = match now {
             Some(now) => {
                 let target = now.offset(-((self.latency + self.timing.safety()) as f64));
-                self.timing.controller.update(target.minus(self.pos), frames)
+                self.timing.controller.update(target.minus(self.pos.offset(moved)), frames)
             }
             None => {
                 self.timing.controller.reset();
                 Steer { shift: 0.0, ratio: self.timing.controller.ratio(), mute: true }
             }
         };
+        // The move itself, faded out and in like any jump.
+        steer.shift += moved;
         let mut done = 0;
         if steer.is_discontinuous() {
             // Ramp what was playing down before moving, instead of cutting
@@ -341,6 +353,18 @@ impl Playout {
             self.render_frames(&mut out[done * channels..], steer.ratio);
         }
         self.timing.stats.publish(&self.timing.controller, now.is_some());
+    }
+
+    /// Takes the device's receive latency, and returns how far, in media
+    /// samples, the position moves with it: back by as much as it grew (a
+    /// longer latency would otherwise read samples that have not arrived),
+    /// forward by as much as it shrank (rather than slew there at 1 ms per
+    /// second). 0 while it holds. One atomic load per callback.
+    fn follow_latency(&mut self) -> f64 {
+        let latency = self.device_latency.samples();
+        let moved = self.latency as f64 - latency as f64;
+        self.latency = latency;
+        moved
     }
 
     fn check_edges(&self, now: MediaPos, ratio: f64, frames: usize) {
@@ -647,6 +671,11 @@ mod tests {
     /// The capture lead with the default transmit guard (500 µs).
     const LEAD: u64 = 7;
 
+    /// A device receive latency of `samples` at [`RATE`].
+    fn rx_latency(samples: u64) -> RxLatency {
+        RxLatency::new((samples * 1_000_000_000 / RATE as u64) as u32, samples)
+    }
+
     struct Rng(u64);
     impl Rng {
         fn next_f64(&mut self) -> f64 {
@@ -726,8 +755,13 @@ mod tests {
         let ring = Arc::new(TimedRing::new(1 << 15));
         let stats = Arc::new(StatsCell::new());
         // Device channel 0 plays the tone, channel 1 is unmapped.
-        let mut playout =
-            Playout::new(RATE, latency, vec![Some(ring.clone()), None], 48, stats.clone());
+        let mut playout = Playout::new(
+            RATE,
+            rx_latency(latency),
+            vec![Some(ring.clone()), None],
+            48,
+            stats.clone(),
+        );
 
         let seconds = 50.0;
         let mut written = (sample_at(EPOCH_NS) as u64 / fpp) * fpp - 4 * fpp;
@@ -792,6 +826,58 @@ mod tests {
     #[test]
     fn playout_resamples_for_slow_device() {
         check_playout(-50.0, 480, 1e-3);
+    }
+
+    /// A new receive latency (the device's `restart_rx`) moves where the
+    /// stream reads by as much, in the next callback and with a fade:
+    /// longer (8 ms), where reading on would lose audio, and shorter by
+    /// less than the controller's slack (6 ms), which it would otherwise
+    /// slew for seconds, and by more (2 ms). The controller sees no step:
+    /// no realignment, no underrun.
+    #[test]
+    fn playout_follows_a_new_receive_latency() {
+        let (period, fpp) = (256usize, 48u64);
+        let latency = rx_latency(192);
+        let ring = Arc::new(TimedRing::new(1 << 15));
+        let stats = Arc::new(StatsCell::new());
+        let sources = vec![Some(ring.clone())];
+        let mut playout = Playout::new(RATE, latency.clone(), sources, 48, stats.clone());
+        let mut written = (sample_at(EPOCH_NS) as u64 / fpp) * fpp - 4 * fpp;
+        let packet = vec![0x1000_0000; fpp as usize];
+        let mut out = vec![0f32; period];
+        // How far the stream is from where it should read at the start of
+        // the next callback.
+        let off_target = |p: &Playout, now_ns: u64| {
+            let lag = (p.latency + p.timing.safety()) as f64;
+            MediaPos::from_ns(now_ns, RATE).offset(period as f64 - lag).minus(p.pos)
+        };
+        let second = RATE as usize / period;
+        let changes = [(2, 384), (4, 288), (6, 96)];
+        let mut running_from = None;
+        for (i, now_ns) in callbacks(0.0, period, 0.0, 8.0) {
+            let now = sample_at(now_ns as f64);
+            while (written + fpp) as f64 + 15.0 <= now {
+                ring.write(written, &packet);
+                written += fpp;
+            }
+            if let Some(&(_, samples)) = changes.iter().find(|(s, _)| i == s * second) {
+                let (ns, samples) = rx_latency(samples).get();
+                latency.set(ns, samples);
+            }
+            playout.render(Some(now_ns), &mut out);
+            if running_from.is_none() && playout.timing.controller.running() {
+                running_from = Some(stats.snapshot("", 1, "").underruns);
+            }
+            if i >= second {
+                assert_eq!(playout.latency, latency.samples(), "callback {i}");
+                let off = off_target(&playout, now_ns);
+                assert!(off.abs() < 1.0, "callback {i}: {off} samples off target");
+            }
+        }
+        let s = stats.snapshot("test", 1, "f32");
+        assert_eq!(s.realigns, 0, "{s:?}");
+        assert_eq!(Some(s.underruns), running_from, "{s:?}");
+        assert_eq!(s.overruns, 0, "{s:?}");
     }
 
     /// Captures a 997 Hz sine on a device whose clock is off by
@@ -877,7 +963,8 @@ mod tests {
     fn playout_mutes_without_clock_and_fades_in() {
         let ring = Arc::new(TimedRing::new(1 << 12));
         let stats = Arc::new(StatsCell::new());
-        let mut playout = Playout::new(RATE, 96, vec![Some(ring.clone())], 48, stats.clone());
+        let mut playout =
+            Playout::new(RATE, rx_latency(96), vec![Some(ring.clone())], 48, stats.clone());
         let mut out = vec![1i16; 64];
         playout.render(None, &mut out);
         assert!(out.iter().all(|&v| v == 0));
@@ -904,7 +991,8 @@ mod tests {
         // Callbacks larger than the internal chunk and of varying size.
         let ring = Arc::new(TimedRing::new(1 << 15));
         let stats = Arc::new(StatsCell::new());
-        let mut playout = Playout::new(RATE, 96, vec![Some(ring.clone())], 48, stats.clone());
+        let mut playout =
+            Playout::new(RATE, rx_latency(96), vec![Some(ring.clone())], 48, stats.clone());
         let sink = Arc::new(TimedRing::new(1 << 15));
         let mut capture = Capture::new(RATE, 24, vec![Some(sink.clone())], 48, LEAD, stats.clone());
         let mut t = EPOCH_NS;
@@ -1248,7 +1336,8 @@ mod tests {
         let (tone, amplitude, drift_ppm, latency, fpp) = (997.0, 0.5, -40.0, 192, 48u64);
         let ring = Arc::new(TimedRing::new(1 << 15));
         let stats = Arc::new(StatsCell::new());
-        let mut playout = Playout::new(RATE, latency, vec![Some(ring.clone())], 48, stats.clone());
+        let mut playout =
+            Playout::new(RATE, rx_latency(latency), vec![Some(ring.clone())], 48, stats.clone());
         let device_rate = RATE as f64 * (1.0 + drift_ppm * 1e-6);
         let mut rng = Rng(spec.period as u64 ^ 0x5eed);
         let mut written = (sample_at(EPOCH_NS) as u64 / fpp) * fpp - 4 * fpp;
@@ -1372,7 +1461,8 @@ mod tests {
     fn playout_fades_out_when_the_clock_goes() {
         let ring = Arc::new(TimedRing::new(1 << 15));
         let stats = Arc::new(StatsCell::new());
-        let mut playout = Playout::new(RATE, 96, vec![Some(ring.clone())], 48, stats.clone());
+        let mut playout =
+            Playout::new(RATE, rx_latency(96), vec![Some(ring.clone())], 48, stats.clone());
         let start = sample_at(EPOCH_NS) as u64;
         ring.write(start - 2000, &vec![0x4000_0000; 30_000]);
         let mut out = vec![0f32; 64];

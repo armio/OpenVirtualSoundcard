@@ -92,7 +92,7 @@ fn verify_from(
     start: u64,
     delay: u64,
 ) -> Result<(), String> {
-    let end = io.now().unwrap() - io.latency_samples;
+    let end = io.now().unwrap() - io.latency_samples();
     if end <= start {
         return Err("nothing to read yet".into());
     }
@@ -114,7 +114,7 @@ fn verify_from(
 
 /// Checks that `rx_ch` of `io` carries `tx_ch`'s signal for the last 100 ms.
 fn verify(io: &AudioIo, rx_ch: usize, tx_ch: usize) -> Result<(), String> {
-    let end = io.now().unwrap() - io.latency_samples;
+    let end = io.now().unwrap() - io.latency_samples();
     verify_from(io, rx_ch, tx_ch, end - io.sample_rate as u64 / 10, 0)
 }
 
@@ -465,7 +465,7 @@ async fn a_respelled_subscription_keeps_its_flow_and_audio() {
     assert_eq!(flows.len(), 1, "{flows:?}");
 
     for (channel, device) in [("Vox", "spell-tx"), ("01", "stage-box"), ("vox", "SPELL-TX")] {
-        let before = io.now().unwrap() - io.latency_samples;
+        let before = io.now().unwrap() - io.latency_samples();
         rx.subscribe(1, channel, device).unwrap();
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert_eq!(tx.tx_flows(), flows, "after re-subscribing as {channel}@{device}");
@@ -495,9 +495,9 @@ async fn a_transmitter_needing_more_latency_is_played_later() {
     let io = rx.audio();
     rx.subscribe(1, "04", "slow-tx").unwrap();
     // 10 ms at 48 kHz, where we run at 1 ms: 432 samples later.
-    let delay = 480 - io.latency_samples;
+    let delay = 480 - io.latency_samples();
     eventually("delayed audio on rx 1", || {
-        let end = io.now().unwrap() - io.latency_samples;
+        let end = io.now().unwrap() - io.latency_samples();
         verify_from(&io, 0, 3, end - 4800, delay)
     })
     .await;
@@ -538,7 +538,7 @@ async fn an_unsubscribed_channel_forgets_its_audio() {
         verify(&io, 1, 1)
     })
     .await;
-    let ts = io.now().unwrap() - io.latency_samples - 1000;
+    let ts = io.now().unwrap() - io.latency_samples() - 1000;
     assert!(io.rx[0].read_one(ts).is_some());
 
     rx.unsubscribe(1).unwrap();

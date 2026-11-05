@@ -388,14 +388,14 @@ mod tests {
     #[test]
     fn applies_a_change_and_reloads() {
         let (path, seen) =
-            daemon("apply", PROTOCOL_VERSION, Response::Applied { restart: Restart::Device });
+            daemon("apply", PROTOCOL_VERSION, Response::Applied { restart: Restart::Receive });
         let worker = Worker::start(path, || {});
         for _ in 0..3 {
             worker.next();
         }
         let change = SettingsChange { latency_ms: Some(2.0), ..Default::default() };
         worker.send(Command::Apply(change.clone()));
-        assert!(matches!(worker.next(), Event::Applied(Ok(Restart::Device))));
+        assert!(matches!(worker.next(), Event::Applied(Ok(Restart::Receive))));
         assert!(matches!(worker.next(), Event::Settings(_)));
         assert!(matches!(worker.next(), Event::Interfaces(_)));
         assert!(seen.lock().unwrap().contains(&Request::Apply { change }));

@@ -86,13 +86,14 @@ pub struct EngineInfo {
 }
 
 impl EngineInfo {
-    /// The facts of a running device, with its current names.
+    /// The facts of a running device, with its current names and receive
+    /// latency.
     pub fn from_device(d: &Device) -> Self {
         let info = d.info();
         let (rx_names, tx_names) = d.channel_names();
         Self {
             sample_rate: info.sample_rate,
-            latency_samples: saturate(info.latency_samples),
+            latency_samples: saturate(d.latency_samples()),
             tx_latency_samples: saturate(info.tx_latency_samples),
             tx_guard_samples: saturate(ns_to_samples(info.tx_guard_ns, info.sample_rate)),
             fpp_max: FPP_MAX,
@@ -336,8 +337,9 @@ mod tests {
             ..Default::default()
         };
         let e = EngineInfo::from_saved(&c, &saved).unwrap();
-        // 2 ms at 48 kHz, also the transmit latency: it follows the receive one.
-        assert_eq!((e.latency_samples, e.tx_latency_samples), (96, 96));
+        // 2 ms at 48 kHz; the transmit latency stays the configured 4 ms,
+        // as it does when the latency changes while the device runs.
+        assert_eq!((e.latency_samples, e.tx_latency_samples), (96, 192));
         assert_eq!(e.device_name, "vocal-fx");
         assert_eq!(
             (e.rx_names, e.tx_names),

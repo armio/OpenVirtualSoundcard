@@ -382,15 +382,16 @@ tx_channels = 8              # a count, or a list of names: ["Left", "Right"]
 rx_channels = 8
 latency_ms = 4.0             # receive latency, 1 to 40
 # Transmit latency: the least latency receivers of the transmit channels must
-# play them at. Unset: latency_ms.
+# play them at. Unset: latency_ms above (a latency set later from a
+# controller or the app changes the receive side only).
 # tx_latency_ms = 1.0
 # Remember renames and subscriptions made from a controller.
 state_file = "ovsc-state.toml"
 # Show lock: refuse changes from controllers (Dante Controller) to the
-# latency, sample rate and encoding, which stop audio both ways, and to the
-# device and channel names, which other devices subscribe by. Subscriptions
-# stay open. The macOS app turns it on and off; its choice is saved in
-# state_file and replaces this.
+# latency, which pauses the inputs, to the sample rate and encoding, which
+# stop audio both ways, and to the device and channel names, which other
+# devices subscribe by. Subscriptions stay open. The macOS app turns it on
+# and off; its choice is saved in state_file and replaces this.
 lock_remote_settings = false
 
 # Subscriptions to set up at start (controllers can change them later).

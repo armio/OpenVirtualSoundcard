@@ -67,7 +67,7 @@ fn read_properties(shared: &Shared, asked: Option<&[u16]>) -> Vec<(u16, Option<u
         (SAMPLE_RATE, info.sample_rate),
         (DEFAULT_LATENCY, shared.configured_latency_ns()),
         (CONFIGURED_LATENCY, shared.configured_latency_ns()),
-        (RX_LATENCY, info.latency_ns),
+        (RX_LATENCY, info.latency.ns()),
         (MAX_LATENCY, MAX_LATENCY_NS),
         (MIN_LATENCY, MIN_LATENCY_NS),
     ];
@@ -99,10 +99,11 @@ fn changed_by(shared: &Shared, from: SocketAddr, what: String) {
 }
 
 /// A controller writing device properties ([`opcode::PROPERTIES_1101`]):
-/// the configured or receive latency is saved and applied by restarting the
-/// device, unless the show lock refuses it. The answer echoes the records
-/// applied; a refusal is an error result, as for a value out of range
-/// (docs/PROTOCOL.md §4.6.3: the real reply to 0x1101 is unknown).
+/// the configured or receive latency is saved, for the device's owner to
+/// apply to the receive side ([`Shared::restart_rx`]), unless the show lock
+/// refuses it. The answer echoes the records applied; a refusal is an error
+/// result, as for a value out of range (docs/PROTOCOL.md §4.6.3: the real
+/// reply to 0x1101 is unknown).
 fn write_properties(shared: &Shared, frame: &Frame<'_>, from: SocketAddr) -> Vec<u8> {
     use arc::property::*;
     let h = &frame.header;
@@ -145,19 +146,11 @@ fn write_properties(shared: &Shared, frame: &Frame<'_>, from: SocketAddr) -> Vec
         return respond(h, result::ERROR, &[]);
     }
     if !unchanged {
+        // Applied by the daemon to the receive side only: the receive flows
+        // are requested again, the transmit flows other devices receive
+        // from this one go on (docs/MACOS.md, "Setting the latency from
+        // Dante Controller or the app").
         changed_by(shared, from, what());
-        // The restart that applies it closes the transmit flows too, though
-        // only the receive side changes (docs/MACOS.md, "Setting the
-        // latency from Dante Controller or the app"). Only the macOS daemon
-        // restarts at once; other backends apply it at their next start.
-        let flows = shared.state().tx_flows.len();
-        if flows > 0 {
-            warn!(
-                "the new latency applies when the device restarts (at once in the macOS daemon), \
-                 which stops the {flows} flows other devices receive from it until each \
-                 receiver requests its flow again"
-            );
-        }
     }
     arc::encode_properties_response(h, &applied)
 }
@@ -945,23 +938,32 @@ mod tests {
         let shared = shared(true);
         let requests = shared.latency_requests();
         // Dante Controller's own 0x1101 packet for 2 ms: refused with an
-        // error result, and the device does not restart.
+        // error result, and nothing is asked of the daemon.
         let set = |ns| arc::encode_set_latency_request(1, ns, 16);
         assert_eq!(ask(&shared, set(2_000_000)), result::ERROR);
         assert_eq!(shared.configured_latency_ns(), 4_000_000);
         assert!(!requests.has_changed().unwrap());
         assert_eq!(noted(&shared), [(true, "the receive latency to 2 ms".to_owned())]);
         assert_eq!(shared.remote_changes.recent()[0].from, controller());
-        // The latency it already has changes nothing: no error, no restart.
+        // The latency it already has changes nothing: no error, no request.
         assert_eq!(ask(&shared, set(4_000_000)), result::SUCCESS);
         assert!(!requests.has_changed().unwrap());
         assert_eq!(noted(&shared).len(), 1);
 
-        // Unlocked, the controller sets it, which restarts the device.
+        // Unlocked, the controller sets it, for the daemon to apply to the
+        // receive side.
         shared.lock_remote_settings(false);
         assert_eq!(ask(&shared, set(2_000_000)), result::SUCCESS);
         assert_eq!(shared.configured_latency_ns(), 2_000_000);
         assert!(requests.has_changed().unwrap());
+        // Reported as the receive latency once applied.
+        let rx_latency = |s: &Shared| read_properties(s, Some(&[arc::property::RX_LATENCY]));
+        assert_eq!(rx_latency(&shared), [(arc::property::RX_LATENCY, Some(4_000_000))]);
+        assert!(shared.restart_rx());
+        assert_eq!(rx_latency(&shared), [(arc::property::RX_LATENCY, Some(2_000_000))]);
+        assert_eq!(shared.info.latency.get(), (2_000_000, 96));
+        // Applying it again changes nothing.
+        assert!(!shared.restart_rx());
         assert_eq!(noted(&shared)[1], (false, "the receive latency to 2 ms".to_owned()));
         // Saved with the state, as the app's choice.
         assert_eq!(shared.state().remote_settings_lock_set, Some(false));
