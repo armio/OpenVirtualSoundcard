@@ -152,9 +152,12 @@ fn supervise(counters: &Counters, events: &mpsc::UnboundedSender<TxEvent>, body:
 /// Playout): 40 ms for OpenVirtualSoundcard (`MAX_LATENCY_MS`), about 20 ms
 /// for Dante hardware (PROTOCOL.md 4.6.2, property 0x8302). A packet older
 /// than that is useless to every receiver, so after a longer stall the
-/// thread skips it instead of queueing it ahead of the packets that still
-/// count. A tighter window, such as our own latency, would also skip
-/// packets that a receiver set to a higher latency than ours still plays.
+/// thread restarts at the newest due packet instead of queueing stale ones
+/// ahead of the packets that still count; the few overdue packets that a
+/// receiver at a high latency could still have played are skipped with
+/// them. A tighter window, such as our own latency, would also skip
+/// packets after short stalls that a receiver set to a higher latency than
+/// ours still plays.
 fn catch_up_window(latency_samples: u64, rate: u32) -> u64 {
     let max_latency_ns = (MAX_LATENCY_MS * 1e6) as u64;
     ns_to_samples(max_latency_ns, rate).max(latency_samples)
