@@ -633,9 +633,13 @@ result 1 with a 4-record property block echoing the applied values
 error result, nothing changed) a value outside 1 to 40 ms. It saves the new
 latency with the device's state, answers like netaudio's virtual device
 (`8205`, `0211`, `8301`, `0310` with the applied values), then restarts its
-network engine with it while the PTP clock keeps running: subscriptions drop
-for about a second and come back. A pointer past the end of the packet reads
-as no value, so the 5th record above is ignored. ⚠️
+network engine with it while the PTP clock keeps running: its subscriptions
+drop for about a second and come back, and its transmit flows close, so
+devices receiving from it must request them again. With the show lock on
+(`[device] lock_remote_settings`, or set from the app), it refuses any other
+latency the same way as one out of range, and answers a write of its current
+latency as above without restarting. A pointer past the end of the packet
+reads as no value, so the 5th record above is ignored. ⚠️
 
 **Set AES67 multicast prefix** (protocol 0x2809): content
 `01 01 | 8060 0010 | a b c d` (NAC `commands/settings.rs`). ⚠️
@@ -1351,10 +1355,12 @@ changing sample rate or encoding.
 
 **OpenVirtualSoundcard** answers 0x0081 and 0x0083 with 0x0080 and 0x0082: its six
 sample rates and the encodings 16, 24 and 32. When its owner can apply a
-change (the macOS daemon), it sets the capability bits 0x08 and 0x10 in
-0x0060 and update mode 2, takes a set request (`u32 1`, `u32 value`), reports
-the value as pending and restarts with it; otherwise the mode is 0 (fixed)
-and set requests are ignored. ⚠️ (not yet tried with Dante Controller)
+change (the macOS daemon) and the show lock is off, it sets the capability
+bits 0x08 and 0x10 in 0x0060 and update mode 2, takes a set request
+(`u32 1`, `u32 value`), reports the value as pending and restarts with it;
+otherwise the bits are clear, the mode is 0 (fixed) and set requests are
+ignored. It sends 0x0060, 0x0080 and 0x0082 unasked whenever the show lock
+turns on or off. ⚠️ (not yet tried with Dante Controller)
 
 #### 7.4.6 0x0102 RX channel change and other change notifications
 
@@ -1783,6 +1789,9 @@ Sources: INF `device_server/arc_server.rs`, `channels_subscriber.rs`,
 | 0x1100 / 0x1102 | zero-filled stubs | full property lists (CAP) | implement real properties so DC can show and set latency |
 | 0x1001 set name, 0x1101 set latency, conmon 0x81/0x83 sample rate and encoding, 0x63 identify, 0x90 reboot | not implemented | formats known ([§4.3](#43-0x1001-set-device-name), [§4.6.3](#463-0x1101-write-properties-setting-latency), [§7.5](#75-settings-commands-writes-and-probes)) | implement. Replies to 0x1101 still need captures. |
 | `pcm` TXT | `3 e` | real `3 e`; netaudio's encoder `3 0xe` | `3 e` |
+| `latency_ns` TXT of transmit channels | the device's receive latency (a FIXME in Inferno) | DVS advertises 6 ms | OpenVirtualSoundcard advertises its own transmit latency (`tx_latency_ms`, else the receive latency); receivers play at the larger of it and their own ([§8.4](#84-timestamps-and-ptp)) |
+| Received packet size | fpp derived from the length, slot count fixed | — | Derive fpp from the length ([§8.2](#82-payload)); OpenVirtualSoundcard accepts 1 to 256 whole frames of the flow's slots, only from the transmitter's address and the source port its audio comes from |
+| QoS marking | none | Audinate's QoS guidance: DSCP 56 (CS7) for PTP, 46 (EF) for audio, strict priority | OpenVirtualSoundcard marks audio EF (TOS `0xB8`), PTP event messages CS7 (`0xE0`) and PTP general messages EF; unverified that macOS keeps the marking on the wire |
 
 ### 11.2 Unknowns worth capturing with Wireshark
 

@@ -270,19 +270,21 @@ impl DriverConfig {
     }
 
     /// The configuration used until host storage or the daemon provides
-    /// one: 48 kHz, 8 x 8 channels named 01 to 08, 4 ms latency, the
-    /// default margins (500 us in, 1000 us out) and TX guard (500 us), in
-    /// safety mode. Its offsets come from [`compute_offsets`], so they match
-    /// what a default daemon sends.
+    /// one: 48 kHz, 8 x 8 channels named 01 to 08, 4 ms receive and
+    /// transmit latency, the default margins (500 us in, 1000 us out) and
+    /// TX guard (500 us), in safety mode. Its offsets come from
+    /// [`compute_offsets`], so they match what a default daemon sends.
     pub fn fallback() -> Self {
         const RATE: u32 = 48_000;
         const LATENCY_US: u64 = 4_000;
         const TX_GUARD_US: u64 = 500;
         // ovsc-core's FPP_MAX.
         const FPP_MAX: u32 = 32;
+        let latency_samples = ((LATENCY_US * RATE as u64 + 500_000) / 1_000_000) as u32;
         let o = compute_offsets(&OffsetInputs {
             sample_rate: RATE,
-            latency_samples: ((LATENCY_US * RATE as u64 + 500_000) / 1_000_000) as u32,
+            latency_samples,
+            tx_latency_samples: latency_samples,
             tx_guard_samples: (TX_GUARD_US * RATE as u64 / 1_000_000) as u32,
             fpp_max: FPP_MAX,
             input_margin_us: 500,
@@ -379,13 +381,20 @@ pub struct OffsetInputs {
     pub sample_rate: u32,
     /// L: the receive latency, `round(latency_ms * fs / 1000)`.
     pub latency_samples: u32,
+    /// T: the transmit latency, `round(tx_latency_ms * fs / 1000)` (or L
+    /// when `tx_latency_ms` is unset). The device asks the receivers of its
+    /// transmit channels for at least this latency (TXT `latency_ns`), so
+    /// they play an output frame no sooner than T after its time
+    /// (docs/PROTOCOL.md 8.4).
+    pub tx_latency_samples: u32,
     /// The TX guard, `floor(tx_guard_us * fs / 1e6)`.
     pub tx_guard_samples: u32,
     /// The largest number of frames per packet the device sends.
     pub fpp_max: u32,
     pub input_margin_us: u32,
     pub output_margin_us: u32,
-    /// Replaces L as the output latency when set.
+    /// Replaces T as the output latency when set: for receivers whose own
+    /// latency is longer than T.
     pub output_latency_override: Option<u32>,
     pub latency_mode: InputLatencyMode,
 }
@@ -407,7 +416,10 @@ pub struct Offsets {
 /// * latency mode: input safety `margin(input)`, input latency L, read
 ///   delay L;
 /// * both modes: output safety `max(fpp_max - 1 - guard, 0) + margin(output)`,
-///   output latency L or the override.
+///   output latency T or the override.
+///
+/// A receiver plays an output frame at its time plus the larger of T and
+/// its own latency, so T is the output latency for receivers at T or less.
 ///
 /// Results saturate at `u32::MAX`; [`DriverConfig::validate`] bounds them.
 pub fn compute_offsets(i: &OffsetInputs) -> Offsets {
@@ -424,7 +436,7 @@ pub fn compute_offsets(i: &OffsetInputs) -> Offsets {
         input_safety: sat(input_safety),
         output_safety: sat(tx_lead + margin(i.output_margin_us)),
         input_latency: sat(input_latency),
-        output_latency: i.output_latency_override.unwrap_or(i.latency_samples),
+        output_latency: i.output_latency_override.unwrap_or(i.tx_latency_samples),
         input_read_delay: sat(input_read_delay),
     }
 }

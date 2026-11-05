@@ -6,7 +6,7 @@
 use std::f64::consts::TAU;
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -192,6 +192,22 @@ pub fn record(io: AudioIo, path: &Path) -> anyhow::Result<Running> {
     }))
 }
 
+/// The file of the `n`th recording to `path`, 0 being the first: a device
+/// restarted mid-recording (a new latency, a new network address) records
+/// on into a new file rather than over the old one. `take.wav`, then
+/// `take-2.wav`, `take-3.wav`, …
+pub fn numbered(path: &Path, n: u32) -> PathBuf {
+    if n == 0 {
+        return path.to_owned();
+    }
+    let stem = path.file_stem().map(|s| s.to_string_lossy()).unwrap_or_default();
+    let name = match path.extension() {
+        Some(ext) => format!("{stem}-{}.{}", n + 1, ext.to_string_lossy()),
+        None => format!("{stem}-{}", n + 1),
+    };
+    path.with_file_name(name)
+}
+
 /// Minimal streaming WAV (RIFF, PCM) writer.
 pub struct WavWriter {
     file: BufWriter<File>,
@@ -245,6 +261,14 @@ impl WavWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restarted_recordings_get_files_of_their_own() {
+        let path = Path::new("/rec/take.wav");
+        assert_eq!(numbered(path, 0), path);
+        assert_eq!(numbered(path, 1), Path::new("/rec/take-2.wav"));
+        assert_eq!(numbered(Path::new("take"), 2), Path::new("take-3"));
+    }
 
     #[test]
     fn wav_header_is_valid() {

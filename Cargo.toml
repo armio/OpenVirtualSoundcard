@@ -26,6 +26,9 @@ anyhow = "1"
 arc-swap = "1"
 cc = "1"
 clap = { version = "4", features = ["derive", "env"] }
+# Without the `realtime` feature: it would make WASAPI's callback threads
+# join MMCSS, but pulls in audio_thread_priority (MPL-2.0), a licence
+# deny.toml does not list. ovsc-soundcard promotes its ALSA threads itself.
 cpal = "0.18"
 hex = "0.4"
 libc = "0.2"

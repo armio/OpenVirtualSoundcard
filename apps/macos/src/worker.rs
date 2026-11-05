@@ -205,7 +205,9 @@ impl Link {
                 Ok(())
             }
             Ok(other) => {
-                self.applied(Err("OpenVirtualSoundcard gave an answer this app does not understand.".into()));
+                self.applied(Err(
+                    "OpenVirtualSoundcard gave an answer this app does not understand.".into(),
+                ));
                 Err(unexpected(&other))
             }
             Err(e) => {
@@ -305,9 +307,13 @@ mod tests {
                 connected: true,
                 io_running: false,
                 audio_flowing: true,
+                faulted: false,
+                audio_trouble: false,
                 detail: String::new(),
             },
             warnings: vec![],
+            urgent_warnings: 0,
+            earlier: vec![],
         }
     }
 
@@ -320,6 +326,7 @@ mod tests {
             rx_channels: 8,
             tx_channels: 8,
             latency_ms: 4.0,
+            lock_remote_settings: false,
         }
     }
 

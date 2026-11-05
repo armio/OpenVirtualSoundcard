@@ -9,8 +9,16 @@
 //!
 //! * the media time jumps by more than 1 us against the previous mapping;
 //! * the clock becomes valid;
-//! * the grandmaster changes;
-//! * the state changes into Locked or FreeRunning.
+//! * the state changes into FreeRunning (a different clock).
+//!
+//! Everything else keeps `step_gen`, because the mapping stays continuous:
+//! losing the master (the clock holds over on its own mapping), a new master
+//! whose time agrees with the running clock (the servo keeps the clock and
+//! steps it, which counts as a jump, only if the new master's time differs),
+//! and the servo losing or regaining lock. The driver keeps following a
+//! clock whose `step_gen` it already follows, whatever its state, so none of
+//! these stops the audio; a new `step_gen` it only follows once the clock is
+//! Locked or FreeRunning (see `ovsc_shm::timeline`).
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -57,9 +65,6 @@ struct Previous {
     snapshot: Option<ClockSnapshot>,
     valid: bool,
     state: ClockState,
-    grandmaster: u64,
-    /// The last master the clock had, kept while it has none.
-    last_master: u64,
     step_gen: u64,
 }
 
@@ -83,21 +88,17 @@ impl MirrorWriter {
             _ => false,
         };
         let became_valid = valid && !prev.valid;
-        // Losing the master is no discontinuity: the clock holds over on its
-        // own mapping, and the plug-in keeps playing on it. A master other
-        // than the last one is.
-        let new_master = grandmaster != 0 && grandmaster != prev.last_master;
-        let locked = matches!(status.state, ClockState::Locked | ClockState::FreeRunning)
-            && status.state != prev.state;
-        if jumped || became_valid || new_master || locked {
+        // A change of master or of lock state is no discontinuity by itself:
+        // the mapping says whether the time moved. The driver keeps playing
+        // on a continuous clock whatever its state, so counting those would
+        // only make it slip audio that never moved.
+        let free_running =
+            status.state == ClockState::FreeRunning && prev.state != ClockState::FreeRunning;
+        if jumped || became_valid || free_running {
             prev.step_gen += 1;
         }
         prev.valid = valid;
         prev.state = status.state;
-        prev.grandmaster = grandmaster;
-        if grandmaster != 0 {
-            prev.last_master = grandmaster;
-        }
         if snapshot.is_some() {
             prev.snapshot = snapshot;
         }
@@ -167,25 +168,27 @@ mod tests {
             (false, ClockState::Unlocked, 0, 0)
         );
 
-        // A master appears: new grandmaster.
+        // A master appears: no mapping yet, nothing to count.
         w.publish(&block, None, &status(ClockState::Locking, Some(m1)));
         let r = read(&block);
-        assert_eq!(r.step_gen, 1);
+        assert_eq!(r.step_gen, 0);
         assert_eq!(r.grandmaster, 0x0102_0304_0506 << 16 | 7);
 
         // First valid mapping.
         w.publish(&block, Some(snap), &status(ClockState::Locking, Some(m1)));
-        assert_eq!(read(&block).step_gen, 2);
+        assert_eq!(read(&block).step_gen, 1);
         assert_eq!(read(&block).snapshot, snap);
 
         // Continuous updates, within 1 us: no step.
         w.publish(&block, Some(at(2_000_000, 0)), &status(ClockState::Locking, Some(m1)));
         w.publish(&block, Some(at(3_000_000, 1_000)), &status(ClockState::Locking, Some(m1)));
-        assert_eq!(read(&block).step_gen, 2);
+        assert_eq!(read(&block).step_gen, 1);
 
-        // Locking -> Locked.
+        // Locking -> Locked on the same mapping: no step either. The driver
+        // starts following this clock now, and realigns to it then, because
+        // it has never followed this step_gen.
         w.publish(&block, Some(at(3_000_000, 1_000)), &status(ClockState::Locked, Some(m1)));
-        assert_eq!(read(&block).step_gen, 3);
+        assert_eq!(read(&block).step_gen, 1);
         assert_eq!(read(&block).state, ClockState::Locked);
 
         // A step of 1 us + 1 ns against the previous mapping.
@@ -196,38 +199,45 @@ mod tests {
             rate: 1.0,
         };
         w.publish(&block, Some(stepped), &status(ClockState::Locked, Some(m1)));
-        assert_eq!(read(&block).step_gen, 4);
+        assert_eq!(read(&block).step_gen, 2);
 
-        // Master change while locked.
+        // A master change on a continuous mapping (a Dante leader change),
+        // and the servo re-locking to it: no step.
+        w.publish(&block, Some(stepped), &status(ClockState::Locking, Some(m2)));
+        let r = read(&block);
+        assert_eq!((r.step_gen, r.grandmaster), (2, 0x0102_0304_0509 << 16 | 7));
         w.publish(&block, Some(stepped), &status(ClockState::Locked, Some(m2)));
-        assert_eq!(read(&block).step_gen, 5);
+        assert_eq!(read(&block).step_gen, 2);
+        // Unlocked and locked again on the same master: no step.
+        w.publish(&block, Some(stepped), &status(ClockState::Locking, Some(m2)));
+        w.publish(&block, Some(stepped), &status(ClockState::Locked, Some(m2)));
+        assert_eq!(read(&block).step_gen, 2);
 
         // Master lost: the clock holds over on the same mapping, which is no
-        // step. The same master back is none either until it locks again.
+        // step, and neither is a master heard again.
         w.publish(&block, Some(stepped), &status(ClockState::Unlocked, None));
         let r = read(&block);
-        assert_eq!((r.valid, r.step_gen, r.grandmaster), (true, 5, 0));
-        w.publish(&block, Some(stepped), &status(ClockState::Locking, Some(m2)));
-        assert_eq!(read(&block).step_gen, 5);
-        w.publish(&block, Some(stepped), &status(ClockState::Locked, Some(m2)));
-        assert_eq!(read(&block).step_gen, 6);
+        assert_eq!((r.valid, r.step_gen, r.grandmaster), (true, 2, 0));
+        w.publish(&block, Some(stepped), &status(ClockState::Locking, Some(m1)));
+        w.publish(&block, Some(stepped), &status(ClockState::Locked, Some(m1)));
+        assert_eq!(read(&block).step_gen, 2);
 
         // Lost, holdover expired: the block keeps the last mapping. Valid
-        // again counts once; so does a master other than the last.
+        // again counts once.
         w.publish(&block, Some(stepped), &status(ClockState::Unlocked, None));
         w.publish(&block, None, &status(ClockState::Unlocked, None));
         let r = read(&block);
-        assert_eq!((r.valid, r.step_gen), (false, 6));
+        assert_eq!((r.valid, r.step_gen), (false, 2));
         assert_eq!(r.snapshot, stepped);
         w.publish(&block, Some(stepped), &status(ClockState::Unlocked, None));
-        assert_eq!(read(&block).step_gen, 7);
+        assert_eq!(read(&block).step_gen, 3);
         w.publish(&block, Some(stepped), &status(ClockState::Locking, Some(m1)));
-        assert_eq!(read(&block).step_gen, 8);
+        assert_eq!(read(&block).step_gen, 3);
 
-        // Locking -> FreeRunning.
+        // Locking -> FreeRunning: another clock.
         w.publish(&block, Some(stepped), &status(ClockState::FreeRunning, None));
         let r = read(&block);
-        assert_eq!((r.valid, r.state, r.step_gen), (true, ClockState::FreeRunning, 9));
+        assert_eq!((r.valid, r.state, r.step_gen), (true, ClockState::FreeRunning, 4));
         assert!(r.publish_ns > 0);
     }
 }

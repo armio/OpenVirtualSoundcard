@@ -125,7 +125,10 @@ sudo "/Library/Application Support/OpenVirtualSoundcard/uninstall.sh"
 ```
 
 [`docs/MACOS.md`](docs/MACOS.md) covers the app, latency, status,
-troubleshooting and how the driver works.
+troubleshooting and how the driver works. For live sound, processing a
+console's channels and sending them back, read [`docs/LIVE.md`](docs/LIVE.md)
+first: the settings, the network, a pre-show check, and what happens when
+something fails.
 
 ### Trying it without Dante hardware
 
@@ -156,6 +159,7 @@ ovsc route rx-dev 1 01@tx-dev
 * [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): crates, threads, time model, data path.
 * [`docs/PROTOCOL.md`](docs/PROTOCOL.md): byte-level protocol reference, sourced, with confidence markers and open questions.
 * [`docs/MACOS.md`](docs/MACOS.md): the macOS Core Audio device, for users and developers.
+* [`docs/LIVE.md`](docs/LIVE.md): live use, such as vocal processing between a console and a plug-in host.
 * [`docs/ROADMAP.md`](docs/ROADMAP.md): what's next.
 
 | Crate | Purpose |

@@ -25,11 +25,14 @@ pub const MAX_TX_FLOWS: usize = 32;
 pub const MAX_RX_FLOWS: usize = 32;
 /// Channels per transmit flow we advertise.
 pub const MAX_CHANNELS_PER_TX_FLOW: u16 = 8;
-/// Frames-per-packet range we advertise for transmit flows.
+/// Frames-per-packet range we advertise for transmit flows, and accept in
+/// flow requests.
 pub const FPP_MAX: u16 = 32;
 pub const FPP_MIN: u16 = 2;
-/// Largest frames-per-packet value we accept in flow requests.
-pub const FPP_LIMIT: u16 = 256;
+/// The most frames a received packet may carry: the frame count is read
+/// from a packet's length (PROTOCOL.md §8.2), and the macOS driver's ring
+/// span assumes no more (`ovsc_hal_server::config::RX_FPP_LIMIT`).
+pub const RX_FPP_LIMIT: usize = 256;
 /// PCM type of current Dante devices.
 pub const PCM_TYPE: u8 = 0x0e;
 
@@ -43,8 +46,14 @@ pub struct DeviceInfo {
     pub factory_name: String,
     pub sample_rate: u32,
     pub format: SampleFormat,
+    /// Receive latency: received audio is played this long after its
+    /// timestamp.
     pub latency_ns: u32,
     pub latency_samples: u64,
+    /// Transmit latency: the least receive latency asked of the receivers
+    /// of our transmit channels (TXT `latency_ns`).
+    pub tx_latency_ns: u32,
+    pub tx_latency_samples: u64,
     pub tx_guard_ns: u64,
     pub ports: Ports,
     /// Factory (default) channel names.
@@ -69,8 +78,21 @@ impl DeviceInfo {
                 id
             }
         };
-        let factory_name =
-            format!("ovsc-{}", hex::encode(&device_id[2..])).chars().take(31).collect();
+        // The name the device has until someone names it, and its mDNS host
+        // name. It must not change with the IP address, as the device id
+        // does: controllers' subscriptions to the device go by name. So, as
+        // Dante hardware does, it ends in the last three bytes of the
+        // interface's MAC address, which tell computers apart, and the
+        // process id when there are several devices on one computer. Without
+        // a MAC address (loopback), the device id stands in.
+        let factory_name = if iface.mac != [0; 6] {
+            match config.process_id {
+                0 => format!("ovsc-{}", hex::encode(&iface.mac[3..])),
+                p => format!("ovsc-{}-{p}", hex::encode(&iface.mac[3..])),
+            }
+        } else {
+            format!("ovsc-{}", hex::encode(&device_id[2..]))
+        };
         let format = SampleFormat::from_bits(config.bits_per_sample as u32)
             .ok_or_else(|| Error::Config("bits_per_sample".into()))?;
         let version = [
@@ -88,6 +110,8 @@ impl DeviceInfo {
             format,
             latency_ns: config.latency_ns(),
             latency_samples: config.latency_samples(),
+            tx_latency_ns: config.tx_latency_ns(),
+            tx_latency_samples: config.tx_latency_samples(),
             tx_guard_ns: config.tx_guard_us as u64 * 1000,
             ports: config.ports,
             tx_channels: config.tx_channels.names(),
@@ -104,5 +128,44 @@ impl DeviceInfo {
             bits_per_sample: self.format.bits(),
             pcm_type: PCM_TYPE as u16,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use super::*;
+    use crate::config::LATENCY_HEADROOM_US;
+    use crate::rx::own_channel_txt;
+
+    fn info(config: DeviceConfig) -> Result<DeviceInfo> {
+        let iface = Interface {
+            name: "lo".into(),
+            ip: Ipv4Addr::LOCALHOST,
+            netmask: Ipv4Addr::new(255, 0, 0, 0),
+            gateway: Ipv4Addr::UNSPECIFIED,
+            mac: [0; 6],
+            link_speed_mbps: 1000,
+        };
+        DeviceInfo::new(&config, iface)
+    }
+
+    #[test]
+    fn transmit_channels_ask_for_the_transmit_latency() {
+        // Receive at 4 ms, ask receivers of our channels for only 1 ms.
+        let i = info(DeviceConfig { tx_latency_ms: Some(1.0), ..Default::default() }).unwrap();
+        assert_eq!((i.latency_ns, i.latency_samples), (4_000_000, 192));
+        assert_eq!((i.tx_latency_ns, i.tx_latency_samples), (1_000_000, 48));
+        let txt = own_channel_txt(&i, 1);
+        assert_eq!(txt.latency_ns, 1_000_000);
+        // Enough for packets that leave the guard after their timestamp.
+        assert!(u64::from(txt.latency_ns) >= i.tx_guard_ns + u64::from(LATENCY_HEADROOM_US) * 1000);
+        // Unset, the transmit latency is the receive latency, as before.
+        let i = info(DeviceConfig { latency_ms: 2.0, ..Default::default() }).unwrap();
+        assert_eq!(own_channel_txt(&i, 2).latency_ns, 2_000_000);
+        // A device does not start with a latency its transmitter cannot meet.
+        assert!(info(DeviceConfig { tx_latency_ms: Some(0.5), ..Default::default() }).is_err());
+        assert!(info(DeviceConfig { latency_ms: 0.5, ..Default::default() }).is_err());
     }
 }

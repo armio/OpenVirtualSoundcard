@@ -2,27 +2,28 @@
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use ovsc_clock::MediaClock;
 use ovsc_proto::arc::SubscriptionStatus;
 use ovsc_proto::audio::{Sample, SampleFormat};
+use ovsc_proto::dns::Record;
 
-use crate::buffer::TimedRing;
+use crate::buffer::{SWEEP_INTERVAL, Sweeper, TimedRing};
 use crate::config::DeviceConfig;
 use crate::control;
 use crate::directory::{Directory, ResolvedChannel, StaticDirectory};
 use crate::info::{BOARD_NAME, DeviceInfo, MANUFACTURER, MODEL_ID};
-use crate::mdns::{self, Advertisement, Mdns};
+use crate::mdns::{self, Advertisement, Mdns, NameConflict};
 use crate::net::{Interface, bind_udp, into_tokio};
 use crate::persist::{self, SavedState};
 use crate::rx::{RxManager, own_channel_txt};
-use crate::state::{FormatRequest, Shared, State, Subscription};
+use crate::state::{FormatRequest, RemoteChanges, Shared, State, Subscription};
 use crate::tx::{self, FlowControl, TxCommand};
 use crate::{Error, Result};
 
@@ -35,15 +36,23 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct Device {
     shared: Arc<Shared>,
     mdns: Option<Mdns>,
-    tasks: Vec<JoinHandle<()>>,
+    /// The device's tasks, each with what it does, for [`Device::stopped_part`].
+    tasks: Vec<(&'static str, JoinHandle<()>)>,
     rx_shutdown: Option<oneshot::Sender<oneshot::Sender<()>>>,
     /// Closes once the receive manager and all its threads have exited (see
     /// [`RxManager::new`]).
     rx_threads: mpsc::Receiver<()>,
-    tx_commands: std::sync::mpsc::Sender<TxCommand>,
+    tx_commands: std::sync::mpsc::SyncSender<TxCommand>,
     tx_thread: Option<std::thread::JoinHandle<()>>,
+    /// Forgets samples in the rings whose writer stopped, before their
+    /// 32-bit tags could match again (see [`Sweeper`]).
+    sweeper: Sweeper,
     /// Where the device saves its state; saved once more on shutdown.
     state_file: Option<std::path::PathBuf>,
+    /// Why the saved state could not be used, if it could not.
+    state_problem: Option<String>,
+    /// The device name [`advertise`] announces, once it has claimed it.
+    announced: Arc<Mutex<Option<String>>>,
 }
 
 /// Status of a receive channel.
@@ -83,6 +92,25 @@ pub struct StartOptions {
     /// caller then applies [`Device::format_requests`], restarting the
     /// device with them.
     pub format_configurable: bool,
+    /// Note controllers' changes in this log, rather than a new one, to keep
+    /// them listed across a restart of the device (see
+    /// [`Device::remote_changes`]).
+    pub remote_changes: Option<RemoteChanges>,
+    /// Start from this state instead of the state file's: the
+    /// [`Device::saved_state`] of the device this one replaces, so that a
+    /// restart keeps the names and subscriptions made since the start
+    /// even without a state file. It is saved to the state file, if any.
+    pub state: Option<SavedState>,
+    /// The name the device this one replaces in this process announced
+    /// ([`Device::announced_name`]). Starting with that name, the device
+    /// announces it again without probing for it first: the name is
+    /// already its own on the network, and a probe would be answered by
+    /// any other device that announces it too (two devices given the same
+    /// name, say), which would rename this one mid-show, breaking every
+    /// subscription to it. That conflict is reported instead
+    /// ([`Device::name_conflict`], `renamed_to: None`). Any other name is
+    /// probed for, as at a first start.
+    pub announced: Option<String>,
 }
 
 /// Packet counters since the device started.
@@ -96,6 +124,39 @@ pub struct DeviceStats {
     pub rx_packets: u64,
     /// Received packets that were already older than the receive latency.
     pub rx_late_packets: u64,
+    /// Audio packets the network stack refused to send or reported
+    /// undeliverable.
+    pub tx_send_errors: u64,
+    /// The OS error code of the latest send error, 0 if none.
+    pub tx_last_send_error: i32,
+    /// Audio packets sent more than 250 µs after their send time
+    /// (timestamp + guard).
+    pub tx_late_packets: u64,
+    /// The latest an audio packet left after its send time, in ns.
+    pub tx_max_lateness_ns: u64,
+    /// Audio packets never sent: too old for any receiver after a stall of
+    /// the transmit thread or a media clock step.
+    pub tx_skipped_packets: u64,
+    /// Times a transmit flow's timeline restarted after such a stall or
+    /// step.
+    pub tx_resyncs: u64,
+    /// Transmit flows removed after 4 s without keepalives.
+    pub tx_expired_flows: u64,
+    /// The transmit thread runs without real-time scheduling.
+    pub tx_not_realtime: bool,
+    /// A receive thread started without real-time scheduling since the
+    /// device started.
+    pub rx_not_realtime: bool,
+    /// The transmit thread has stopped: no flow sends audio until the
+    /// device restarts.
+    pub tx_engine_failed: bool,
+    /// Packets missing from received flows: gaps in their timestamps.
+    pub rx_lost_packets: u64,
+    /// Received packets stamped ahead of our clock by more than a packet.
+    pub rx_early_packets: u64,
+    /// Datagrams receive flows dropped: from another sender than the
+    /// flow's transmitter, or not whole frames of the flow's slots.
+    pub rx_rejected_packets: u64,
 }
 
 impl Device {
@@ -126,8 +187,25 @@ impl Device {
         options: StartOptions,
     ) -> Result<Self> {
         config.validate()?;
-        let saved = config.state_file.as_deref().and_then(SavedState::load).unwrap_or_default();
-        let config = with_saved_latency(config, &saved);
+        let recovered = match options.state {
+            Some(state) => persist::Recovered { state, intact: false, problem: None },
+            None => config.state_file.as_deref().map(SavedState::recover).unwrap_or_default(),
+        };
+        let saved = recovered.state.clone();
+        let on_disk = recovered.intact.then_some(recovered.state);
+        // Also a problem found by a device this one replaces.
+        let state_problem = recovered
+            .problem
+            .or_else(|| config.state_file.as_deref().and_then(persist::problem_at_start));
+        let config = config.with_saved(&saved);
+        if let Some(ns) = saved.latency_ns {
+            let ms = ns as f64 / 1e6;
+            if config.latency_ns() == ns {
+                info!("receive latency {ms} ms, as set by a controller or the app");
+            } else {
+                warn!("ignoring the saved latency of {ms} ms");
+            }
+        }
         let iface = Interface::find(&config.interface)?;
         let info = DeviceInfo::new(&config, iface)?;
         let state = initial_state(&config, &info, saved);
@@ -140,7 +218,14 @@ impl Device {
             config.ring_capacity,
             options.rings,
             options.format_configurable,
+            options.remote_changes.unwrap_or_default(),
         )?;
+        // Rings in a region shared with a driver outlive the device, so the
+        // sweeper's first pass, at once, also forgets what an earlier device
+        // left behind.
+        let rings = shared.rx_rings.iter().chain(&shared.tx_rings).cloned().collect();
+        let (clock, rate) = (shared.clock.clone(), shared.info.sample_rate);
+        let sweeper = Sweeper::spawn(rings, SWEEP_INTERVAL, move || clock.now_samples(rate))?;
 
         // Bind everything first so that port conflicts fail the start.
         let arc_socket = into_tokio(bind_udp(ip, ports.arc)?)?;
@@ -178,30 +263,38 @@ impl Device {
         };
 
         let mut tasks = Vec::new();
-        tasks.push(tokio::spawn(control::run_arc(shared.clone(), arc_socket)));
+        tasks.push(("ARC server", tokio::spawn(control::run_arc(shared.clone(), arc_socket))));
         if let Some(s) = arc_loopback {
-            tasks.push(tokio::spawn(control::run_arc(shared.clone(), s)));
+            tasks.push((
+                "ARC server on 127.0.0.1",
+                tokio::spawn(control::run_arc(shared.clone(), s)),
+            ));
         }
-        tasks.push(tokio::spawn(control::run_cmc(shared.clone(), cmc_socket)));
+        tasks.push(("CMC server", tokio::spawn(control::run_cmc(shared.clone(), cmc_socket))));
         tasks.push(match settings_socket {
-            Some(s) => tokio::spawn(control::run_conmon(shared.clone(), s, notify_rx)),
-            None => tokio::spawn(control::drain_notifications(notify_rx)),
+            Some(s) => {
+                ("settings server", tokio::spawn(control::run_conmon(shared.clone(), s, notify_rx)))
+            }
+            None => ("notifications", tokio::spawn(control::drain_notifications(notify_rx))),
         });
 
         let (tx_commands, tx_events, tx_thread) = tx::spawn_engine(shared.clone());
         let fc = FlowControl::new(shared.clone(), tx_commands.clone());
-        tasks.push(tokio::spawn(fc.run(fc_socket, tx_events)));
+        tasks.push(("flow control server", tokio::spawn(fc.run(fc_socket, tx_events))));
 
         let (rx_shutdown, rx_shutdown_rx) = oneshot::channel();
         let (rx_threads_tx, rx_threads) = mpsc::channel(1);
         let rx = RxManager::new(shared.clone(), directory, rx_threads_tx);
-        tasks.push(tokio::spawn(rx.run(rx_shutdown_rx)));
+        tasks.push(("receive manager", tokio::spawn(rx.run(rx_shutdown_rx))));
 
+        let announced = Arc::new(Mutex::new(None));
         if let Some(m) = &mdns {
-            tasks.push(tokio::spawn(advertise(shared.clone(), m.clone())));
+            let claimed = options.announced;
+            let advertiser = advertise(shared.clone(), m.clone(), claimed, announced.clone());
+            tasks.push(("mDNS advertiser", tokio::spawn(advertiser)));
         }
         if let Some(path) = config.state_file.clone() {
-            tasks.push(tokio::spawn(persist::run(shared.clone(), path)));
+            tasks.push(("state saver", tokio::spawn(persist::run(shared.clone(), path, on_disk))));
         }
 
         info!(
@@ -223,13 +316,56 @@ impl Device {
             rx_threads,
             tx_commands,
             tx_thread: Some(tx_thread),
+            sweeper,
             state_file: config.state_file,
+            state_problem,
+            announced,
         })
+    }
+
+    /// The device name this device announces on the network, once it has
+    /// claimed it (probed for it, RFC 6762 §8.1, or taken it over from the
+    /// device it replaces); `None` before that, and without discovery. A
+    /// device that replaces this one in the same process takes it over
+    /// through [`StartOptions::announced`].
+    pub fn announced_name(&self) -> Option<String> {
+        self.announced.lock().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// The names, subscriptions and latency a controller or the app set,
+    /// as they would be saved; see [`StartOptions::state`].
+    pub fn saved_state(&self) -> SavedState {
+        SavedState::from_state(&self.shared.state(), &self.shared.info.factory_name)
+    }
+
+    /// Why the saved state (names, subscriptions, latency) could not be
+    /// used at start, if it could not: the device then started from the
+    /// backup or without it (see [`SavedState::recover`]). It stays for
+    /// the life of the process, through restarts of the device.
+    pub fn saved_state_problem(&self) -> Option<&str> {
+        self.state_problem.as_deref()
+    }
+
+    /// A part of the running device that has stopped on its own, if one
+    /// has: the transmit thread or one of the tasks. They only end when
+    /// the device shuts down, so this means one failed (a panic, say) and
+    /// the device no longer works as a whole.
+    pub fn stopped_part(&self) -> Option<&'static str> {
+        if self.tx_thread.as_ref().is_some_and(|t| t.is_finished()) {
+            return Some("transmit thread");
+        }
+        self.tasks.iter().find(|(_, t)| t.is_finished()).map(|(what, _)| *what)
     }
 
     /// Current device name.
     pub fn name(&self) -> String {
         self.shared.name()
+    }
+
+    /// Another device on the network that uses this device's name, or did
+    /// when this device took another one; see [`NameConflict`].
+    pub fn name_conflict(&self) -> Option<NameConflict> {
+        self.shared.state().name_conflict.clone()
     }
 
     /// Sets the receive latency to `ns`, saved for the next start of the
@@ -253,6 +389,22 @@ impl Device {
     /// depth; see [`StartOptions::format_configurable`].
     pub fn format_requests(&self) -> watch::Receiver<FormatRequest> {
         self.shared.format_requests()
+    }
+
+    /// Whether the show lock keeps controllers from changing the latency,
+    /// the format and the names; see [`DeviceConfig::lock_remote_settings`].
+    pub fn remote_settings_locked(&self) -> bool {
+        self.shared.remote_settings_locked()
+    }
+
+    /// Turns the show lock on or off, saved with the device's state.
+    pub fn lock_remote_settings(&self, locked: bool) {
+        self.shared.lock_remote_settings(locked)
+    }
+
+    /// What controllers changed, or tried to change while locked, recently.
+    pub fn remote_changes(&self) -> RemoteChanges {
+        self.shared.remote_changes.clone()
     }
 
     /// Renames the device, as a controller would.
@@ -426,20 +578,21 @@ impl Device {
         }
     }
 
-    /// Aborts the tasks, stops the transmit thread and mDNS, and returns the
-    /// aborted tasks' handles.
+    /// Aborts the tasks, stops the transmit thread, the ring sweeper and
+    /// mDNS, and returns the aborted tasks' handles.
     fn stop_now(&mut self) -> Vec<JoinHandle<()>> {
-        for t in &self.tasks {
+        for (_, t) in &self.tasks {
             t.abort();
         }
         let _ = self.tx_commands.send(TxCommand::Shutdown);
         if let Some(t) = self.tx_thread.take() {
             let _ = t.join();
         }
+        self.sweeper.stop();
         if let Some(m) = &self.mdns {
             m.stop();
         }
-        std::mem::take(&mut self.tasks)
+        std::mem::take(&mut self.tasks).into_iter().map(|(_, t)| t).collect()
     }
 }
 
@@ -467,6 +620,12 @@ impl DeviceObserver {
         self.shared.upgrade().map(|s| s.name())
     }
 
+    /// Another device that uses this device's name, as
+    /// [`Device::name_conflict`]: `Some(None)` when there is none.
+    pub fn name_conflict(&self) -> Option<Option<NameConflict>> {
+        self.shared.upgrade().map(|s| s.state().name_conflict.clone())
+    }
+
     /// Current receive and transmit channel names, as `(rx, tx)`.
     pub fn channel_names(&self) -> Option<(Vec<String>, Vec<String>)> {
         self.shared.upgrade().map(|s| channel_names(&s))
@@ -490,39 +649,27 @@ fn stats(shared: &Shared) -> DeviceStats {
         tx_underruns: c.tx_underruns.load(Ordering::Relaxed),
         rx_packets: c.rx_packets.load(Ordering::Relaxed),
         rx_late_packets: c.rx_late_packets.load(Ordering::Relaxed),
+        tx_send_errors: c.tx_send_errors.load(Ordering::Relaxed),
+        tx_last_send_error: c.tx_last_send_error.load(Ordering::Relaxed),
+        tx_late_packets: c.tx_late_packets.load(Ordering::Relaxed),
+        tx_max_lateness_ns: c.tx_max_lateness_ns.load(Ordering::Relaxed),
+        tx_skipped_packets: c.tx_skipped_packets.load(Ordering::Relaxed),
+        tx_resyncs: c.tx_resyncs.load(Ordering::Relaxed),
+        tx_expired_flows: c.tx_expired_flows.load(Ordering::Relaxed),
+        tx_not_realtime: c.tx_not_realtime.load(Ordering::Relaxed),
+        rx_not_realtime: c.rx_not_realtime.load(Ordering::Relaxed),
+        tx_engine_failed: c.tx_engine_failed.load(Ordering::Relaxed),
+        rx_lost_packets: c.rx_lost_packets.load(Ordering::Relaxed),
+        rx_early_packets: c.rx_early_packets.load(Ordering::Relaxed),
+        rx_rejected_packets: c.rx_rejected_packets.load(Ordering::Relaxed),
     }
 }
 
-/// `config` with the receive latency a controller or the app saved, if it
-/// is valid.
-fn with_saved_latency(mut config: DeviceConfig, saved: &SavedState) -> DeviceConfig {
-    if let Some(ns) = saved.latency_ns {
-        let ms = ns as f64 / 1e6;
-        if (crate::config::MIN_LATENCY_MS..=crate::config::MAX_LATENCY_MS).contains(&ms) {
-            info!("receive latency {ms} ms, as set by a controller or the app");
-            config.latency_ms = ms;
-        } else {
-            warn!("ignoring the saved latency of {ms} ms");
-        }
-    }
-    config
-}
-
+/// The state a device starts in. `config` already holds the saved name and
+/// latency ([`DeviceConfig::with_saved`]).
 fn initial_state(config: &DeviceConfig, info: &DeviceInfo, saved: SavedState) -> State {
-    let pick = |saved: &[String], factory: &[String]| -> Vec<String> {
-        factory
-            .iter()
-            .enumerate()
-            .map(|(i, f)| saved.get(i).filter(|s| !s.is_empty()).unwrap_or(f).clone())
-            .collect()
-    };
-    let name = saved
-        .name
-        .clone()
-        .filter(|n| ovsc_proto::discovery::validate_device_name(n).is_ok())
-        .unwrap_or_else(|| {
-            if config.name.is_empty() { info.factory_name.clone() } else { config.name.clone() }
-        });
+    let name = if config.name.is_empty() { info.factory_name.clone() } else { config.name.clone() };
+    let (rx_names, tx_names) = saved.channel_names(&info.rx_channels, &info.tx_channels);
     let mut subscriptions = vec![None; info.rx_channels.len()];
     let initial = config.subscriptions.iter().map(|s| (s.rx_channel, &s.tx_channel, &s.tx_device));
     let restored = saved.subscriptions.iter().map(|s| (s.rx_channel, &s.tx_channel, &s.tx_device));
@@ -540,54 +687,163 @@ fn initial_state(config: &DeviceConfig, info: &DeviceInfo, saved: SavedState) ->
     }
     State {
         name,
-        tx_names: pick(&saved.tx_names, &info.tx_channels),
-        rx_names: pick(&saved.rx_names, &info.rx_channels),
+        name_conflict: None,
+        tx_names,
+        rx_names,
         subscriptions,
         tx_flows: Vec::new(),
         rx_flows: Vec::new(),
         rx_flow_stats: Vec::new(),
         latency_override_ns: saved.latency_ns.filter(|&ns| ns == info.latency_ns),
+        remote_settings_locked: saved.lock_remote_settings.unwrap_or(config.lock_remote_settings),
+        remote_settings_lock_set: saved.lock_remote_settings,
     }
 }
 
-/// Keeps the mDNS records in line with the device name and channel names.
-async fn advertise(shared: Arc<Shared>, mdns: Mdns) {
+/// How many other names [`advertise`] tries when probing finds the device's
+/// name taken, before it announces one anyway and reports the conflict.
+/// RFC 6762 §8.1 slows probing down after 15 conflicts.
+const MAX_RENAMES: u32 = 15;
+
+/// A device name that probing found taken.
+struct Renaming {
+    /// The name asked for (by the configuration, a controller or the app),
+    /// which the alternatives are numbered after.
+    wanted: String,
+    /// The device that holds it.
+    peer: Ipv4Addr,
+    /// The alternative taken last, and how many were tried.
+    picked: String,
+    tries: u32,
+}
+
+/// Keeps the mDNS records in line with the device name and channel names,
+/// and [`State::name_conflict`] up to date.
+///
+/// Each new device name is probed for before it is announced (RFC 6762
+/// §8.1). When another device answers for it, this device takes the first
+/// free name of `<name>-2`, `<name>-3`, ... and keeps it: it is saved like a
+/// rename from a controller, so the device that held the name first keeps
+/// it, and neither changes name at its next start. A conflict that only
+/// shows once a name is announced renames nothing (see [`crate::mdns`]).
+///
+/// `claimed` is the name the device this one replaces in this process
+/// announced ([`StartOptions::announced`]): already this device's on the
+/// network, it is announced again without a probe, which another device
+/// announcing it too would answer. Such a device is a conflict reported
+/// with `renamed_to: None`, as one that appears while the name is
+/// announced. The device name whose records are announced goes to
+/// `announced` ([`Device::announced_name`]).
+async fn advertise(
+    shared: Arc<Shared>,
+    mdns: Mdns,
+    mut claimed: Option<String>,
+    announced: Arc<Mutex<Option<String>>>,
+) {
     let mut watch = shared.watch();
+    let mut conflicts = mdns.conflicts();
+    let mut renaming: Option<Renaming> = None;
     let mut last = None;
     loop {
-        let records = {
-            let s = shared.state();
-            let info = &shared.info;
-            mdns::device_records(&Advertisement {
-                name: &s.name,
-                ip: info.iface.ip,
-                arc_port: info.ports.arc,
-                cmc_port: info.ports.cmc,
-                flow_control_port: info.ports.flow_control,
-                device_id: &info.device_id,
-                process_id: info.process_id,
-                manufacturer: MANUFACTURER,
-                board_name: BOARD_NAME,
-                model: MODEL_ID,
-                tx_channels: info
-                    .tx_channels
-                    .iter()
-                    .zip(&s.tx_names)
-                    .enumerate()
-                    .map(|(i, (f, c))| {
-                        (f.as_str(), c.as_str(), own_channel_txt(info, i as u16 + 1))
-                    })
-                    .collect(),
-            })
-        };
+        let (name, records) = advertisement(&shared);
+        if !claimed.as_ref().is_some_and(|c| c.eq_ignore_ascii_case(&name)) {
+            let taken = mdns.probe(&records).await;
+            if !shared.name().eq_ignore_ascii_case(&name) {
+                // Renamed meanwhile: probe for the new name instead.
+                continue;
+            }
+            if let Some(conflict) = taken {
+                let mut r = match renaming.take() {
+                    Some(r) if r.picked.eq_ignore_ascii_case(&name) => r,
+                    _ => Renaming {
+                        wanted: name.clone(),
+                        peer: conflict.peer,
+                        picked: name.clone(),
+                        tries: 0,
+                    },
+                };
+                r.tries += 1;
+                if r.tries <= MAX_RENAMES {
+                    let new = mdns::alternative_name(&r.wanted, r.tries + 1);
+                    error!(
+                        "the device at {} already uses the name {name}: this device takes the \
+                         name {new}. Rename one of them to choose their names.",
+                        conflict.peer
+                    );
+                    shared.modify(|s| {
+                        if s.name.eq_ignore_ascii_case(&name) {
+                            s.name = new.clone();
+                        }
+                    });
+                    r.picked = new;
+                    renaming = Some(r);
+                    continue;
+                }
+                error!(
+                    "{MAX_RENAMES} names after {} are taken; announcing {name} although the \
+                     device at {} uses it",
+                    r.wanted, conflict.peer
+                );
+            }
+            claimed = Some(name);
+        }
         if last.as_ref() != Some(&records) {
             mdns.set_records(records.clone()).await;
             last = Some(records);
+            *announced.lock().unwrap_or_else(PoisonError::into_inner) = claimed.clone();
         }
-        if watch.changed().await.is_err() {
-            return;
+        report_name_conflict(&shared, renaming.as_ref(), &conflicts.borrow_and_update());
+        tokio::select! {
+            changed = watch.changed() => if changed.is_err() {
+                return;
+            },
+            changed = conflicts.changed() => if changed.is_err() {
+                return;
+            },
         }
     }
+}
+
+/// Sets [`State::name_conflict`]: a device announcing our name right now,
+/// or else the name that probing found taken, while the device keeps the
+/// one it took instead. Status only: it doesn't wake [`Shared::watch`].
+fn report_name_conflict(shared: &Shared, renaming: Option<&Renaming>, live: &[mdns::Conflict]) {
+    let mut s = shared.state();
+    s.name_conflict = match live.first() {
+        Some(c) => Some(NameConflict { name: s.name.clone(), peer: c.peer, renamed_to: None }),
+        None => renaming.filter(|r| r.picked.eq_ignore_ascii_case(&s.name)).map(|r| NameConflict {
+            name: r.wanted.clone(),
+            peer: r.peer,
+            renamed_to: Some(r.picked.clone()),
+        }),
+    };
+}
+
+/// The device name and the mDNS records of the device as it is now.
+fn advertisement(shared: &Shared) -> (String, Vec<Record>) {
+    let s = shared.state();
+    let info = &shared.info;
+    let records = mdns::device_records(&Advertisement {
+        name: &s.name,
+        host: &info.factory_name,
+        ip: info.iface.ip,
+        arc_port: info.ports.arc,
+        cmc_port: info.ports.cmc,
+        flow_control_port: info.ports.flow_control,
+        device_id: &info.device_id,
+        process_id: info.process_id,
+        manufacturer: MANUFACTURER,
+        board_name: BOARD_NAME,
+        model: MODEL_ID,
+        tx_channels: info
+            .tx_channels
+            .iter()
+            .zip(&s.tx_names)
+            .enumerate()
+            .map(|(i, (f, c))| (f.as_str(), c.as_str(), own_channel_txt(info, i as u16 + 1)))
+            .collect(),
+    });
+    (s.name.clone(), records)
 }
 
 /// What an audio backend needs: the media clock and the channel rings.
@@ -623,5 +879,50 @@ impl AudioIo {
     /// Writes transmit channel `ch` at timestamps `ts..`.
     pub fn write_tx(&self, ch: usize, ts: u64, samples: &[Sample]) {
         self.tx[ch].write(ts, samples)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Channels, Ports};
+
+    /// A device's rings that held audio from before it started (rings in a
+    /// region shared with a driver outlive the device) are swept when it
+    /// starts: nothing written a day ago can come back when the 32-bit tags
+    /// match again.
+    #[tokio::test]
+    async fn a_device_sweeps_its_rings() {
+        let clock = ovsc_clock::system_clock();
+        let rate = 48_000;
+        let ring = || Arc::new(TimedRing::new(crate::buffer::DEFAULT_CAPACITY));
+        let rings = ExternalRings { rx: vec![ring(), ring()], tx: vec![ring(), ring()] };
+        let day_ago = clock.now_samples(rate).unwrap() - u64::from(rate) * 86_400;
+        for r in rings.rx.iter().chain(&rings.tx) {
+            r.write(day_ago, &[0x7fff_ff00; 64]);
+        }
+        let config = DeviceConfig {
+            name: "sweep-dev".into(),
+            interface: "127.0.0.1".into(),
+            sample_rate: rate,
+            tx_channels: Channels::Count(2),
+            rx_channels: Channels::Count(2),
+            ports: Ports { arc: 25130, cmc: 25131, flow_control: 25132, settings: 25133 },
+            discovery: false,
+            process_id: 41,
+            ..Default::default()
+        };
+        let options = StartOptions { rings: Some(rings.clone()), ..Default::default() };
+        let device = Device::start_with_options(config, clock, options).await.unwrap();
+        let all = || rings.rx.iter().chain(&rings.tx);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while all().any(|r| r.read_one(day_ago).is_some()) {
+            assert!(tokio::time::Instant::now() < deadline, "rings not swept");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(all().all(|r| r.read_one(day_ago + 63).is_none()));
+        // Shutting down stops the sweeper, which then holds no ring.
+        device.shutdown().await;
+        assert!(all().all(|r| Arc::strong_count(r) == 1), "only the test holds the rings");
     }
 }

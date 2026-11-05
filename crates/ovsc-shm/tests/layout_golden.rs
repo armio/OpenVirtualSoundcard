@@ -160,6 +160,7 @@ fn plugin_status_offsets() {
     assert_eq!(offset_of!(PluginStatus, io_heartbeat_ns), 0x60);
     assert_eq!(offset_of!(PluginStatus, faulted), 0x68);
     assert_eq!(offset_of!(PluginStatus, frames_capped), 0x70);
+    assert_eq!(offset_of!(PluginStatus, non_finite_out), 0x78);
     // Line 1: GetZeroTimeStamp.
     assert_eq!(offset_of!(PluginStatus, zts_calls), 0x80);
     assert_eq!(offset_of!(PluginStatus, seed), 0x88);

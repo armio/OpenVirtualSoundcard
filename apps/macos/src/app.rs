@@ -46,10 +46,12 @@ pub struct App {
     interfaces: Vec<InterfaceInfo>,
     /// Once the settings were read.
     form: Option<Form>,
-    /// A change waiting for the user to accept a restart.
-    confirm: Option<SettingsChange>,
+    /// A change waiting for the user to accept what it interrupts.
+    confirm: Option<(SettingsChange, logic::Confirmation)>,
     /// A change was sent and is not answered yet.
     applying: bool,
+    /// The change sent last, for the words once it is applied.
+    sent: SettingsChange,
     /// What became of the last change.
     outcome: Option<Result<&'static str, String>>,
     /// The next settings follow an applied change: they replace the edit.
@@ -70,6 +72,7 @@ impl App {
             form: None,
             confirm: None,
             applying: false,
+            sent: SettingsChange::default(),
             outcome: None,
             take_next: false,
             restart_until: None,
@@ -99,7 +102,7 @@ impl App {
             Event::Interfaces(interfaces) => self.interfaces = interfaces,
             Event::Applied(Ok(restart)) => {
                 self.applying = false;
-                self.outcome = Some(Ok(logic::applied_message(restart)));
+                self.outcome = Some(Ok(logic::applied_message(&self.sent, restart)));
                 // Saved: the edit is the daemon's now, until it says more.
                 if let Some(form) = &mut self.form {
                     form.edited.name = form.edited.name.trim().to_owned();
@@ -140,6 +143,11 @@ impl App {
                 ui.add(egui::Label::new(name).truncate());
                 let subtitle = match &self.connection {
                     Connection::Connecting => "Connecting…".to_owned(),
+                    Connection::Up(status)
+                        if status.device.as_ref().is_some_and(|d| d.remote_settings_locked) =>
+                    {
+                        format!("OpenVirtualSoundcard {} · settings locked", status.version)
+                    }
                     Connection::Up(status) => format!("OpenVirtualSoundcard {}", status.version),
                     Connection::Down(_) if self.restarting(ui.ctx()) => "Restarting…".to_owned(),
                     Connection::Down(Problem::Version { .. }) => "Different version".to_owned(),
@@ -180,11 +188,7 @@ impl App {
         let driver = &status.driver;
         let (driver_light, driver_word) = logic::driver_light(driver);
         let (audio_light, audio_word) = logic::audio_light(driver);
-        let audio_hover = if driver.io_running {
-            "An application is playing or recording through OpenVirtualSoundcard."
-        } else {
-            "No application is using OpenVirtualSoundcard right now."
-        };
+        let audio_hover = logic::audio_hover(driver);
         [
             (
                 "Clock",
@@ -192,7 +196,7 @@ impl App {
                 format!("Source: {}", logic::clock_source_label(&status.clock.source)),
             ),
             ("Driver", (driver_light, driver_word.to_owned()), driver.detail.clone()),
-            ("Audio", (audio_light, audio_word.to_owned()), audio_hover.to_owned()),
+            ("Audio", (audio_light, audio_word.to_owned()), audio_hover),
         ]
     }
 
@@ -245,9 +249,26 @@ impl App {
 
     fn status_tab(&self, ui: &mut Ui) {
         let Connection::Up(status) = &self.connection else { return };
-        if !status.warnings.is_empty() {
+        // Audio down now first, in red; then what is worth a look.
+        let (urgent, other) = logic::split_warnings(status);
+        if !urgent.is_empty() {
+            notice(ui, Light::Red, |ui| {
+                for warning in urgent {
+                    ui.label(RichText::new(format!("⚠ {warning}")).strong());
+                }
+                if status.driver.faulted {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(logic::RESTART_CORE_AUDIO).monospace());
+                        if ui.small_button("Copy").clicked() {
+                            ui.ctx().copy_text(logic::RESTART_CORE_AUDIO.to_owned());
+                        }
+                    });
+                }
+            });
+        }
+        if !other.is_empty() {
             notice(ui, Light::Amber, |ui| {
-                for warning in &status.warnings {
+                for warning in other {
                     ui.label(RichText::new(format!("⚠ {warning}")).strong());
                 }
             });
@@ -297,6 +318,7 @@ impl App {
                             ("Sent without audio", logic::count_label(p.tx_underruns)),
                             ("Received", logic::count_label(p.rx)),
                             ("Arrived too late", logic::count_label(p.rx_late)),
+                            ("Lost", logic::count_label(p.rx_lost)),
                         ],
                     );
                 });
@@ -304,6 +326,13 @@ impl App {
             });
         } else {
             section(ui, "Core Audio driver", |ui| driver_rows(ui, status));
+        }
+        if !status.earlier.is_empty() {
+            section(ui, "Earlier", |ui| {
+                for news in &status.earlier {
+                    ui.add(egui::Label::new(RichText::new(news).weak()).wrap());
+                }
+            });
         }
     }
 
@@ -320,7 +349,7 @@ impl App {
         };
         let usable = up && !self.applying;
         let before = form.edited.clone();
-        let name_problem = logic::name_problem(&form.edited.name);
+        let name_problem = logic::edited_name_problem(&form.current.name, &form.edited.name);
         ui.add_enabled_ui(usable, |ui| {
             section(ui, "Device", |ui| settings_form(ui, form, &self.interfaces, name_problem));
         });
@@ -329,21 +358,31 @@ impl App {
         }
 
         let change = logic::change(&form.current, &form.edited);
-        let restart = logic::expected_restart(&change);
+        let device = match &self.connection {
+            Connection::Up(status) => status.device.as_ref(),
+            _ => None,
+        };
+        // Restarts and renames interrupt audio or other devices'
+        // subscriptions, the returns to the console among them: say so
+        // before Apply, and ask once more after it.
+        let confirmation =
+            logic::confirmation(&change, &form.current.name, &logic::receivers(device));
         ui.add_space(6.0);
+        if let Some(c) = &confirmation {
+            ui.label(RichText::new(&c.text).color(color(Light::Amber)));
+        }
         ui.horizontal(|ui| {
-            if let Some(note) = logic::interruption(restart) {
-                ui.label(RichText::new(note).color(color(Light::Amber)));
-            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let apply = usable && !change.is_empty() && name_problem.is_none();
                 if ui.add_enabled(apply, egui::Button::new("Apply")).clicked() {
-                    if restart == Restart::Daemon {
-                        self.confirm = Some(change.clone());
-                    } else {
-                        self.applying = true;
-                        self.outcome = None;
-                        self.worker.send(Command::Apply(change.clone()));
+                    match &confirmation {
+                        Some(c) => self.confirm = Some((change.clone(), c.clone())),
+                        None => {
+                            self.applying = true;
+                            self.outcome = None;
+                            self.sent = change.clone();
+                            self.worker.send(Command::Apply(change.clone()));
+                        }
                     }
                 }
                 let revert = !self.applying && !change.is_empty();
@@ -369,20 +408,19 @@ impl App {
         }
     }
 
-    /// Asks before a change that restarts the daemon.
-    fn confirm_restart(&mut self, ctx: &egui::Context) {
-        if self.confirm.is_none() {
-            return;
-        }
+    /// Asks before a change that interrupts audio or other devices'
+    /// subscriptions: a restart or a new name.
+    fn confirm_change(&mut self, ctx: &egui::Context) {
+        let Some((_, confirmation)) = &self.confirm else { return };
         let mut accept = None;
-        let modal = egui::Modal::new(egui::Id::new("confirm-restart")).show(ctx, |ui| {
-            ui.set_width(340.0);
-            ui.label(RichText::new("Restart OpenVirtualSoundcard?").strong().size(15.0));
+        let modal = egui::Modal::new(egui::Id::new("confirm-change")).show(ctx, |ui| {
+            ui.set_width(380.0);
+            ui.label(RichText::new(confirmation.title).strong().size(15.0));
             ui.add_space(4.0);
-            ui.label(logic::interruption(Restart::Daemon).unwrap_or_default());
+            ui.label(&confirmation.text);
             ui.add_space(12.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.button("Restart").clicked() {
+                if ui.button(confirmation.button).clicked() {
                     accept = Some(true);
                 }
                 if ui.button("Cancel").clicked() {
@@ -395,9 +433,10 @@ impl App {
         }
         match accept {
             Some(true) => {
-                if let Some(change) = self.confirm.take() {
+                if let Some((change, _)) = self.confirm.take() {
                     self.applying = true;
                     self.outcome = None;
+                    self.sent = change.clone();
                     self.worker.send(Command::Apply(change));
                 }
             }
@@ -428,7 +467,7 @@ impl eframe::App for App {
                 ui.add_space(8.0);
             });
         });
-        self.confirm_restart(ui.ctx());
+        self.confirm_change(ui.ctx());
     }
 }
 
@@ -515,6 +554,14 @@ fn settings_form(
             );
         });
         ui.end_row();
+
+        ui.label("Show lock");
+        ui.vertical(|ui| {
+            ui.set_max_width(340.0);
+            ui.checkbox(&mut edited.lock_remote_settings, "Lock settings from the network");
+            ui.add(egui::Label::new(RichText::new(logic::LOCK_HELP).small().weak()).wrap());
+        });
+        ui.end_row();
     });
 }
 
@@ -529,6 +576,7 @@ fn device_rows(ui: &mut Ui, device: &DeviceStatus) {
             ("Sample rate", logic::rate_label(device.sample_rate)),
             ("Bit depth", format!("{}-bit", device.bits_per_sample)),
             ("Latency", logic::latency_label(device.latency_ms)),
+            ("Settings from the network", logic::lock_label(device.remote_settings_locked).into()),
         ],
     );
 }

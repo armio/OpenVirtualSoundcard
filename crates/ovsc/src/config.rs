@@ -5,8 +5,10 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use ovsc_core::DeviceConfig;
+use ovsc_core::config::{MAX_LATENCY_MS, min_latency_ms};
 use ovsc_hal_server::config::HELPER_UID;
 use ovsc_hal_server::{EngineInfo, HalOptions, driver_config};
 use ovsc_ipc::protocol::{
@@ -169,14 +171,21 @@ pub struct CoreAudioConfig {
     pub allowed_uids: Vec<u32>,
     /// Extra input safety offset against late packets, in µs.
     pub input_margin_us: u32,
-    /// Extra output safety offset against a late transmit thread, in µs.
+    /// Extra output safety offset, in µs, so that output reaches the rings
+    /// before the transmit thread reads it although the driver's timeline
+    /// and the daemon's clock disagree (by up to 250 µs while audio flows),
+    /// the HAL wakes a few frames late or an IO cycle finishes late. (A late
+    /// transmit thread needs none: it only reads later.)
     pub output_margin_us: u32,
     /// Output latency reported to applications, in ms. Default: the
-    /// receive latency.
+    /// transmit latency (`[device] tx_latency_ms`, else `latency_ms`).
+    /// Receivers play the outputs at the larger of that and their own
+    /// latency, so set it to a longer receiver latency.
     pub output_latency_ms: Option<f64>,
     pub input_latency_mode: LatencyMode,
     pub clock_algorithm: ClockAlgorithm,
-    /// Keep the Mac from idle-sleeping while the engine runs.
+    /// Keep the Mac from idle-sleeping while the daemon runs, engine restarts
+    /// included.
     pub prevent_idle_sleep: bool,
     /// Seconds between status lines in the log; 0 disables them.
     pub status_log_interval_s: u64,
@@ -238,10 +247,52 @@ pub fn channel_map(list: &Option<Vec<u16>>) -> Option<Vec<Option<usize>>> {
 }
 
 impl AppConfig {
+    /// Reads the configuration file at `path`. A latency below the least
+    /// the transmit guard allows is raised to it, with a warning (see
+    /// [`AppConfig::raise_low_latencies`]).
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+        let mut cfg: AppConfig =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        for raised in cfg.raise_low_latencies() {
+            warn!("{}: {raised}", path.display());
+        }
+        Ok(cfg)
+    }
+
+    /// Raises `[device] latency_ms` and `tx_latency_ms` where they are
+    /// below [`min_latency_ms`] to that least, and says what it raised.
+    ///
+    /// Earlier versions took latencies down to 0.25 ms, and an upgrade
+    /// keeps the configuration file. Refused, such a latency would stop
+    /// the daemon at every start, launchd restarting it in a loop, and
+    /// leave the device without an engine until someone edits the file.
+    /// Like a latency in the state file that the device cannot run at, it
+    /// gets a warning and a latency the device can run at instead. A
+    /// latency above the most, or not a number, is still refused.
+    pub fn raise_low_latencies(&mut self) -> Vec<String> {
+        let d = &mut self.device;
+        let min = min_latency_ms(d.tx_guard_us);
+        let mut raised = Vec::new();
+        if min > MAX_LATENCY_MS {
+            // A guard that leaves no latency: validate() says so.
+            return raised;
+        }
+        if d.latency_ms < min {
+            raised.push(format!(
+                "latency_ms {} is below the minimum of {min} ms; using {min} ms",
+                d.latency_ms
+            ));
+            d.latency_ms = min;
+        }
+        if let Some(ms) = d.tx_latency_ms.filter(|&ms| ms < min) {
+            raised.push(format!(
+                "tx_latency_ms {ms} is below the minimum of {min} ms; using {min} ms"
+            ));
+            d.tx_latency_ms = Some(min);
+        }
+        raised
     }
 
     /// Checks the configuration before `ovsc run` uses it on this host.
@@ -320,16 +371,27 @@ pub const EXAMPLE: &str = r#"# OpenVirtualSoundcard configuration.
 
 [device]
 # Name shown in Dante Controller: 1-31 of A-Z a-z 0-9 and inner hyphens.
-name = "ovsc"
+# Two devices must not share one. Empty: "ovsc-" and the end of the
+# interface's MAC address.
+name = ""
 # Network interface name or IPv4 address. Empty: interface of the default route.
 interface = ""
 sample_rate = 48000          # 44100, 48000, 88200, 96000, 176400 or 192000
 bits_per_sample = 24         # 16, 24 or 32
 tx_channels = 8              # a count, or a list of names: ["Left", "Right"]
 rx_channels = 8
-latency_ms = 4.0             # receive latency
+latency_ms = 4.0             # receive latency, 1 to 40
+# Transmit latency: the least latency receivers of the transmit channels must
+# play them at. Unset: latency_ms.
+# tx_latency_ms = 1.0
 # Remember renames and subscriptions made from a controller.
 state_file = "ovsc-state.toml"
+# Show lock: refuse changes from controllers (Dante Controller) to the
+# latency, sample rate and encoding, which stop audio both ways, and to the
+# device and channel names, which other devices subscribe by. Subscriptions
+# stay open. The macOS app turns it on and off; its choice is saved in
+# state_file and replaces this.
+lock_remote_settings = false
 
 # Subscriptions to set up at start (controllers can change them later).
 # [[device.subscriptions]]
@@ -362,9 +424,25 @@ mod tests {
     fn example_parses() {
         let cfg: AppConfig = toml::from_str(EXAMPLE).unwrap();
         cfg.device.validate().unwrap();
-        assert_eq!(cfg.device.name, "ovsc");
+        // No fixed name: every device that kept it would share it.
+        assert_eq!(cfg.device.name, "");
+        // The macOS installer writes this Mac's name into the first
+        // `name = ` line (packaging/macos/install-lib.sh).
+        assert_eq!(EXAMPLE_MACOS.lines().find(|l| l.starts_with("name = ")), Some("name = \"\""));
+        let macos: AppConfig = toml::from_str(EXAMPLE_MACOS).unwrap();
+        assert_eq!(macos.device.name, "");
         assert_eq!(cfg.clock.source, ClockSource::Ptp);
         assert_eq!(cfg.audio.backend, BackendKind::None);
+        assert!(!cfg.device.lock_remote_settings);
+    }
+
+    #[test]
+    fn the_show_lock_is_a_device_option() {
+        let cfg: AppConfig = toml::from_str("[device]\nlock_remote_settings = true\n").unwrap();
+        assert!(cfg.device.lock_remote_settings);
+        // Off unless asked for, also for the configuration installed on Macs.
+        let mac: AppConfig = toml::from_str(EXAMPLE_MACOS).unwrap();
+        assert!(!mac.device.lock_remote_settings);
     }
 
     #[test]
@@ -531,6 +609,78 @@ mod tests {
             "[device]\nsample_rate = 192000\nlatency_ms = 40.0\n[coreaudio]\ninput_margin_us = 44000",
         );
         assert!(error(&wide).starts_with("the Core Audio driver cannot take this configuration"));
+    }
+
+    #[test]
+    fn the_output_latency_follows_the_transmit_latency() {
+        let output_latency = |toml: &str| {
+            let cfg = coreaudio(toml);
+            cfg.validate_for(true).unwrap();
+            let engine = EngineInfo::from_config(&cfg.device).unwrap();
+            driver_config(&engine, 1, &cfg.coreaudio.hal_options()).unwrap().output_latency
+        };
+        // At 48 kHz. Unset, the transmit latency is the receive latency.
+        assert_eq!(output_latency("[device]\nlatency_ms = 4.0"), 192);
+        // Receive at 4 ms, ask the console for 1 ms: it plays the outputs
+        // 1 ms after their time.
+        assert_eq!(output_latency("[device]\nlatency_ms = 4.0\ntx_latency_ms = 1.0"), 48);
+        // A console at 2 ms plays them at 2 ms, which the override reports.
+        let longer = "[device]\ntx_latency_ms = 1.0\n[coreaudio]\noutput_latency_ms = 2.0";
+        assert_eq!(output_latency(longer), 96);
+        // Packets leave 0.5 ms after their time: 0.5 ms would always be late.
+        let e = error(&coreaudio("[device]\ntx_latency_ms = 0.5"));
+        assert!(e.contains("tx_latency_ms must be between 1 and 40 ms"), "{e}");
+        let e = error(&coreaudio("[device]\nlatency_ms = 0.5"));
+        assert!(e.contains("latency_ms must be between 1 and 40 ms"), "{e}");
+    }
+
+    /// A latency an earlier version took (down to 0.25 ms) and an upgrade
+    /// kept is raised to the least the transmit guard allows, rather than
+    /// stop the daemon at every start.
+    #[test]
+    fn a_latency_below_the_minimum_is_raised_at_load() {
+        let dir = std::env::temp_dir().join(format!("ovsc-config-low-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ovsc.toml");
+        let load = |toml: &str| {
+            std::fs::write(&path, toml).unwrap();
+            AppConfig::load(&path).unwrap()
+        };
+        let low = "[device]\nlatency_ms = 0.5\ntx_latency_ms = 0.25\n";
+        let cfg = load(&format!("{low}[audio]\nbackend = \"coreaudio\"\n"));
+        assert_eq!((cfg.device.latency_ms, cfg.device.tx_latency_ms), (1.0, Some(1.0)));
+        cfg.validate_for(true).unwrap();
+        // A longer guard raises them further.
+        let cfg = load("[device]\nlatency_ms = 1.0\ntx_latency_ms = 1.2\ntx_guard_us = 800\n");
+        assert_eq!((cfg.device.latency_ms, cfg.device.tx_latency_ms), (1.3, Some(1.3)));
+        cfg.validate_for(false).unwrap();
+        // Latencies it can run at stay as they are.
+        let cfg = load("[device]\nlatency_ms = 2.0\ntx_latency_ms = 1.0\n");
+        assert_eq!((cfg.device.latency_ms, cfg.device.tx_latency_ms), (2.0, Some(1.0)));
+        // Above the most, or not a number: still refused.
+        for bad in ["80.0", "nan"] {
+            let cfg = load(&format!("[device]\nlatency_ms = {bad}\n"));
+            assert!(cfg.validate_for(false).is_err(), "{bad}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.device.latency_ms = 0.5;
+        cfg.device.tx_latency_ms = Some(0.75);
+        assert_eq!(
+            cfg.raise_low_latencies(),
+            [
+                "latency_ms 0.5 is below the minimum of 1 ms; using 1 ms",
+                "tx_latency_ms 0.75 is below the minimum of 1 ms; using 1 ms",
+            ]
+        );
+        assert!(cfg.raise_low_latencies().is_empty());
+        // A guard that leaves no latency is the error validate() reports.
+        cfg.device.tx_guard_us = 40_000;
+        cfg.device.latency_ms = 0.5;
+        assert!(cfg.raise_low_latencies().is_empty());
+        assert!(format!("{:#}", cfg.validate_for(false).unwrap_err()).contains("tx_guard_us"));
     }
 
     #[test]

@@ -84,15 +84,35 @@
 //!   clock at every callback, jitter filtered out) and steers the ratio,
 //!   within ±1000 ppm. It locks in a few seconds and then holds the ratio
 //!   within a ppm or two of the true clock ratio, an inaudible pitch
-//!   modulation. Start-up, stalls and clock steps realign the stream after a
-//!   short mute instead of slewing for minutes.
+//!   modulation. When a device gap or xrun, a stall or a media-clock step
+//!   leaves the stream where it loses audio (beyond its margin), it jumps
+//!   back onto its target once three callbacks agree (at once for a capture
+//!   xrun the backend reports). On the other side, a backlog of more than a
+//!   callback plus the margin is dropped by a jump after 50 ms; a smaller
+//!   one is slewed away. A jump is a dip of a few milliseconds: the audio
+//!   before the break ramps down over up to 2 ms, the audio after it fades
+//!   in over 5 ms. Only start-up, the loss of the media clock and a step
+//!   beyond 50 ms before the loop has locked mute the stream while it
+//!   settles (100 ms).
 //! * The resampler is a 64-tap Kaiser-windowed sinc interpolator with 1024
 //!   tabulated phases, accurate to better than −100 dB up to 20 kHz at
 //!   48 kHz; it reads the rings (or a short capture history) at arbitrary
 //!   fractional positions, so the ratio can change at every sample.
 //!
 //! Audio callbacks don't allocate, lock or log; statistics are atomics read
-//! by [`Bridge::stats`].
+//! by [`Bridge::stats`], and a small monitor thread logs warnings from them
+//! (xruns, underruns, jumps, stalls, lost devices). Device input is
+//! sanitised: NaN and infinities become silence, subnormal floats zero.
+//!
+//! # Real-time priority
+//!
+//! CoreAudio runs callbacks on its real-time IO thread. WASAPI's threads are
+//! not promoted (cpal's `realtime` feature is off, see `rt.rs`). On Linux the
+//! bridge raises each callback thread to `SCHED_FIFO` itself from its first
+//! callback, for every ALSA device except `null` and those served by a
+//! sound server (`default`, `pulse`, `pipewire`, `jack`); that needs
+//! `CAP_SYS_NICE` (or root, or an `rtprio` limit of at least 90), and
+//! [`DirectionStats::realtime`] and a warning say when it was refused. Without it a busy machine causes xruns at small buffers.
 //!
 //! # Latency
 //!
@@ -100,21 +120,32 @@
 //! `safety` is one device buffer, the interpolator's 32-sample look-ahead and
 //! the margin (1 ms by default, [`BridgeConfig::margin_ms`]); the device's
 //! own output latency comes on top. Capture stamps the newest captured frame
-//! `safety` ahead of the media clock. Small device buffers keep both short.
+//! `safety` ahead of the media clock, plus the transmitter's packet lead
+//! (7 samples at 48 kHz with the default guard). Small device buffers keep
+//! both short. The buffer counted is the largest callback of the last 10 to
+//! 20 s, so a one-off oversized callback costs latency only for that long.
+//! [`DirectionStats::latency_ms`] reports what each direction adds.
 //!
 //! # Limitations
 //!
 //! * Absolute timing is not compensated for the devices' own converter and
 //!   driver latencies, so playback is not sample-aligned with other Dante
 //!   receivers.
-//! * A device disconnect ends its stream ([`DirectionStats::device_lost`]);
-//!   start a new bridge to reconnect.
+//! * A device disconnect ends its stream ([`DirectionStats::device_lost`]),
+//!   and a device can stop calling back without an error
+//!   ([`DirectionStats::stalled`]); [`BridgeStats::needs_reopen`] says when
+//!   to start a new bridge to reconnect.
+//! * A stream opened on `"default"` follows the system default device
+//!   (CoreAudio reroutes it, [`DirectionStats::device_changed`]); name the
+//!   device for live use.
 
 mod bridge;
 pub mod controller;
 mod device;
+mod health;
 mod kernel;
 mod pos;
+mod rt;
 mod sample;
 mod stats;
 mod stream;

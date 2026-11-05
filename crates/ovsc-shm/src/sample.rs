@@ -23,12 +23,18 @@ pub fn to_f32(s: i32) -> f32 {
     s as f32 * (1.0 / FULL_SCALE)
 }
 
-/// Converts a float to a left-justified sample. Values outside [-1.0, 1.0)
-/// saturate to `i32::MIN`/`i32::MAX`, and NaN gives 0 (the semantics of an
-/// `as` cast).
+/// Converts a float to a left-justified sample. Finite values outside
+/// [-1.0, 1.0) saturate to `i32::MIN`/`i32::MAX` (the semantics of an `as`
+/// cast), as any interface clips its float input. Non-finite values (NaN and
+/// ±Inf) give 0.
+///
+/// An `as` cast would turn +Inf into `i32::MAX` and -Inf into `i32::MIN`:
+/// a plug-in in the host that blows up and outputs Inf would then send
+/// full-scale DC to the console, the in-ears and the PA for as long as it
+/// lasts. Silence is the safe failure. NaN already gave 0.
 #[inline]
 pub fn from_f32(x: f32) -> i32 {
-    (x * FULL_SCALE) as i32
+    if x.is_finite() { (x * FULL_SCALE) as i32 } else { 0 }
 }
 
 #[cfg(test)]
@@ -44,8 +50,11 @@ mod tests {
         assert_eq!(from_f32(1.0), i32::MAX);
         assert_eq!(from_f32(2.5), i32::MAX);
         assert_eq!(from_f32(-7.0), i32::MIN);
-        assert_eq!(from_f32(f32::INFINITY), i32::MAX);
-        assert_eq!(from_f32(f32::NEG_INFINITY), i32::MIN);
+        assert_eq!(from_f32(f32::MAX), i32::MAX);
+        assert_eq!(from_f32(f32::MIN), i32::MIN);
+        // Non-finite input is silence, not full scale.
+        assert_eq!(from_f32(f32::INFINITY), 0);
+        assert_eq!(from_f32(f32::NEG_INFINITY), 0);
         assert_eq!(from_f32(f32::NAN), 0);
         assert_eq!(from_f32(-0.0), 0);
     }

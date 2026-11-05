@@ -369,15 +369,21 @@ async fn audio_flows_between_two_devices() {
     // Requested with every slot the flow may hold, as Dante receivers do.
     assert_eq!(flows[0].channels, vec![3, 1, 0, 0]);
 
-    // A freed slot is reused for the next channel from the same device.
+    // The next channel from the same device goes to a slot that carries
+    // nothing. The freed slot keeps its channel, so subscribing that again
+    // needs no request.
     rx.unsubscribe(1).unwrap();
     rx.subscribe(3, "04", "tx-dev").unwrap();
     eventually("audio on rx 3", || verify(&io, 2, 3)).await;
     verify(&io, 1, 0).unwrap();
     assert_eq!(tx.tx_flows().len(), 1);
-    assert_eq!(tx.tx_flows()[0].channels, vec![4, 1, 0, 0]);
+    assert_eq!(tx.tx_flows()[0].channels, vec![3, 1, 4, 0]);
+    rx.subscribe(1, "03", "tx-dev").unwrap();
+    eventually("audio on rx 1 again", || verify(&io, 0, 2)).await;
+    assert_eq!(tx.tx_flows()[0].channels, vec![3, 1, 4, 0]);
 
     // Unsubscribing everything stops the flow on the transmitter.
+    rx.unsubscribe(1).unwrap();
     rx.unsubscribe(2).unwrap();
     rx.unsubscribe(3).unwrap();
     eventually("transmitter to drop the flow", || {
@@ -455,4 +461,93 @@ async fn controller_routes_over_arc_and_device_subscribes_to_itself() {
     stop.store(true, Ordering::Relaxed);
     feeder.join().unwrap();
     dev.shutdown().await;
+}
+
+/// Waits for `rx` to get a run of 20 packets of `len` bytes, answering
+/// each with a keepalive as a receiver does.
+async fn expect_packets(rx: &tokio::net::UdpSocket, len: usize) -> Result<(), String> {
+    let mut buf = [0u8; 2048];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut run = 0;
+    let mut seen = Vec::new();
+    while run < 20 {
+        let (n, from) = tokio::time::timeout_at(deadline, rx.recv_from(&mut buf))
+            .await
+            .map_err(|_| format!("no run of {len}-byte packets; the last sizes {seen:?}"))?
+            .map_err(|e| e.to_string())?;
+        let _ = rx.send_to(&ovsc_proto::audio::KEEPALIVE, from).await;
+        run = if n == len { run + 1 } else { 0 };
+        if seen.len() == 20 {
+            seen.remove(0);
+        }
+        seen.push(n);
+    }
+    Ok(())
+}
+
+/// A receiver that asks again for a flow to the same port, with other
+/// packets and without stopping the old flow first (after changing its
+/// latency, say), gets the packets it asked for under a new handle.
+/// Requests beyond what the device advertises are refused, and none of it
+/// disturbs the other flows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_re_requested_flow_sends_the_packets_asked_for() {
+    use ovsc_proto::dbcp::{self, FlowRequest};
+    use tokio::net::UdpSocket;
+
+    let tx = Device::start(config("tx-rerequest", 24530, 8), system_clock()).await.unwrap();
+    let fc = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 24532);
+    let request = |fpp: u16, channels: &[u16], rx: &UdpSocket| FlowRequest {
+        rx_device: "console".into(),
+        flow_name: "1".into(),
+        sample_rate: 48_000,
+        bits_per_sample: 24,
+        fpp,
+        channels: channels.to_vec(),
+        rx_addr: Ipv4Addr::LOCALHOST,
+        rx_port: rx.local_addr().unwrap().port(),
+    };
+    let ask =
+        |req: FlowRequest| async move { client::request_flow(Ipv4Addr::LOCALHOST, fc, &req).await };
+    let refused = |r: ovsc_core::Result<dbcp::FlowHandle>| match r {
+        Err(ovsc_core::Error::Refused(code)) => code,
+        other => panic!("not refused: {other:?}"),
+    };
+    let invalid = dbcp::error::INVALID_PARAMETER;
+    let rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+
+    // More frames per packet than the advertised 32, more than 8 slots.
+    assert_eq!(refused(ask(request(64, &[1, 2], &rx)).await), invalid);
+    assert_eq!(refused(ask(request(16, &[1, 0, 0, 0, 0, 0, 0, 0, 0], &rx)).await), invalid);
+    assert!(tx.tx_flows().is_empty());
+
+    let first = ask(request(16, &[1, 2], &rx)).await.unwrap();
+    expect_packets(&rx, 9 + 16 * 2 * 3).await.unwrap();
+    // Other packets, same port: a new flow and handle.
+    let second = ask(request(8, &[1, 2], &rx)).await.unwrap();
+    assert_ne!(second, first);
+    expect_packets(&rx, 9 + 8 * 2 * 3).await.unwrap();
+    // The same packets with more channels: the same flow.
+    assert_eq!(ask(request(8, &[1, 2, 3], &rx)).await.unwrap(), second);
+    expect_packets(&rx, 9 + 8 * 3 * 3).await.unwrap();
+    // A late stop for the replaced flow stops nothing.
+    let stop = client::stop_flow(Ipv4Addr::LOCALHOST, fc, first).await;
+    assert!(
+        matches!(stop, Err(ovsc_core::Error::Refused(c)) if c == dbcp::error::FLOW_NOT_FOUND),
+        "{stop:?}"
+    );
+    expect_packets(&rx, 9 + 8 * 3 * 3).await.unwrap();
+    assert_eq!(tx.tx_flows().len(), 1);
+
+    // Another receiver still gets its flow, and both keep sending.
+    let rx2 = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    ask(request(32, &[4, 3, 2], &rx2)).await.unwrap();
+    expect_packets(&rx2, 9 + 32 * 3 * 3).await.unwrap();
+    expect_packets(&rx, 9 + 8 * 3 * 3).await.unwrap();
+    assert_eq!(tx.tx_flows().len(), 2);
+    let stats = tx.stats();
+    assert!(stats.tx_packets > 100, "{stats:?}");
+    assert!(!stats.tx_engine_failed);
+    assert_eq!(stats.tx_send_errors, 0, "{stats:?}");
+    tx.shutdown().await;
 }

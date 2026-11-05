@@ -22,7 +22,7 @@ fn every_24_bit_code_round_trips_bit_exactly() {
 }
 
 #[test]
-fn full_scale_and_saturation() {
+fn full_scale_saturation_and_non_finite() {
     assert_eq!(to_f32(i32::MIN), -1.0);
     assert_eq!(to_f32(((1 << 23) - 1) << 8), 1.0 - STEP);
     assert_eq!(from_f32(-1.0), i32::MIN);
@@ -30,9 +30,14 @@ fn full_scale_and_saturation() {
     assert_eq!(from_f32(1.0), i32::MAX);
     assert_eq!(from_f32(1.5), i32::MAX);
     assert_eq!(from_f32(-1.5), i32::MIN);
-    assert_eq!(from_f32(f32::INFINITY), i32::MAX);
-    assert_eq!(from_f32(f32::NEG_INFINITY), i32::MIN);
+    // Finite values far out of range still clip (`f32::MAX * 2^31` is Inf
+    // after the multiplication, and the cast saturates it) ...
     assert_eq!(from_f32(f32::MAX), i32::MAX);
+    assert_eq!(from_f32(f32::MIN), i32::MIN);
+    // ... but non-finite input, from a plug-in that blew up, is silence
+    // rather than full-scale DC.
+    assert_eq!(from_f32(f32::INFINITY), 0);
+    assert_eq!(from_f32(f32::NEG_INFINITY), 0);
     assert_eq!(from_f32(f32::NAN), 0);
     assert_eq!(from_f32(-f32::NAN), 0);
     assert_eq!(from_f32(0.0), 0);

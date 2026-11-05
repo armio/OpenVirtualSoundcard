@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use ovsc_core::{Device, DeviceConfig};
+use ovsc_core::{Device, DeviceConfig, SavedState};
 use ovsc_ipc::protocol::{
     self, CLOCK_ALGORITHM_RAW, DriverConfig, InputLatencyMode, MAX_NAME_BYTES, OffsetInputs,
     SERVICE_NAME, compute_offsets,
@@ -14,7 +14,7 @@ use ovsc_shm::time::ns_to_samples;
 
 /// ovsc-core's `FPP_MAX`: the most frames per packet the device sends.
 pub const FPP_MAX: u32 = 32;
-/// ovsc-core's `FPP_LIMIT`: the most frames per packet of any flow the
+/// ovsc-core's `RX_FPP_LIMIT`: the most frames per packet of any flow the
 /// device receives.
 pub const RX_FPP_LIMIT: u32 = 256;
 /// The user ID of Core Audio's driver helper (`_coreaudiod`).
@@ -34,12 +34,13 @@ pub struct HalOptions {
     pub input_margin_us: u32,
     /// Added to the output safety offset.
     pub output_margin_us: u32,
-    /// Reported as the output latency instead of the receive latency.
+    /// Reported as the output latency instead of the transmit latency.
     pub output_latency_ms: Option<f64>,
     pub latency_mode: InputLatencyMode,
     /// `CLOCK_ALGORITHM_RAW` or `CLOCK_ALGORITHM_SIMPLE_IIR`.
     pub clock_algorithm: u32,
-    /// Keep the Mac from idle-sleeping while the engine runs.
+    /// Keep the Mac from idle-sleeping while the daemon runs, engine restarts
+    /// included.
     pub prevent_idle_sleep: bool,
     /// How often the status line is logged; zero disables it.
     pub status_log_interval: Duration,
@@ -70,6 +71,9 @@ pub struct EngineInfo {
     pub sample_rate: u32,
     /// The receive latency L, in samples.
     pub latency_samples: u32,
+    /// The transmit latency T, in samples: what the device asks of the
+    /// receivers of its transmit channels, and its default output latency.
+    pub tx_latency_samples: u32,
     /// How long after its timestamp a packet is sent, in samples.
     pub tx_guard_samples: u32,
     /// The most frames per packet the device sends.
@@ -89,6 +93,7 @@ impl EngineInfo {
         Self {
             sample_rate: info.sample_rate,
             latency_samples: saturate(info.latency_samples),
+            tx_latency_samples: saturate(info.tx_latency_samples),
             tx_guard_samples: saturate(ns_to_samples(info.tx_guard_ns, info.sample_rate)),
             fpp_max: FPP_MAX,
             rx_names,
@@ -97,9 +102,23 @@ impl EngineInfo {
         }
     }
 
-    /// The facts a device started with `c` will have, before it runs. The
-    /// names are the configured ones; a device restores renamed channels
-    /// from its state file only when it starts.
+    /// The facts a device started with `c` from the saved state `saved`
+    /// will have, before it runs: its latency and names as the device
+    /// takes them from `saved` ([`DeviceConfig::with_saved`],
+    /// [`SavedState::channel_names`]). Offered to the driver until the
+    /// device runs, the device's start then changes nothing the driver
+    /// needs a new configuration for: a daemon that starts again on a
+    /// state file with another latency than the configuration's does not
+    /// reconfigure Core Audio twice.
+    pub fn from_saved(c: &DeviceConfig, saved: &SavedState) -> Result<Self, ConfigError> {
+        let mut e = Self::from_config(&c.clone().with_saved(saved))?;
+        (e.rx_names, e.tx_names) = saved.channel_names(&e.rx_names, &e.tx_names);
+        Ok(e)
+    }
+
+    /// The facts a device started with `c` will have, before it runs, if
+    /// nothing was saved: the configured names and latency (see
+    /// [`EngineInfo::from_saved`]).
     pub fn from_config(c: &DeviceConfig) -> Result<Self, ConfigError> {
         c.validate().map_err(|e| ConfigError::Device(e.to_string()))?;
         let device_name =
@@ -107,6 +126,7 @@ impl EngineInfo {
         Ok(Self {
             sample_rate: c.sample_rate,
             latency_samples: saturate(c.latency_samples()),
+            tx_latency_samples: saturate(c.tx_latency_samples()),
             tx_guard_samples: saturate(ns_to_samples(c.tx_guard_us as u64 * 1000, c.sample_rate)),
             fpp_max: FPP_MAX,
             rx_names: c.rx_channels.names(),
@@ -162,6 +182,7 @@ pub fn driver_config(
     let offsets = compute_offsets(&OffsetInputs {
         sample_rate: fs,
         latency_samples: e.latency_samples,
+        tx_latency_samples: e.tx_latency_samples,
         tx_guard_samples: e.tx_guard_samples,
         fpp_max: e.fpp_max,
         input_margin_us: o.input_margin_us,
@@ -297,6 +318,76 @@ mod tests {
         // Too large for the driver: refused by validate().
         let o = HalOptions { output_latency_ms: Some(1000.0), ..Default::default() };
         assert!(matches!(driver_config(&engine(48_000, 4.0), 1, &o), Err(ConfigError::Driver(_))));
+    }
+
+    #[test]
+    fn the_offer_follows_the_saved_state() {
+        let c = DeviceConfig {
+            name: "studio".into(),
+            latency_ms: 4.0,
+            tx_channels: Channels::Count(2),
+            rx_channels: Channels::Count(2),
+            ..Default::default()
+        };
+        let saved = SavedState {
+            name: Some("vocal-fx".into()),
+            latency_ns: Some(2_000_000),
+            rx_names: vec!["Vox".into()],
+            ..Default::default()
+        };
+        let e = EngineInfo::from_saved(&c, &saved).unwrap();
+        // 2 ms at 48 kHz, also the transmit latency: it follows the receive one.
+        assert_eq!((e.latency_samples, e.tx_latency_samples), (96, 96));
+        assert_eq!(e.device_name, "vocal-fx");
+        assert_eq!(
+            (e.rx_names, e.tx_names),
+            (vec!["Vox".into(), "02".into()], c.tx_channels.names())
+        );
+        assert_eq!(EngineInfo::from_saved(&c, &SavedState::default()), EngineInfo::from_config(&c));
+    }
+
+    /// What the daemon offers the driver before the device runs is what
+    /// the device publishes once it runs from the same saved state: its
+    /// start reconfigures nothing.
+    #[tokio::test]
+    async fn a_device_runs_as_offered() {
+        let dir = std::env::temp_dir().join(format!("ovsc-hal-offer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = dir.join("state.toml");
+        SavedState::update(&state, |s| {
+            s.latency_ns = Some(2_000_000);
+            s.name = Some("vocal-fx".into());
+            s.tx_names = vec![String::new(), "Vox FX".into()];
+        })
+        .unwrap();
+        let c = DeviceConfig {
+            name: "studio".into(),
+            interface: "127.0.0.1".into(),
+            latency_ms: 4.0,
+            tx_channels: Channels::Count(2),
+            rx_channels: Channels::Count(2),
+            ports: ovsc_core::Ports {
+                arc: 24996,
+                cmc: 24997,
+                flow_control: 24998,
+                settings: 24999,
+            },
+            discovery: false,
+            process_id: 51,
+            state_file: Some(state.clone()),
+            ..Default::default()
+        };
+        let o = HalOptions::default();
+        let saved = SavedState::load(&state).unwrap();
+        let offered = driver_config(&EngineInfo::from_saved(&c, &saved).unwrap(), 1, &o).unwrap();
+        let device = Device::start(c.clone(), ovsc_clock::system_clock()).await.unwrap();
+        let runs = driver_config(&EngineInfo::from_device(&device), 1, &o).unwrap();
+        device.shutdown().await;
+        assert_eq!(offered, runs);
+        // Offered from the configuration alone, the latency differs.
+        let configured = driver_config(&EngineInfo::from_config(&c).unwrap(), 1, &o).unwrap();
+        assert!(!configured.structural_eq(&runs));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

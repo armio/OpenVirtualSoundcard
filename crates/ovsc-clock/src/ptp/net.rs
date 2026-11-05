@@ -13,6 +13,18 @@ use crate::local_now_ns;
 /// PTPv2 and management messages on the same ports can be longer.
 pub(crate) const RECV_BUF_LEN: usize = 1500;
 
+/// IP TOS byte of event messages (Sync, Delay_Req): DSCP CS7 (56). Dante's
+/// published switch QoS settings give time-critical PTP event messages the
+/// highest priority class, CS7, above audio (EF), so that Syncs and our
+/// Delay_Reqs do not queue behind audio on a busy link. Queued Syncs are
+/// what unlocks the servo (finding clock#2).
+pub(crate) const EVENT_TOS: u32 = 56 << 2;
+
+/// IP TOS byte of general messages (Follow_Up, Delay_Resp): DSCP EF (46),
+/// the class Dante's QoS settings give PTP's other messages and audio. The
+/// follower sends none; the development master does.
+pub(crate) const GENERAL_TOS: u32 = 46 << 2;
+
 /// Where and how to send and receive PTP traffic.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Endpoints {
@@ -45,12 +57,22 @@ impl Endpoints {
                 "PTP event and general ports must differ",
             ));
         }
-        Ok((self.bind_port(self.event_port)?, self.bind_port(self.general_port)?))
+        Ok((
+            self.bind_port(self.event_port, EVENT_TOS)?,
+            self.bind_port(self.general_port, GENERAL_TOS)?,
+        ))
     }
 
     /// Binds `0.0.0.0:port`, shared with other PTP software on the host,
-    /// joins the PTP group on our interface and sends multicast through it.
-    fn bind_port(&self, port: u16) -> io::Result<UdpSocket> {
+    /// joins the PTP group on our interface and sends multicast through it,
+    /// marked with `tos`.
+    fn bind_port(&self, port: u16, tos: u32) -> io::Result<UdpSocket> {
+        let socket = self.socket(port, tos)?;
+        socket.set_nonblocking(true)?;
+        UdpSocket::from_std(socket.into())
+    }
+
+    fn socket(&self, port: u16, tos: u32) -> io::Result<Socket> {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         // Other PTP software (or a second OpenVirtualSoundcard instance) may already
         // listen on these well-known ports; multicast is delivered to all.
@@ -73,6 +95,14 @@ impl Endpoints {
                 format!("cannot join {} on interface {}: {e}", self.group, self.interface),
             )
         })?;
+        // A socket bound to 0.0.0.0 on Linux also receives the group's
+        // datagrams from every other interface on which any process joined
+        // it (IP_MULTICAST_ALL defaults to 1), so a host with a second PTP
+        // network could follow that network's master. With it off, only
+        // the membership joined above, on our interface, delivers. BSD
+        // sockets (macOS) already filter by membership.
+        #[cfg(target_os = "linux")]
+        socket.set_multicast_all_v4(false)?;
         socket.set_multicast_if_v4(&self.interface)?;
         // Keep loopback on so a master and followers on the same host (tests,
         // development setups) hear each other. Our own packets are ignored by
@@ -80,12 +110,21 @@ impl Endpoints {
         socket.set_multicast_loop_v4(true)?;
         // PTPv1 is link-local: never let it be routed.
         socket.set_multicast_ttl_v4(1)?;
+        #[cfg(not(any(
+            target_os = "fuchsia",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "haiku",
+            target_os = "wasi",
+        )))]
+        if let Err(e) = socket.set_tos_v4(tos) {
+            tracing::warn!("cannot mark PTP port {port} with TOS {tos:#04x}: {e}");
+        }
         #[cfg(target_vendor = "apple")]
         if let Err(e) = kernel_ts::enable(&socket) {
             tracing::warn!("no kernel receive timestamps on PTP port {port}: {e}");
         }
-        socket.set_nonblocking(true)?;
-        UdpSocket::from_std(socket.into())
+        Ok(socket)
     }
 }
 
@@ -302,5 +341,27 @@ impl SplitMix64 {
     /// Uniform in `[0, 1)`.
     pub fn next_f64(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sockets_are_marked_and_on_linux_filtered_by_interface() {
+        let endpoints = Endpoints {
+            interface: Ipv4Addr::LOCALHOST,
+            group: Ipv4Addr::new(224, 0, 1, 129),
+            event_port: 0,
+            general_port: 0,
+        };
+        for tos in [EVENT_TOS, GENERAL_TOS] {
+            let socket = endpoints.socket(0, tos).unwrap();
+            assert_eq!(socket.tos_v4().unwrap(), tos);
+            #[cfg(target_os = "linux")]
+            assert!(!socket.multicast_all_v4().unwrap());
+        }
+        assert_eq!((EVENT_TOS, GENERAL_TOS), (0xe0, 0xb8));
     }
 }

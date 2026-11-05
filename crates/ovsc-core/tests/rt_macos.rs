@@ -64,7 +64,7 @@ fn time_constraint_policy_is_set() {
     for (class, period_ns, constraint_ns) in cases {
         let policy = std::thread::spawn(move || {
             assert!(current_time_constraint().is_none(), "a new thread is not real-time");
-            raise_priority("test", class);
+            assert!(raise_priority("test", class), "{class:?}: reported as not real-time");
             current_time_constraint()
         })
         .join()

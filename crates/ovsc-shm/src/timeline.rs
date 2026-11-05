@@ -23,6 +23,14 @@
 //! beyond `seed_rate_jump_ppm`, a reset (sample-rate change) or an IO stall
 //! gives the HAL a new timeline, that is, a new seed.
 //!
+//! A new key is only followed once the daemon's clock is Locked or
+//! FreeRunning: a clock still locking may yet step. The key already
+//! followed is followed whatever the state, because its mapping is
+//! continuous with what the timeline follows (any jump would have changed
+//! the key): the daemon re-locking after a disturbance or to a new master
+//! whose time agrees, and the daemon's own holdover, keep the audio flowing
+//! with nothing to slip.
+//!
 //! Absolute times are u64 nanoseconds and only differences are f64. Media
 //! positions come from exact integer maths. Nothing here allocates, locks or
 //! panics, so the driver can call it on its real-time threads.
@@ -397,8 +405,8 @@ impl DeviceTimeline {
     ///
     /// Another daemon's clock, or this one's after a step, stays shut out
     /// until the timeline follows it, however close it is: a clock still
-    /// locking may step when it locks, and the content would slip under
-    /// audio already flowing.
+    /// locking may yet step, and the content would slip under audio already
+    /// flowing.
     pub fn gate(&self, now_ns: u64, input: Option<&ClockInput>) -> bool {
         let Some(i) = input else {
             return false;
@@ -477,11 +485,15 @@ impl DeviceTimeline {
             && now_ns.abs_diff(i.heartbeat_ns) <= self.params.stale_ns
     }
 
-    /// Whether the daemon's clock is worth following.
+    /// Whether the daemon's clock is worth following: a valid, sane clock
+    /// of a live daemon that is Locked or FreeRunning, or, in any state, the
+    /// one the timeline follows already (the key changes with every
+    /// discontinuity, so that clock is continuous with what is followed).
     fn usable(&self, now_ns: u64, i: &ClockInput) -> bool {
         let r = &i.record;
         r.valid
-            && matches!(r.state, ClockState::Locked | ClockState::FreeRunning)
+            && (matches!(r.state, ClockState::Locked | ClockState::FreeRunning)
+                || self.followed == Some((i.generation, r.step_gen)))
             && self.sane_rate(r.snapshot.rate)
             && self.alive(now_ns, i)
     }

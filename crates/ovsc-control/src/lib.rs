@@ -24,9 +24,12 @@ pub const SOCKET_PATH: &str = "/var/run/ovsc/control.sock";
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Receive latencies offered for selection, in milliseconds. Any value in
-/// [`LATENCY_MIN_MS`]..=[`LATENCY_MAX_MS`] is accepted.
+/// [`LATENCY_MIN_MS`]..=[`LATENCY_MAX_MS`] is accepted that is also at
+/// least the device's transmit guard (`tx_guard_us`, 500 µs by default)
+/// plus 500 µs: the device's packets leave that guard after their
+/// timestamps.
 pub const LATENCY_CHOICES_MS: &[f64] = &[1.0, 2.0, 4.0, 5.0, 6.0, 10.0, 20.0, 40.0];
-pub const LATENCY_MIN_MS: f64 = 0.25;
+pub const LATENCY_MIN_MS: f64 = 1.0;
 pub const LATENCY_MAX_MS: f64 = 40.0;
 
 /// Sample rates the device can run at.
@@ -73,18 +76,22 @@ pub enum Response {
     },
 }
 
-/// What restarts to apply a change.
+/// What restarts to apply a change. Either restart stops audio both ways:
+/// the device's inputs, and every flow other devices receive from it (such
+/// as returns to a console), which they must request again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Restart {
-    /// Nothing: applied at once (a new name).
+    /// Nothing: applied at once (a new name, the show lock). A new name
+    /// still leaves other devices' subscriptions to this one unresolved.
     None,
     /// The network engine restarts, the clock keeps running: audio stops
-    /// for a second or two (a new latency).
+    /// for a second or two, and devices receiving from this one may take
+    /// several more seconds to subscribe again (a new latency).
     Device,
     /// The whole daemon restarts and the clock locks again: audio stops for
-    /// ten to twenty seconds (a new interface, sample rate or channel
-    /// count).
+    /// ten to twenty seconds (a new interface, sample rate, bit depth or
+    /// channel count).
     Daemon,
 }
 
@@ -103,8 +110,20 @@ pub struct Status {
     pub device: Option<DeviceStatus>,
     pub clock: ClockInfo,
     pub driver: DriverInfo,
-    /// Problems worth showing, in plain words.
+    /// Problems worth showing, in plain words, the most urgent first. Those
+    /// about counters (lost packets, late cycles) cover the last 30 s: each
+    /// stays for 30 s after its counter last rose.
     pub warnings: Vec<String>,
+    /// How many of [`Status::warnings`], from the first, mean that audio is
+    /// down now in at least one direction (a failed driver, a closed gate
+    /// while an application plays, a stopped transmit engine, a lost
+    /// clock): the app shows them in red. 0 from a daemon before it.
+    #[serde(default)]
+    pub urgent_warnings: usize,
+    /// Older news, no longer a warning but worth a look in the details:
+    /// controllers' changes more than 10 minutes ago, newest first.
+    #[serde(default)]
+    pub earlier: Vec<String>,
 }
 
 /// The running Dante device.
@@ -124,6 +143,11 @@ pub struct DeviceStatus {
     /// Flows other devices receive from this one.
     pub tx_flows: Vec<TxFlowStatus>,
     pub packets: PacketCounts,
+    /// Whether the show lock keeps controllers such as Dante Controller
+    /// from changing the latency, sample rate, encoding and names
+    /// ([`Settings::lock_remote_settings`]).
+    #[serde(default)]
+    pub remote_settings_locked: bool,
 }
 
 /// One receive channel.
@@ -159,6 +183,10 @@ pub struct PacketCounts {
     pub rx: u64,
     /// Packets that arrived after their play-out time.
     pub rx_late: u64,
+    /// Packets missing from received flows (gaps in their timestamps). 0
+    /// from a daemon before it.
+    #[serde(default)]
+    pub rx_lost: u64,
 }
 
 /// The media clock.
@@ -187,8 +215,21 @@ pub struct DriverInfo {
     pub connected: bool,
     /// Whether an application is playing or recording through the device.
     pub io_running: bool,
-    /// Whether audio may flow: the driver's gate is open.
+    /// Whether audio may flow: the driver's gate is open, the driver has not
+    /// failed ([`DriverInfo::faulted`]) and, while an application plays or
+    /// records, Core Audio keeps calling it. True with no application too:
+    /// audio would flow.
     pub audio_flowing: bool,
+    /// Whether the driver caught a panic and went silent: every input and
+    /// output stays silent until Core Audio restarts (`sudo killall
+    /// coreaudiod`). False from a daemon before it.
+    #[serde(default)]
+    pub faulted: bool,
+    /// Whether audio flows but had audible problems in the last 30 s
+    /// (dropouts, late or lost packets, slips): [`Status::warnings`] says
+    /// which. False from a daemon before it.
+    #[serde(default)]
+    pub audio_trouble: bool,
     /// The driver's status line, for diagnostics.
     pub detail: String,
 }
@@ -208,6 +249,13 @@ pub struct Settings {
     pub tx_channels: u16,
     /// Receive latency, ms.
     pub latency_ms: f64,
+    /// The show lock: controllers on the network (Dante Controller) may not
+    /// change the latency, sample rate, encoding or names, which interrupt
+    /// audio or break other devices' subscriptions. Subscriptions stay
+    /// open, and changes from the app still apply. Saved with the device's
+    /// state, like the name and latency.
+    #[serde(default)]
+    pub lock_remote_settings: bool,
 }
 
 /// A change of [`Settings`]: fields left out keep their value.
@@ -228,6 +276,8 @@ pub struct SettingsChange {
     pub tx_channels: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_remote_settings: Option<bool>,
 }
 
 impl SettingsChange {
@@ -343,6 +393,7 @@ mod tests {
                 rx_channels: 8,
                 tx_channels: 8,
                 latency_ms: 4.0,
+                lock_remote_settings: true,
             }),
         ];
         for r in responses {
@@ -352,6 +403,53 @@ mod tests {
             encode_line(&Response::Applied { restart: Restart::None }),
             "{\"result\":\"applied\",\"restart\":\"none\"}\n"
         );
+    }
+
+    #[test]
+    fn the_show_lock_is_optional_on_the_wire() {
+        // A daemon from before the lock: unlocked.
+        let old = r#"{"result":"settings","name":"m1","interface":"","sample_rate":48000,
+            "bits_per_sample":24,"rx_channels":8,"tx_channels":8,"latency_ms":4.0}"#
+            .replace('\n', " ");
+        let Response::Settings(s) = decode_line(&old).unwrap() else { panic!("no settings") };
+        assert!(!s.lock_remote_settings);
+        let lock = Request::Apply {
+            change: SettingsChange { lock_remote_settings: Some(true), ..Default::default() },
+        };
+        assert_eq!(
+            encode_line(&lock),
+            "{\"op\":\"apply\",\"change\":{\"lock_remote_settings\":true}}\n"
+        );
+    }
+
+    #[test]
+    fn the_health_fields_are_optional_on_the_wire() {
+        // A daemon from before them: no urgent warnings, no earlier news,
+        // a driver that has not failed and no trouble.
+        let old = r#"{"result":"status","protocol":1,"version":"0.1.0","engine_running":true,
+            "engine_error":null,"device":null,
+            "clock":{"source":"ptp","state":"Locked","locked":true,"leader":null,
+                "offset_ns":0,"path_delay_ns":0,"freq_offset_ppm":0.0},
+            "driver":{"connected":true,"io_running":true,"audio_flowing":true,"detail":""},
+            "warnings":["w"]}"#
+            .replace('\n', " ");
+        let Response::Status(s) = decode_line(&old).unwrap() else { panic!("no status") };
+        assert_eq!((s.urgent_warnings, s.earlier.len()), (0, 0));
+        assert!(!s.driver.faulted && !s.driver.audio_trouble);
+        let counts: PacketCounts =
+            decode_line(r#"{"tx":1,"tx_underruns":2,"rx":3,"rx_late":4}"#).unwrap();
+        assert_eq!(counts.rx_lost, 0);
+
+        // A newer daemon's status reads back whole, and its new fields are
+        // extra keys that an older app's decoder skips.
+        let mut new = *s;
+        new.urgent_warnings = 1;
+        new.earlier = vec!["e".into()];
+        new.driver.faulted = true;
+        new.driver.audio_flowing = false;
+        let line = encode_line(&Response::Status(Box::new(new.clone())));
+        assert_eq!(decode_line::<Response>(&line).unwrap(), Response::Status(Box::new(new)));
+        assert!(line.contains("\"urgent_warnings\":1") && line.contains("\"faulted\":true"));
     }
 
     #[test]

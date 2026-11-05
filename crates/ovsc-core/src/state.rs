@@ -1,7 +1,10 @@
 //! Mutable device state shared by the servers, and change notification.
 
-use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::collections::VecDeque;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::SystemTime;
 
 use tokio::sync::{mpsc, watch};
 
@@ -26,6 +29,9 @@ pub struct Subscription {
 pub struct State {
     /// Current device name (user-assigned or factory).
     pub name: String,
+    /// Another device using the device name, as mDNS shows it. Status only:
+    /// setting it doesn't go through [`Shared::modify`].
+    pub name_conflict: Option<crate::mdns::NameConflict>,
     /// Current transmit channel names (user-assigned or factory).
     pub tx_names: Vec<String>,
     /// Current receive channel names.
@@ -42,6 +48,16 @@ pub struct State {
     /// ([`DeviceInfo::latency_ns`]); a new one takes effect when the device
     /// restarts, which [`Shared::latency_requests`] asks for.
     pub latency_override_ns: Option<u32>,
+    /// The show lock: while it is on, controllers may not change the
+    /// latency, the sample rate or the encoding, which interrupt audio both
+    /// ways, nor the device or channel names, which other devices'
+    /// subscriptions depend on. Subscriptions stay open, and the app's
+    /// changes still apply. See [`Shared::lock_remote_settings`].
+    pub remote_settings_locked: bool,
+    /// The lock as the app last set it, saved with the state so that it
+    /// survives restarts; `None` until then, when the configuration's
+    /// `lock_remote_settings` applies.
+    pub remote_settings_lock_set: Option<bool>,
 }
 
 impl State {
@@ -59,6 +75,10 @@ impl State {
 pub enum Notify {
     /// Receive channels (0-based) whose name or subscription changed.
     RxChannelsChanged(Vec<usize>),
+    /// The show lock turned on or off ([`Shared::lock_remote_settings`]),
+    /// which decides whether controllers may set the sample rate and the
+    /// encoding.
+    RemoteSettingsLockChanged,
 }
 
 /// Packet counters, written by the transmit thread and the receive threads
@@ -73,16 +93,121 @@ pub struct Counters {
     pub rx_packets: AtomicU64,
     /// Received packets older than the receive latency on arrival.
     pub rx_late_packets: AtomicU64,
+    /// Audio packets the network stack refused to send (a full queue,
+    /// no route, ...) or reported undeliverable (ICMP host or port
+    /// unreachable).
+    pub tx_send_errors: AtomicU64,
+    /// The OS error code of the latest failed send, 0 if none or unknown.
+    pub tx_last_send_error: AtomicI32,
+    /// Audio packets sent more than the transmit thread's late allowance
+    /// (250 µs) after their send time, timestamp + guard. The first packet
+    /// of a flow, and the first after a resync, are not counted: they are
+    /// up to one packet late by design.
+    pub tx_late_packets: AtomicU64,
+    /// The latest any audio packet left after its send time, in ns, since
+    /// the device started (the packets [`Counters::tx_late_packets`] skips
+    /// excluded).
+    pub tx_max_lateness_ns: AtomicU64,
+    /// Audio packets never sent: overdue by more than any receiver can
+    /// play after a stall or a media clock step, or (never expected) too
+    /// large to encode.
+    pub tx_skipped_packets: AtomicU64,
+    /// Times a flow's timeline restarted after a stall or a media clock
+    /// step.
+    pub tx_resyncs: AtomicU64,
+    /// Unicast flows removed after 4 s without keepalives.
+    pub tx_expired_flows: AtomicU64,
+    /// Set when the transmit thread runs without real-time scheduling.
+    pub tx_not_realtime: AtomicBool,
+    /// Set once a receive thread has started without real-time scheduling,
+    /// until the device restarts.
+    pub rx_not_realtime: AtomicBool,
+    /// Set when the transmit thread has stopped on a panic: no flow sends
+    /// audio any more, and flow requests are refused until the device
+    /// restarts.
+    pub tx_engine_failed: AtomicBool,
+    /// Packets missing from received flows: gaps in their timestamps.
+    pub rx_lost_packets: AtomicU64,
+    /// Received packets stamped ahead of our clock by more than a packet,
+    /// a sign that the transmitter's clock disagrees with ours.
+    pub rx_early_packets: AtomicU64,
+    /// Datagrams dropped by receive flows: not from the flow's transmitter,
+    /// or not whole frames of the flow's slots.
+    pub rx_rejected_packets: AtomicU64,
 }
 
-/// When one receive flow's packets arrive, written by its receive thread.
+/// What one receive flow's packets look like, written by its receive thread
+/// (and [`FlowStats::degraded`] by the subscription manager).
 #[derive(Debug, Default)]
 pub struct FlowStats {
     /// The longest a packet took, from its timestamp to its arrival, in
     /// samples, since the heartbeat last took it.
     pub max_arrival: AtomicU32,
-    /// Packets that arrived later than the receive latency.
+    /// Packets that arrived later than the flow's latency.
     pub late_packets: AtomicU64,
+    /// Packets accepted and written into the rings.
+    pub packets: AtomicU64,
+    /// Packets missing from the timestamp sequence.
+    pub lost_packets: AtomicU64,
+    /// Timestamp jumps too large to be packet loss (a transmitter restart,
+    /// a clock step).
+    pub discontinuities: AtomicU64,
+    /// Packets stamped more than a packet ahead of our clock.
+    pub early_packets: AtomicU64,
+    /// The furthest ahead of our clock a packet was stamped, in samples,
+    /// since someone last took it.
+    pub max_early: AtomicU32,
+    /// Datagrams dropped: from another address or source port than the
+    /// flow's transmitter, or not whole frames of the flow's slots.
+    pub rejected_packets: AtomicU64,
+    /// The last dropped datagram, for diagnostics: source IPv4 address
+    /// (high 32 bits), source port (next 16) and length (low 16).
+    pub last_rejected: AtomicU64,
+    /// Set while the flow recently lost packets or received them too late
+    /// to play: audible trouble, though the flow still counts as receiving.
+    pub degraded: AtomicBool,
+}
+
+/// A change a controller made, or tried to make, to a setting that
+/// interrupts audio or that other devices depend on: the latency, the sample
+/// rate, the encoding or a name. Kept so that the app can show who did what
+/// once the audio dropped, or why a controller's change did not take.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteChange {
+    /// When, by the system clock.
+    pub at: SystemTime,
+    /// The controller's address.
+    pub from: SocketAddr,
+    /// What it asked for, in words: "the receive latency to 2 ms".
+    pub what: String,
+    /// Whether it was refused because remote settings are locked.
+    pub refused: bool,
+}
+
+/// The last few [`RemoteChange`]s, oldest first. Clones share the log: a
+/// daemon hands it to the device it restarts
+/// ([`crate::StartOptions::remote_changes`]), so that a latency change that
+/// restarted the device is still listed afterwards.
+#[derive(Clone, Debug, Default)]
+pub struct RemoteChanges(Arc<Mutex<VecDeque<RemoteChange>>>);
+
+impl RemoteChanges {
+    /// How many changes the log keeps.
+    pub const KEPT: usize = 8;
+
+    /// Adds `change`, dropping the oldest beyond [`RemoteChanges::KEPT`].
+    pub fn push(&self, change: RemoteChange) {
+        let mut log = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if log.len() == Self::KEPT {
+            log.pop_front();
+        }
+        log.push_back(change);
+    }
+
+    /// The changes kept, oldest first.
+    pub fn recent(&self) -> Vec<RemoteChange> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect()
+    }
 }
 
 /// A sample rate or bit depth that a controller asked for, applied when the
@@ -113,6 +238,8 @@ pub struct Shared {
     pub format_configurable: bool,
     /// The latest format asked for; see [`Shared::request_format`].
     format_request: watch::Sender<FormatRequest>,
+    /// What controllers changed or tried to change; see [`RemoteChange`].
+    pub remote_changes: RemoteChanges,
 }
 
 impl Shared {
@@ -126,6 +253,7 @@ impl Shared {
         ring_capacity: usize,
         rings: Option<ExternalRings>,
         format_configurable: bool,
+        remote_changes: RemoteChanges,
     ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<Notify>)> {
         let (rx_rings, tx_rings) = match rings {
             Some(r) => {
@@ -151,6 +279,7 @@ impl Shared {
             latency_request: watch::channel(None).0,
             format_configurable,
             format_request: watch::channel(FormatRequest::default()).0,
+            remote_changes,
         });
         Ok((shared, notify_rx))
     }
@@ -171,14 +300,9 @@ impl Shared {
     /// saves it with the other state, and tells [`Shared::latency_requests`]
     /// listeners, who restart the device to apply it.
     pub fn request_latency(&self, ns: u32) -> crate::Result<()> {
-        let ms = ns as f64 / 1e6;
-        if !(crate::config::MIN_LATENCY_MS..=crate::config::MAX_LATENCY_MS).contains(&ms) {
-            return Err(crate::Error::Config(format!(
-                "latency {ms} ms is outside {} to {} ms",
-                crate::config::MIN_LATENCY_MS,
-                crate::config::MAX_LATENCY_MS
-            )));
-        }
+        // The rule the device checks when it restarts with this latency.
+        let guard_us = (self.info.tx_guard_ns / 1000) as u32;
+        crate::config::check_latency_ms("the latency", ns as f64 / 1e6, guard_us)?;
         self.modify(|s| s.latency_override_ns = Some(ns));
         self.latency_request.send_replace(Some(ns));
         Ok(())
@@ -226,6 +350,33 @@ impl Shared {
     /// The format asked for and not applied yet.
     pub fn pending_format(&self) -> FormatRequest {
         *self.format_request.borrow()
+    }
+
+    /// Whether the show lock is on: see [`State::remote_settings_locked`].
+    pub fn remote_settings_locked(&self) -> bool {
+        self.state().remote_settings_locked
+    }
+
+    /// Turns the show lock on or off, and saves that with the state: from
+    /// then on it replaces the configuration's `lock_remote_settings`. Only
+    /// the device's owner (the app) calls this; controllers cannot.
+    pub fn lock_remote_settings(&self, locked: bool) {
+        let changed = self.modify(|s| {
+            let changed = s.remote_settings_locked != locked;
+            s.remote_settings_locked = locked;
+            s.remote_settings_lock_set = Some(locked);
+            changed
+        });
+        // Conmon tells controllers again whether the format is settable.
+        if changed {
+            self.notify(Notify::RemoteSettingsLockChanged);
+        }
+    }
+
+    /// Notes a controller's change, or refused attempt, in
+    /// [`Shared::remote_changes`].
+    pub fn record_remote_change(&self, from: SocketAddr, what: String, refused: bool) {
+        self.remote_changes.push(RemoteChange { at: SystemTime::now(), from, what, refused });
     }
 
     /// Subscribes to [`Shared::modify`] notifications.

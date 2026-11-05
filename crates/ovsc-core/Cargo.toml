@@ -9,6 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+arc-swap.workspace = true
 ovsc-proto.workspace = true
 ovsc-shm.workspace = true
 ovsc-clock.workspace = true

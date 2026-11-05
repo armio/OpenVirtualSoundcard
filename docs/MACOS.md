@@ -128,11 +128,13 @@ notarizes with `NOTARY_PROFILE`.
 | `/Library/Application Support/OpenVirtualSoundcard/uninstall.sh` | The uninstaller. |
 | `/Library/LaunchDaemons/org.openvirtualsoundcard.daemon.plist` | The launchd job `org.openvirtualsoundcard.daemon`. |
 | `/Library/Logs/OpenVirtualSoundcard/ovsc.log` | The daemon's log. |
-| `/etc/newsyslog.d/org.openvirtualsoundcard.conf` | Rotates the log at 1 MiB, keeping 5 old files. The running daemon keeps writing to the rotated `ovsc.log.0` until it restarts. |
+| `/etc/newsyslog.d/org.openvirtualsoundcard.conf` | Rotates the log at 1 MiB, keeping 5 old files. The daemon notices within 5 s and writes to the new `ovsc.log`. |
 
-The launchd job runs `ovsc run --config "/Library/Application Support/OpenVirtualSoundcard/ovsc.toml"`
-as root, at boot and again whenever it exits (`RunAtLoad`, `KeepAlive`,
-`ThrottleInterval` 5 s). It holds the Mach service `org.openvirtualsoundcard.audio`
+The launchd job runs `ovsc run --config "/Library/Application Support/OpenVirtualSoundcard/ovsc.toml"
+--log-file /Library/Logs/OpenVirtualSoundcard/ovsc.log` as root, at boot and
+again whenever it exits (`RunAtLoad`, `KeepAlive`, `ThrottleInterval` 5 s):
+it exits on purpose, with an error, when a part of it failed ([The daemon
+restarted by itself](#the-daemon-restarted-by-itself)). It holds the Mach service `org.openvirtualsoundcard.audio`
 (`MachServices`), which only launchd can hand out, so the driver can connect
 only to a daemon that launchd started. `ProcessType` `Interactive` keeps
 launchd from throttling it and coalescing its timers.
@@ -160,6 +162,51 @@ Wi-Fi: name the Dante interface if so. If the interface is missing or has no
 address, the daemon keeps running and retries every few seconds (2 s, backing
 off to 5 s), logging `cannot start the engine: ...; retrying until it
 starts`. The device stays present and silent meanwhile.
+
+### The device name
+
+Dante Controller lists devices by name, and subscriptions find their
+transmitters by name (`<channel>@<device>`), so every device on the network
+needs a name of its own.
+
+* The installer names the device after the Mac (`scutil --get
+  LocalHostName`, which macOS keeps unique on the network). With
+  `name = ""` the device is called `ovsc-` and the last six hex digits of
+  the Dante interface's MAC address, such as `ovsc-5279b6` (with
+  `-<process_id>` for a second device on one Mac). Neither changes when the
+  IP address does. A name set from Dante Controller or the app is saved in
+  `state.toml` and wins over the configuration.
+* The device's service records point at the host name `<default
+  name>.local` (`ovsc-5279b6.local`), as Dante hardware points at its
+  factory name, so a device named after the Mac does not clash with the
+  Mac's own `<name>.local`.
+* When the device starts, and when it is renamed, it first asks the network
+  whether another device has the name (mDNS probing, RFC 6762 §8.1); this
+  takes about a second before the device appears. If one answers, the
+  device takes `<name>-2` (or `-3`, ...), saves it like a rename, and logs
+  an error: `the device at <address> already uses the name <name>: this
+  device takes the name <name>-2`. The device that had the name keeps it,
+  and neither changes name at its next start. Receivers' subscriptions to
+  `<name>` reach the device that kept it: re-patch the ones meant for this
+  one before the show. When the daemon restarts its network engine (for a
+  new latency, or when the network interface changes), the device keeps
+  the name it announced without asking again.
+* If another device starts announcing the name while this one runs (one
+  that does not probe, or two devices started at the same instant), this
+  device keeps its name, since renaming it mid-show would break every
+  subscription to it, also through the daemon's restarts of its network
+  engine. It logs `the device at <address> also announces
+  <name>...: Rename one of them.`, announces its records again, and keeps
+  reporting the conflict until the other device withdraws the name or its
+  records expire. A new daemon process (launchd starting one after a
+  crash, a reboot) asks the network again, and takes `<name>-2` if the other
+  device still announces the name. Meanwhile a subscription on this device to
+  `<channel>@<name>` that is made (or that reconnects) goes to the other
+  device if that one has the channel, rather than looping back to this one,
+  and logs a warning. Subscriptions already receiving stay where they are.
+* A Mac cloned from another one's disk has the same `ovsc.toml` and
+  `state.toml`, so the same device name. Rename one of the two (Dante
+  Controller or the app) before putting both on one network.
 
 ### Ports and other Dante software
 
@@ -191,8 +238,19 @@ already in use`. Add the section and restart the daemon.
 | `[device] tx_channels` | 1 to 128: the device's outputs. |
 | `[device] sample_rate` | 44100, 48000, 88200, 96000, 176400 or 192000. |
 | `[device] bits_per_sample` | 16, 24 or 32, for the transmitted audio. |
-| `[device] latency_ms` | The receive latency, 0.25 to 40 ms. |
+| `[device] latency_ms` | The receive latency, 1 to 40 ms: the device's inputs are read this long after their timestamps. |
+| `[device] tx_latency_ms` | The transmit latency, 1 to 40 ms: the least latency the device asks of receivers of its outputs (the console); see [Latency and safety offsets](#latency-and-safety-offsets). Unset: `latency_ms`. |
 | `[clock] source` | `"ptp"` follows the network's PTP master; `"free"` runs on this Mac's own clock, for a network without a master. `"system"` is refused. |
+| `[device] lock_remote_settings` | `false` (default) or `true`: the [show lock](#locking-the-settings-for-a-show). The app's choice replaces it. |
+
+Both latencies must also be at least `tx_guard_us` (500 µs by default) plus
+0.5 ms: the device sends a packet `tx_guard_us` after its first frame's
+timestamp, so a latency of `tx_guard_us` or less would make every packet
+late, and the 0.5 ms leaves room for the send's wake-up and the network.
+With the default guard, 1 ms is the least. A configuration file with less
+(earlier versions took down to 0.25 ms) is raised to the least as the
+daemon reads it, with a warning in the log naming the file, the value and
+the least; a latency above 40 ms is still refused.
 
 A new rate, channel count or latency reaches Core Audio as a device
 configuration change: applications that use the device see it reconfigure.
@@ -206,8 +264,46 @@ In Device View, under Device Config, Dante Controller sets the latency (see
 below), the sample rate and the encoding (the bit depth). A new sample rate
 or encoding is written into `ovsc.toml`, as from the [OpenVirtualSoundcard
 app](#the-openvirtualsoundcard-app), and the daemon restarts with it: audio stops for
-10 to 20 seconds. Remember that devices only exchange audio at the same
-sample rate.
+10 to 20 seconds in both directions, the feeds other devices receive from
+OpenVirtualSoundcard included, and Dante Controller gives no warning first.
+Remember that devices only exchange audio at the same sample rate.
+
+Dante Controller also renames the device and its channels. Receivers
+subscribe by `channel@device`, so a new device name leaves every
+subscription to OpenVirtualSoundcard's outputs unresolved (the console's
+returns go silent) until someone patches them again. A transmit channel
+keeps answering to its factory name (`01`, `02`, ...), so only subscriptions
+made to a previous custom name break.
+
+Any of these changes, made by mistake mid-show from any computer running
+Dante Controller, interrupts the show; [lock the
+settings](#locking-the-settings-for-a-show) to refuse them.
+
+#### Locking the settings for a show
+
+With the show lock on, the daemon refuses controllers' changes of the
+latency, the sample rate, the encoding, the device name and the channel
+names. Dante Controller gets an error for a latency write or a rename (the
+error result OpenVirtualSoundcard also gives for a value out of range), and
+the device reports the sample rate and encoding as not writable, and no
+longer as configurable; it tells Dante Controller so, unasked, whenever the
+lock is turned on or off. The log says
+`refusing ... from the controller at ...: remote settings are locked`.
+Subscriptions stay open, so the console can still patch to and from
+OpenVirtualSoundcard, and the app's own changes still apply. A write that
+changes nothing (the latency it already has, say) is not refused.
+
+Turn it on in the app (Settings, **Show lock**), or from a script with
+`{"op":"apply","change":{"lock_remote_settings":true}}`. The choice is saved
+in the device's state file and survives restarts, like a rename; it replaces
+`[device] lock_remote_settings` (default `false`), which sets it until the
+app has.
+
+Whether locked or not, the app's Status lists the last few changes
+controllers made, or tried to make while locked, with the controller's
+address and how long ago: the explanation for a dropout that a colleague's
+Dante Controller caused. The list survives the network engine restarting,
+but not the daemon.
 
 #### Setting the latency from Dante Controller or the app
 
@@ -217,13 +313,33 @@ too. Its Latency tab shows how late the packets of each receive flow arrive,
 against that setting. Like a rename, the new latency is saved in the device's state file
 (`state.toml`, as `latency_ns`) and from then on replaces
 `latency_ms`, also after a reboot. Deleting `latency_ns` from the state file
-(then restarting the daemon) goes back to `latency_ms`.
+(then restarting the daemon) goes back to `latency_ms`. Only the receive
+latency is set this way; while `tx_latency_ms` is unset, the transmit
+latency follows it. A saved latency below the least the device allows is
+ignored at start.
 
 To apply it, the daemon restarts its network engine while the clock keeps
-running and the driver stays attached: subscriptions drop for about a second
-and come back, and Core Audio sees a configuration change with the new
-latency and safety offsets. The log says `restarting the network engine for a
-receive latency of ... ms`.
+running and the driver stays attached. Although only the receive side
+changes, the restart stops audio in both directions:
+
+1. Each receive flow is stopped, then the device withdraws all its mDNS
+   records (goodbyes for the device and every transmit channel).
+2. Every transmit flow closes, so the feeds other devices receive from
+   OpenVirtualSoundcard (the processed returns to a console, say) stop.
+3. The engine starts again with the new latency, announces itself, and
+   requests its receive flows again: its inputs come back after about a
+   second.
+4. Each device that received from it must notice and request its flow
+   again. When that happens depends on that device, not on
+   OpenVirtualSoundcard; expect several seconds, and test it with your
+   console before relying on it.
+
+Core Audio also sees a configuration change with the new latency and safety
+offsets, and some applications restart their audio engine on it. The log
+says `restarting the network engine for a receive latency of ... ms`, and
+warns when transmit flows were open. Change the latency before the show, or
+[lock the settings](#locking-the-settings-for-a-show) so that nobody does it
+from Dante Controller during one.
 
 The `[coreaudio]` section tunes the device:
 
@@ -231,12 +347,12 @@ The `[coreaudio]` section tunes the device:
 |---|---|---|
 | `control_socket` | `"/var/run/ovsc/control.sock"` | The [control socket](#the-control-socket) for the app; empty for none. |
 | `allowed_uids` | `[202]` | Effective user IDs allowed to connect; 202 is `_coreaudiod`, Core Audio's driver helper. |
-| `input_margin_us` | `500` | Added to the input safety offset. |
-| `output_margin_us` | `1000` | Added to the output safety offset. |
-| `output_latency_ms` | unset | Output latency reported to applications; unset means `latency_ms`. |
+| `input_margin_us` | `500` | Added to the input safety offset; see [Choosing the margins](#choosing-the-margins). |
+| `output_margin_us` | `1000` | Added to the output safety offset; see [Choosing the margins](#choosing-the-margins). |
+| `output_latency_ms` | unset | Output latency reported to applications; unset means the transmit latency (`tx_latency_ms`, else `latency_ms`). Set it to the console's latency when that is longer. |
 | `input_latency_mode` | `"safety"` | `"safety"` or `"latency"`: see [Latency and safety offsets](#latency-and-safety-offsets). |
 | `clock_algorithm` | `"raw"` | Core Audio's time stamp smoothing: `"raw"` (none) or `"iir"`. |
-| `prevent_idle_sleep` | `true` | Keep the Mac from idle-sleeping while the engine runs. |
+| `prevent_idle_sleep` | `true` | Keep the Mac from idle-sleeping while the daemon runs, from its start and across engine restarts. A restart of the daemon itself still releases it for a moment: on a show machine, also turn system sleep off (see [The Mac must not sleep](#the-mac-must-not-sleep)). |
 | `status_log_interval_s` | `30` | Seconds between status lines in the log; 0 disables them. |
 | `service` | `"org.openvirtualsoundcard.audio"` | The Mach service the daemon serves. Leave it as is: the driver always connects to `org.openvirtualsoundcard.audio`, which is compiled in and listed in its Info.plist, and the launchd job holds that name. |
 | `debug_zts_jitter_ns` | `0` | Jitters the time stamps on purpose, for tests only. |
@@ -250,24 +366,64 @@ an administrator of the Mac, and does not need to stay open: the daemon runs
 without it.
 
 * The header shows the device name and three lights: **Clock** (green when
-  locked to the Dante network, amber while locking, red when unlocked),
-  **Driver** (whether Core Audio has loaded the OpenVirtualSoundcard driver) and
-  **Audio** (whether an application is playing or recording through it).
+  locked to the Dante network, amber while locking or in holdover, red when
+  unlocked), **Driver** (green when Core Audio has loaded the
+  OpenVirtualSoundcard driver, red when it has not or when the driver has
+  failed) and **Audio**:
+  * green **Flowing**: audio can flow, and nothing audible went wrong in the
+    last 30 s;
+  * amber **Dropouts**: audio flows, but something audible happened in the
+    last 30 s (lost or late packets, late output or early input cycles,
+    slips, packets sent without the application's audio): the warnings say
+    what;
+  * amber **Stopped**: the driver holds the audio back (its gate is
+    closed), so inputs and returns are silent, usually for seconds while the
+    clock settles or the engine restarts;
+  * red **Silent**: the driver caught an internal error and is silent until
+    Core Audio restarts. The app shows the command, `sudo killall
+    coreaudiod`, with a button to copy it.
+
+  Hovering over a light says more.
 * **Status** lists the device (interface, address, sample rate, bit depth,
-  latency), the clock (its leader, offset, network delay and rate), the
-  receive channels with what each one is subscribed to, the transmit flows
-  and the packet counters. Warnings from the daemon, such as a clock that
-  does not lock, come first.
+  latency, whether settings from the network are locked), the clock (its
+  leader, offset, network delay and rate), the receive channels with what
+  each one is subscribed to, the transmit flows and the packet counters.
+  Warnings from the daemon come first: in red those that mean audio is down
+  now (a failed driver, Core Audio no longer calling it, a gate closed
+  while an application plays, a stopped transmit engine, a clock that has
+  not locked or lost its leader), then in amber the rest. A warning about a
+  counter (lost, late or early packets, datagrams from a stray sender, send
+  errors, late sends, skipped packets, expired flows, late output or early
+  input cycles, slips, invalid samples from the application, packets sent
+  without its audio while it plays) appears when the counter rises and
+  stays for 30 s after it last rose, saying how many in the last 30 s and
+  what to do; the first 10 s after the engine (re)starts and the first 3 s
+  after an application starts IO do not count. Holdover (with the seconds
+  left), a clock relocking, a jump of the clock, a new clock leader,
+  subscribed channels without audio for 10 s, a transmit or receive
+  thread without real-time priority and another device using this one's
+  name also warn.
+  The changes controllers made or tried to make come last, newest first,
+  for 10 minutes; older ones move to **Earlier**, at the bottom. The header
+  says `settings locked` while the show lock is on.
 * **Settings** changes the device name, the network interface, the sample
-  rate, the bit depth, the receive and transmit channel counts and the
-  latency. **Apply** sends only what changed. A new name applies at once,
-  and a new latency restarts the network engine (audio stops for a second
-  or two, see
-  [above](#setting-the-latency-from-dante-controller-or-the-app)). A new
-  interface, rate, bit depth or channel count is written into
-  `ovsc.toml`, keeping its comments, and restarts the whole daemon:
-  the app asks first, since audio then stops for 10 to 20 seconds while the
-  clock locks again.
+  rate, the bit depth, the receive and transmit channel counts, the
+  latency and the [show lock](#locking-the-settings-for-a-show). **Apply**
+  sends only what changed, and asks first for anything that interrupts
+  audio or other devices' subscriptions, saying what it does:
+  * A new latency restarts the network engine: audio stops for a second or
+    two in both directions, and devices receiving from OpenVirtualSoundcard,
+    such as a console taking its returns, must request their flows again
+    (see [above](#setting-the-latency-from-dante-controller-or-the-app)).
+  * A new interface, rate, bit depth or channel count is written into
+    `ovsc.toml`, keeping its comments, and restarts the whole daemon:
+    audio stops for 10 to 20 seconds in both directions while the clock
+    locks again.
+  * A new name applies at once, but subscriptions other devices made to
+    OpenVirtualSoundcard's outputs name the old one: they stop resolving
+    until patched again in Dante Controller. The question lists the devices
+    receiving from it now.
+  * The show lock applies at once and interrupts nothing.
 
 Build it with `packaging/macos/build-app.sh`, which needs nothing beyond
 Rust and the command-line tools. It is signed ad hoc; built on the Mac that
@@ -292,8 +448,8 @@ echo '{"op":"apply","change":{"latency_ms":2}}' | nc -U /var/run/ovsc/control.so
 
 | Request | Answer |
 |---|---|
-| `{"op":"status"}` | `"result":"status"`: the device, the clock, the driver and warnings. |
-| `{"op":"settings"}` | `"result":"settings"`: `name`, `interface`, `sample_rate`, `bits_per_sample`, `rx_channels`, `tx_channels`, `latency_ms`. |
+| `{"op":"status"}` | `"result":"status"`: the device, the clock, the driver (`audio_flowing`; `faulted`, a driver silent until Core Audio restarts; `audio_trouble`, audible problems in the last 30 s) and `warnings`, of which the first `urgent_warnings` mean audio is down now; `earlier` holds controllers' changes older than 10 minutes. |
+| `{"op":"settings"}` | `"result":"settings"`: `name`, `interface`, `sample_rate`, `bits_per_sample`, `rx_channels`, `tx_channels`, `latency_ms`, `lock_remote_settings`. |
 | `{"op":"interfaces"}` | `"result":"interfaces"`: the interfaces that are up and have an IPv4 address. |
 | `{"op":"apply","change":{...}}` | `"result":"applied"` with `"restart"`: `"none"`, `"device"` (the network engine restarts) or `"daemon"` (the daemon exits for launchd to start it again); or `"result":"error"` with a `message`, and nothing changed. `change` holds any of the settings' fields. |
 
@@ -327,6 +483,8 @@ computes both (`compute_offsets` in
 with:
 
 * `L = round(latency_ms × fs / 1000)`, the receive latency;
+* `T = round(tx_latency_ms × fs / 1000)`, the transmit latency (`T = L`
+  while `tx_latency_ms` is unset);
 * `guard = floor(tx_guard_us × fs / 1e6)`: a packet is sent this long after
   its timestamp (`tx_guard_us` is 500 µs by default);
 * `FPP_MAX = 32`, the most frames per transmitted packet;
@@ -337,7 +495,7 @@ with:
 | Input safety offset | `L + margin(input_margin_us)` | `margin(input_margin_us)` |
 | Input latency | 0 | `L` |
 | Output safety offset | `max(FPP_MAX − 1 − guard, 0) + margin(output_margin_us)` | same |
-| Output latency | `L`, or `output_latency_ms` | same |
+| Output latency | `T`, or `output_latency_ms` | same |
 
 In safety mode the network latency is part of the input safety offset, so
 the input time stamps an application gets are the senders' capture times:
@@ -349,11 +507,25 @@ values sees the same input total in either mode.
 The output safety offset covers the transmit thread: a packet carries up to
 `FPP_MAX` frames and leaves `guard` after its first frame's timestamp, so a
 frame must be in the ring up to `FPP_MAX − 1 − guard` frames before its own
-time. Dante receivers play a frame at its timestamp plus their own receive
-latency; the device reports `latency_ms` as its output latency unless
-`output_latency_ms` says otherwise.
+time. The output margin adds room for the driver writing late ([Choosing
+the margins](#choosing-the-margins)).
 
-With the default margins, 4 ms latency and the default guard:
+A receiver plays an output frame at its timestamp plus the larger of its own
+receive latency and the latency the device asks for in its transmit
+channels' advertisement, `T` (TXT `latency_ns`, [PROTOCOL.md](PROTOCOL.md)
+sections 2.2 and 8.4). So the console plays the device's outputs
+`max(console latency, T)` after their time, and the device reports `T` as
+its output latency. That is right while the console's latency is at most
+`T`; if it is longer, set `output_latency_ms` to it, or hosts under-report
+the output path by the difference. While `tx_latency_ms` is unset, `T` is
+the receive latency: raising `latency_ms` (here, from the app or from Dante
+Controller) then delays the console's playout of the outputs as well as the
+inputs. For live use, set `tx_latency_ms = 1.0`: the console then plays the
+returns at its own latency (at least 1 ms), and `latency_ms` sets only the
+input side.
+
+With the default margins, 4 ms latency (`tx_latency_ms` unset) and the
+default guard:
 
 | Rate | `L` | Input safety | Output safety | Output latency |
 |---|---|---|---|---|
@@ -369,22 +541,78 @@ The test `offsets_match_the_design_table` in
 checks this table against `compute_offsets`, and the end-to-end test checks
 the 48 kHz row on a real device (scenario S2).
 
+#### Round trip
+
+The HAL reads input one buffer plus the input safety offset behind its IO
+cycle and writes output one buffer plus the output safety offset ahead of
+it ([Measured IO timing](#measured-io-timing)). With a buffer of `B` frames,
+a frame captured at a stagebox is therefore played by the console
+
+```text
+2·B + input safety + output safety + max(console latency, T)
+  = 2·B + L + margin(input_margin_us)
+        + max(FPP_MAX − 1 − guard, 0) + margin(output_margin_us)
+        + max(console latency, T)
+```
+
+after its capture, plus the plug-ins' own latency and the stagebox's and
+console's converters and processing. A host that adds both buffers and the
+device's latencies and safety offsets reports the same figure while the
+output latency is right (see above). At 48 kHz with the default margins and
+guard, and a console at 1 ms:
+
+| `latency_ms` | `tx_latency_ms` | B = 32 | B = 64 | B = 128 |
+|---|---|---|---|---|
+| 4 | unset | 11.0 ms | 12.3 ms | 15.0 ms |
+| 4 | 1 | 8.0 ms | 9.3 ms | 12.0 ms |
+| 2 | 1 | 6.0 ms | 7.3 ms | 10.0 ms |
+| 1 | 1 | 5.0 ms | 6.3 ms | 9.0 ms |
+
+Each millisecond of `latency_ms` adds a millisecond, and so does each one of
+`T` above the console's latency.
+
+#### Choosing the margins
+
+The input margin covers the driver's timeline and the daemon's clock
+disagreeing (by up to 250 µs while audio flows, see [Clock states and
+silence](#clock-states-and-silence)) and packets a little later than `L`.
+The output margin covers the same disagreement, HAL wake-ups 1 to 3 frames
+late and IO cycles that finish late, so that output reaches the rings
+before the transmit thread reads it; a transmit thread that runs late needs
+none, since it then reads later still. Neither should be below the 250 µs
+clock bound plus a few frames, about 300 µs. The defaults (500 µs in,
+1000 µs out) leave room for a busy Mac; each 100 µs less shortens the round
+trip by 100 µs.
+
+To lower them, run the show's load (the session, its plug-ins and buffer
+size) for at least an hour, then read `out_margin` and `in_margin` in the
+[status](#status) (the log's `min_out_margin` and `min_in_margin`), and
+`late_out`, `early_in` and `tx_underruns`, which must stay 0. The smallest
+margin of each, less 12 frames (250 µs at 48 kHz) and a few more, is how far
+that margin may come down; repeat the test after changing it. On the input
+side, a receive latency `L` that packets keep to (the app's Latency tab, the
+`rx_late` counter) matters more than the margin.
+
 ## Clock states and silence
 
 The daemon's clock is in one of these states:
 
 | State | Meaning |
 |---|---|
-| Unlocked | No master heard yet, or the master went silent. After losing a master the clock keeps running on its last frequency for 30 s (holdover), then becomes invalid. |
-| Locking | A master was found; the servo is converging. |
+| Unlocked | No master heard yet, or the master went silent. After losing a master the clock keeps running on its frequency estimate for 30 s (holdover), then becomes invalid. |
+| Locking | A master was found and the servo is converging; or a locked clock is slewing back after its error stayed above 250 µs (an unlock), or checking its time against a new master. |
 | Locked | Following the master. |
 | FreeRunning | `clock.source = "free"`. |
 
-The driver keeps its own continuous timeline for Core Audio and follows the
-daemon's clock when it is Locked or FreeRunning ([Device timeline](#device-timeline)).
-The status shows the driver's side as `clock=synthetic` (it has not followed
-a daemon clock yet), `clock=following` or `clock=holdover` (it lost the
-daemon's clock and keeps going at the last rate).
+The driver keeps its own continuous timeline for Core Audio
+([Device timeline](#device-timeline)). It starts following a daemon clock
+once that clock is Locked or FreeRunning, and from then on keeps following
+it in any state for as long as its `step_gen` stays the same: the daemon
+bumps `step_gen` on every jump of its clock, so a clock with the same
+`step_gen` is continuous with what the driver plays. The status shows the
+driver's side as `clock=synthetic` (it has not followed a daemon clock yet),
+`clock=following` or `clock=holdover` (it lost the daemon's clock and keeps
+going at the last rate).
 
 Audio flows only while the driver's **gate** is open (`gate=1`). The gate is
 open when all of these hold:
@@ -394,25 +622,52 @@ open when all of these hold:
   less than 1 s old;
 * the daemon's clock is valid and within 1000 ppm of nominal;
 * the driver's timeline follows this clock, or continues it in holdover: a
-  new daemon's clock, or the same clock after a step, is shut out until the
-  timeline follows it (so never while `clock=synthetic`);
+  new daemon's clock, or the same clock after a step, is shut out until it
+  has locked and the timeline follows it (so never while
+  `clock=synthetic`);
 * the daemon's clock agrees with the driver's timeline to within 250 µs.
 
-Otherwise the inputs read silence and the outputs are dropped. So:
+Otherwise the inputs read silence and the outputs are dropped. The driver
+ramps both over 5 ms when the gate opens and when it closes (240 frames at
+48 kHz), so a gate edge is a short fade, not a click. A faulted driver goes
+silent at once, and audio that stops arriving (a daemon that died) is not
+faded. So:
 
 * before the daemon's clock first locks, the device is silent;
+* when Syncs are delayed for a few seconds (a network without
+  strict-priority QoS for PTP, a loaded 100 Mbit link), the daemon's clock
+  may unlock: it keeps its frequency estimate and slews back gently, by at
+  most 100 ppm, and the driver keeps following it. Audio keeps flowing and
+  nothing slips;
 * when the master goes away (no Sync for 5 s), the daemon's clock holds over
-  for 30 s on its last mapping, and audio keeps flowing on it while the two
-  clocks agree. When a master is heard again the daemon locks to it and the
-  driver realigns once; if the holdover runs out first, the device is silent
-  until then;
-* when the clock steps, the driver realigns once: the audio slips once, but
-  the timeline Core Audio sees stays continuous. A new master silences the
-  device until the daemon's clock has locked to it, then the driver realigns
-  the same way;
-* when the daemon restarts, audio stops until the new daemon's clock locks.
+  for 30 s on its frequency estimate, and the driver follows it. When the
+  same or a new master is heard, the daemon checks it against its running
+  clock: within 250 µs it slews on and audio keeps flowing; beyond, it steps
+  (see the next point). If the holdover runs out first, the device is silent
+  until the daemon's clock locks again;
+* a new leader that was synchronised to the old one, the normal Dante leader
+  change (the leader reboots, Preferred Leader is moved, a better device
+  joins), agrees with the running clock to within microseconds: the clock
+  stays continuous, `step_gen` does not change, and audio keeps flowing.
+  If the old leader just went silent, the new one takes over once the old
+  one has been silent for 1 s (four of its Sync intervals if it advertised
+  slower Syncs than one every 250 ms, and at most the 5 s master timeout)
+  and the new one has sent two Syncs, while the clock runs on;
+* when the clock steps (the master's time jumped by more than 2 ms, or a new
+  master's time differs from the running clock by more than 250 µs), the
+  device is silent until the daemon's clock has locked again, then the
+  driver realigns once: the audio slips once, but the timeline Core Audio
+  sees stays continuous. For a new master 10 ms off, the replay test
+  measures 1.6 s of silence at the median and 5.5 s at worst;
+* when the daemon restarts, audio stops until the new daemon's clock locks
+  (3.6 s at the median and about 7.6 s at worst in the servo simulation).
   Core Audio sees no change: no reconfiguration, no new timeline;
 * when the daemon is stopped, the device stays present and silent.
+
+The daemon's clock status counts unlocks, steps (with the size of the last
+one), master changes and master losses, and reports the masters heard
+besides the one followed, the time of the last Sync and when a holdover
+runs out, so that it can warn before a problem is heard.
 
 ## Status
 
@@ -458,11 +713,13 @@ sudo tail -400 /Library/Logs/OpenVirtualSoundcard/ovsc.log
 sudo launchctl print system/org.openvirtualsoundcard.daemon
 ```
 
-launchd opens this file when it starts the daemon, and the daemon never
-reopens it. After newsyslog rotates the log at 1 MiB, the running daemon
-keeps writing to `ovsc.log.0` until it restarts. If `ovsc.log` is
-empty or stale, read `ovsc.log.0`, or restart the daemon with
-`sudo launchctl kickstart -k system/org.openvirtualsoundcard.daemon`.
+The daemon opens this file itself (`--log-file`) and looks every 5 s whether
+it is still the file it writes to. When newsyslog has rotated it (at 1 MiB,
+keeping `ovsc.log.0` to `ovsc.log.4`), the daemon logs `log file ... reopened
+after a rotation` at the top of the new `ovsc.log`; the last few seconds
+before that are at the end of `ovsc.log.0`. An older daemon (before
+`--log-file`) went on writing to `ovsc.log.0`, which then grew without
+bound: if `ovsc.log` stays empty, reinstall, or restart the daemon.
 
 Lines worth knowing:
 
@@ -470,13 +727,29 @@ Lines worth knowing:
   at start;
 * `hal: plug-in attached: pid <helper>, ...` when a driver instance connects;
 * `clock locked to ...` and `clock lost`;
+* `the network interface <name> is gone`, `... lost its IPv4 address`,
+  `... has its address <ip> back`, and `<why>: restarting the network
+  engine` ([The network changed](#the-network-changed));
+* `<what> panicked: ...` and `...: restarting the daemon`
+  ([The daemon restarted by itself](#the-daemon-restarted-by-itself));
+* `the saved state ... could not be read` ([The saved subscriptions are
+  gone](#the-saved-subscriptions-are-gone));
 * every `status_log_interval_s`: `clock <state>; receiving <n>/<m>
   subscribed channels; <k> transmit flows; packets: tx <n> (<u> underruns),
-  rx <n> (<l> late); hal: peers=... io=... gate=... regime=... absorbs=...
-  seed=... late_out=... early_in=... silenced=... in_missing=...
-  tx_underruns=... min_out_margin=... min_in_margin=...`, the margins being
-  the smallest seen since IO started, in frames. A late packet arrived after
-  its timestamp plus the latency: its audio may have been read already;
+  rx <n> (<l> late)[; <interface problem>]; healthy|warnings: <...>; hal:
+  peers=... io=... gate=... regime=... absorbs=... seed=... late_out=...
+  early_in=... silenced=... in_missing=... tx_underruns=...
+  min_out_margin=... min_in_margin=...[ non_finite_out=...]`, the margins
+  being the smallest seen since IO started, in frames. `healthy`, or
+  `warnings:` and the app's warnings in a few words (`3 late output cycles,
+  clock in holdover, 21 s left`). A late packet arrived after its timestamp
+  plus the latency: its audio may have been read already. `in_missing` counts
+  every input channel without a sample, subscribed or not, and
+  `tx_underruns` every packet sent while no application plays, so neither
+  is an alarm on its own;
+* `health: <warning>` (WARN) when one of the app's warnings appears, and
+  `health: cleared: <what>` (INFO) once it has been gone for 10 s: a warning
+  that comes and goes within that time is logged once;
 * once per IO session, `hal: io_trace <session> <i>: ...`: the first 64 IO
   operations, with the sample times Core Audio passed
   ([Measured IO timing](#measured-io-timing)).
@@ -581,6 +854,73 @@ with the Dante interface in place of `en7`.
   hardware). Use another Ethernet adapter for the Dante network: a plain
   USB-C adapter worked.
 
+### The network changed
+
+The daemon looks at its network interface every second. It restarts the
+whole network engine (clock, device, advertisement; the driver stays
+attached and reads silence meanwhile) when:
+
+* the interface came back after it was gone: a USB-C or Thunderbolt
+  Ethernet adapter or a dock that re-enumerated after a knock or a power
+  blip. Its multicast memberships (PTP, mDNS) went with it, so without a
+  restart the clock would be lost some 35 s later, for good;
+* the interface was attached again under a new index;
+* the interface no longer has the engine's address: a DHCP lease replacing
+  a self-assigned 169.254 address, or a router handing out a new lease;
+* the interface got its address back after a cable pull, but the clock has
+  not locked 15 s later.
+
+A restart needs two looks in a row (2 s). While the interface is gone or
+has no address the engine waits for it; after a cable pull that brings the
+same address back, nothing restarts and the clock locks again by itself.
+Audio returns once the clock has locked again, typically a few seconds
+after the restart. The log says what happened (`the network interface en7
+is gone`, `... is back: restarting the network engine`), and the status
+line ends with the problem while it lasts.
+
+Name the Dante interface in `[device] interface` for a show: with the
+default route (an empty name), a restart picks whatever carries the default
+route at that moment, which may be Wi-Fi.
+
+### The daemon restarted by itself
+
+A part of the daemon failed: a panic in any thread (logged at error level
+as `... panicked: ...`), a device task or the transmit thread that stopped,
+or the driver heartbeat task. Rather than run on half dead (silent with a
+green status), the daemon says goodbye to the driver and exits with an
+error; launchd starts a new one within `ThrottleInterval` (5 s), and audio
+returns once its clock locks. `sudo launchctl print
+system/org.openvirtualsoundcard.daemon` shows the last exit status. Please
+report the panic message with the log.
+
+### The saved subscriptions are gone
+
+The renames, subscriptions and latency set from Dante Controller or the app
+are saved in `state.toml` ([What gets installed](#what-gets-installed)). Each
+save is flushed to the disk before it replaces the file, and the previous
+version is kept as `state.toml.bak`. If the file cannot be read at start
+(empty or damaged, after a power cut during a save on an older version, or
+a disk fault), the daemon logs `the saved state ... could not be read` as
+an error, starts from `state.toml.bak`, and the app shows a warning. Once
+the engine runs, the daemon saves the state it runs with, keeping the
+damaged file as `state.toml.corrupt-<unix time>` first. Check the
+subscriptions in Dante Controller then. The damaged file is never
+overwritten, so it can still be repaired by hand: stop the daemon, copy the
+repaired file over `state.toml`, and start it again.
+
+### The Mac must not sleep
+
+With `prevent_idle_sleep = true` (the default) the daemon keeps the Mac
+from idle-sleeping from the moment it starts, across engine restarts. A
+restart of the daemon itself (a settings change in the app, a crash)
+releases it for a few seconds, and nothing keeps a display or a lid from
+sleeping. On a show machine, also turn sleep off:
+
+```sh
+sudo pmset -a sleep 0 disablesleep 1
+pmset -g assertions | grep -i openvirtualsoundcard
+```
+
 ### Firewall
 
 When the application firewall is on, `install.sh` lets the daemon accept
@@ -644,8 +984,12 @@ log or call the host; everything else runs on one serial queue,
 ring slots `t + off − read_delay` into Core Audio's buffer, WriteMix stores
 the mix at TX ring slots `t + off`, where `t` is Core Audio's sample time and
 `off` the timeline's ring offset. A ring slot holds the sample and the low 32
-bits of its timestamp, so a stale slot reads as silence. Every 24-bit sample
-survives the trip through Float32 bit for bit.
+bits of its timestamp, so a stale slot reads as silence; the daemon's ring
+sweeper clears slots older than two ring lengths every 5 s, so that a slot
+left unwritten for 2^32 samples (about 25 h at 48 kHz) cannot match again.
+Every 24-bit sample survives the trip through Float32 bit for bit, and a
+non-finite output sample (NaN or infinity from a plug-in) is sent as silence
+and counted (`non_finite_out` in the plug-in status).
 
 **IPC.** The driver's Info.plist lists `org.openvirtualsoundcard.audio` under
 `AudioServerPlugIn_MachServices`. Messages are XPC dictionaries with an `op`:
@@ -726,9 +1070,9 @@ synchronously on every clock change. The driver reads it with a bounded
 number of tries and keeps its last good record, so a daemon that dies in the
 middle of a write cannot make the IO thread spin. The mirror counts
 discontinuities in `step_gen`: a jump of the media time by more than 1 µs, the
-clock becoming valid, a grandmaster other than the last one, or a change into
-Locked or FreeRunning. Losing the master is not one: the clock holds over on
-the same mapping.
+clock becoming valid, or a change into FreeRunning. A change of master or of
+lock state is not one by itself, and neither is losing the master: the
+mapping says whether the time moved.
 
 ## Device timeline
 
@@ -750,9 +1094,11 @@ T(h) = t_whole + t_frac + (h − h_a) × rho        device frame t lives at ring
   timeline does not move.
 * Only a rate jump beyond 200 ppm, a reset (a new sample rate) or an IO stall
   of more than 4 periods gives Core Audio a new timeline (a new seed).
-* The timeline follows the daemon's clock only while it is valid, Locked or
-  FreeRunning and within 1000 ppm, the daemon's engine runs at the device's
-  rate, and its heartbeat is under 1 s old. Otherwise it holds over at its
+* The timeline follows the daemon's clock only while it is valid and within
+  1000 ppm, the daemon's engine runs at the device's rate, and its heartbeat
+  is under 1 s old; and only once it is Locked or FreeRunning, unless it is
+  the clock (daemon generation and `step_gen`) the timeline already
+  follows, which it follows in any state. Otherwise it holds over at its
   current rate.
 
 The audio passes the network unchanged: the driver writes output frame `t` at
@@ -866,9 +1212,9 @@ and the device is always selected by its UID.
 | S5 | Buffer sizes | 5 s loopbacks at 32, 128, 1024 and 4096 frames, device delay 0. At 32 and 128 frames, up to 2400 frames and 20 slips per channel may be lost to the runner's scheduling stalls. |
 | S6 | Daemon restart under IO | 40 s loopback; `sudo launchctl kickstart -k system/org.openvirtualsoundcard.daemon` at 10 s. One outage of at most 15 s, then bit-exact again at device delay 0, allowing two Core Audio overload skips and 2400 more frames lost to stalls; no timeline jump: `seed` unchanged and no `coreaudiod` re-anchoring lines; `attach` + 1. |
 | S7 | Core Audio restart | `sudo killall coreaudiod`; the device returns within 60 s, a new driver instance attaches, a 10 s loopback passes (480 frames may be lost to stalls), the rate is still 48000. |
-| S8 | Channel change | Install `e2e-4ch.toml` and restart the daemon: 4 × 4 within 30 s without a `coreaudiod` restart; 5 s loopback (480 frames may be lost to stalls). |
+| S8 | Channel change | Install `e2e-4ch.toml` and restart the daemon: 4 × 4 within 30 s without a `coreaudiod` restart; once the gate is open again, a 5 s loopback (480 frames may be lost to stalls). |
 | S9 | Rate change | Install `e2e-96k.toml` and restart the daemon: `wait-rate org.openvirtualsoundcard.vsc 96000 30`; once `ppm` has stayed within 2 of +50 for 8 s, a 5 s loopback at +50 ± 3 ppm (960 frames may be lost to stalls); then back to 48 kHz. |
-| S10 | Daemon absent | Once `ppm` has stayed within 2 of +50 for 8 s, `sudo launchctl bootout system/org.openvirtualsoundcard.daemon`: the device stays alive, a 10 s loopback reads exact silence at +50 ± 5 ppm (holdover); after `launchctl bootstrap` it attaches within 30 s and a 5 s loopback passes (480 frames may be lost to stalls). |
+| S10 | Daemon absent | Once `ppm` has stayed within 2 of +50 for 8 s, `sudo launchctl bootout system/org.openvirtualsoundcard.daemon`: the device stays alive, a 10 s loopback reads exact silence at +50 ± 5 ppm (holdover); after `launchctl bootstrap` it attaches within 30 s and, once the gate is open, a 5 s loopback passes (480 frames may be lost to stalls). |
 | S11 | Package and uninstall | `build-pkg.sh`; `sudo installer -pkg <package> -target /` over the install; the device is present; `uninstall.sh --purge` removes it and the package receipt, and leaves no launchd job file, driver bundle or `/Library/Application Support/OpenVirtualSoundcard`. |
 
 The GitHub macOS runners are small VMs whose scheduling stalls sometimes
