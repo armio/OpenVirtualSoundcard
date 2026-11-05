@@ -9,7 +9,7 @@
 use ovsc_clock::ClockSnapshot;
 use ovsc_clock::ptp::servo::{Servo, ServoConfig, ServoEvent, ServoState};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 const US: u64 = 1_000;
 const MS: u64 = 1_000_000;
