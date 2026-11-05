@@ -374,6 +374,12 @@ fn subscription_words(s: SubscriptionStatus) -> &'static str {
         SubscriptionStatus::ReceivingUnicast | SubscriptionStatus::ReceivingMulticast => {
             "receiving"
         }
+        // The statuses ovsc-core reports through `Other` (PROTOCOL.md §4.14).
+        SubscriptionStatus::Other(0x000F) => "transmitter not answering",
+        SubscriptionStatus::Other(0x0010) => "sample rate or bit depth differs",
+        SubscriptionStatus::Other(0x0012) => "no receive flow left",
+        SubscriptionStatus::Other(0x0013) => "cannot receive on this interface",
+        SubscriptionStatus::Other(0x001A) => "transmitter needs more than 40 ms of latency",
         SubscriptionStatus::Other(_) => "unknown state",
     }
 }
@@ -716,6 +722,16 @@ backend = "coreaudio"
         assert_eq!(subscription_words(SubscriptionStatus::ReceivingUnicast), "receiving");
         assert_eq!(subscription_words(SubscriptionStatus::Unresolved), "transmitter not found");
         assert_eq!(subscription_words(SubscriptionStatus::None), "");
+        // The receive manager's statuses without a variant of their own.
+        assert_eq!(
+            subscription_words(SubscriptionStatus::Other(0x000F)),
+            "transmitter not answering"
+        );
+        assert_eq!(
+            subscription_words(SubscriptionStatus::Other(0x0013)),
+            "cannot receive on this interface"
+        );
+        assert_eq!(subscription_words(SubscriptionStatus::Other(0x0099)), "unknown state");
     }
 
     #[tokio::test]
