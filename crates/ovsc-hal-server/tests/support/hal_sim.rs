@@ -306,6 +306,9 @@ pub struct Cycle {
     pub matched: u64,
     /// Others that were silence.
     pub silent: u64,
+    /// Others in frames that carried what was played at their device time
+    /// scaled by one gain below 1: the driver's fade at a gate edge.
+    pub faded: u64,
     /// Others: audio from another time or channel, or garbage.
     pub wrong: u64,
     /// Input channel-frames that were not silence, matched or not.
@@ -315,6 +318,34 @@ pub struct Cycle {
     /// The device times of the first and the last input frame with a
     /// channel that did not match.
     pub unmatched: Option<(i64, i64)>,
+}
+
+/// Whether input `frame`, at device time `td`, is what was played there
+/// scaled by one gain strictly between 0 and 1 on every channel: the driver
+/// fades audio in and out over 5 ms at the gate's edges (ovsc-hal's
+/// `EdgeRamp`), on the output before the 24-bit wire and on the input.
+/// Audio from another time or channel never fits one gain across 4 or more
+/// channels of PRBS.
+fn faded(frame: &[f32], td: i64) -> bool {
+    if td < 0 || frame.len() < 4 {
+        return false;
+    }
+    let played = |ch: usize| f64::from(prbs::sample(ch, td as u64));
+    let (mut xs, mut ss) = (0.0, 0.0);
+    for (ch, &x) in frame.iter().enumerate() {
+        xs += f64::from(x) * played(ch);
+        ss += played(ch) * played(ch);
+    }
+    let g = xs / ss;
+    // A few 24-bit steps: the wire truncates the faded output.
+    let tolerance = 4.0 / f64::from(1u32 << 23);
+    ss > 0.0
+        && g > 0.0
+        && g < 1.0
+        && frame
+            .iter()
+            .enumerate()
+            .all(|(ch, &x)| (f64::from(x) - g * played(ch)).abs() <= tolerance)
 }
 
 impl Cycle {
@@ -730,6 +761,7 @@ fn io_loop(d: &Driver, shared: &Shared, n: u32, seen: &mut Record) {
                 inputs,
                 matched: 0,
                 silent: 0,
+                faded: 0,
                 wrong: 0,
                 nonzero: 0,
                 first_wrong: None,
@@ -738,6 +770,7 @@ fn io_loop(d: &Driver, shared: &Shared, n: u32, seen: &mut Record) {
             for (i, frame) in input.chunks_exact(inputs.max(1)).enumerate() {
                 let td = t_in + i as i64;
                 let mut matched = true;
+                let fade = faded(frame, td);
                 for (ch, &x) in frame.iter().enumerate() {
                     if x != 0.0 {
                         result.nonzero += 1;
@@ -747,7 +780,9 @@ fn io_loop(d: &Driver, shared: &Shared, n: u32, seen: &mut Record) {
                         continue;
                     }
                     matched = false;
-                    if x == 0.0 {
+                    if fade {
+                        result.faded += 1;
+                    } else if x == 0.0 {
                         result.silent += 1;
                     } else {
                         result.wrong += 1;

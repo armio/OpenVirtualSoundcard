@@ -302,12 +302,13 @@ fn describe(c: &Cycle) -> String {
     let total = u64::from(c.frames) * c.inputs as u64;
     let mut s = format!(
         "cycle at device time {} (session {}, {} us late): {} of {total} channel-frames \
-         matched, {} silent, {} wrong",
+         matched, {} silent, {} faded, {} wrong",
         c.time,
         c.session,
         c.late_ns / 1000,
         c.matched,
         c.silent,
+        c.faded,
         c.wrong
     );
     if let Some((ch, t, x)) = c.first_wrong {

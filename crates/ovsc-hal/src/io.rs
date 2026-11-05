@@ -69,6 +69,131 @@ const DEFAULT_TX_GUARD_US: u64 = 500;
 /// our time stamps one period off shows up.
 const FAR_MARGIN: i64 = TimelineParams::DEFAULT.period as i64 / 2;
 
+/// The length, in frames, of the gain ramps at the gate's edges (see
+/// `EdgeRamp`): 5 ms, like the sound-card bridge's fade-in after a
+/// realignment.
+pub fn edge_ramp_frames(sample_rate: u32) -> u32 {
+    (sample_rate / 200).max(1)
+}
+
+/// The gain `g` frames into a ramp of `len` frames: `g / len`, from 0
+/// (silence) to 1 (unity, from `g = len` on).
+#[inline]
+pub fn edge_gain(g: u32, len: u32) -> f32 {
+    g.min(len) as f32 / len.max(1) as f32
+}
+
+/// One direction's gain at the gate's edges.
+///
+/// Without it, audio steps from silence to full level when the gate opens
+/// (StartIO, the daemon's engine starting, the clock usable again after a
+/// cable pull or a restart) and from full level to silence when it closes
+/// (stale heartbeat, the engine stopping, coherence lost): a click in the
+/// in-ears and the PA. With it, audio fades in over [`edge_ramp_frames`]
+/// when the gate opens, and when it closes the same ramp fades out what is
+/// at the last open position, which continues what went before, instead of
+/// stopping dead: ReadInput reads it from the RX rings, WriteMix writes the
+/// host's output there as a tail. A fade-out only runs on the attachment the
+/// audio flowed through, and never once the engine is faulted (a faulted
+/// engine is silent at once); audio through a new attachment fades in from
+/// silence. Ramps follow each other without a step: a fade-in that the gate
+/// interrupts fades out from where it got to, and the other way round.
+///
+/// A slip of the ring offset while the gate stays open (a re-lock) is not
+/// crossfaded.
+///
+/// Only the IO thread touches it; atomics because `do_io` takes `&self`.
+struct EdgeRamp {
+    /// Frames into the ramp: 0 is silence, the ramp's length is unity.
+    level: AtomicU32,
+    /// The attachment generation and the ring offset of the last operation
+    /// that moved audio, where a fade-out continues.
+    generation: AtomicU64,
+    off: AtomicI64,
+}
+
+impl EdgeRamp {
+    const fn new() -> Self {
+        Self { level: AtomicU32::new(0), generation: AtomicU64::new(0), off: AtomicI64::new(0) }
+    }
+
+    fn level(&self) -> u32 {
+        self.level.load(Ordering::Relaxed)
+    }
+
+    /// The level an operation from `src` starts at: audio through another
+    /// attachment than the last (a daemon restart) is another stream, and
+    /// fades in from silence.
+    fn start(&self, src: &Source<'_>) -> u32 {
+        if src.open && self.generation.load(Ordering::Relaxed) != src.a.generation {
+            return 0;
+        }
+        self.level()
+    }
+
+    /// Silence, with nothing left to fade out.
+    fn cut(&self) {
+        self.level.store(0, Ordering::Relaxed);
+    }
+
+    /// Where the rest of a fade-out goes while the gate is closed: the last
+    /// open position, if `a` is still the attachment the audio flowed
+    /// through and there is something left to fade.
+    fn tail<'a>(&self, a: Option<&'a Attachment>) -> Option<(&'a Attachment, i64)> {
+        let a = a?;
+        let more = self.level() > 0 && self.generation.load(Ordering::Relaxed) == a.generation;
+        more.then(|| (a, self.off.load(Ordering::Relaxed)))
+    }
+
+    /// Frame `i`'s gain in an operation that starts at `level`, fading in
+    /// (reaching unity at frame `len - level - 1`) or out (reaching 0 at
+    /// frame `level - 1`).
+    #[inline]
+    fn gain(level: u32, i: usize, fading_out: bool, len: u32) -> f32 {
+        let i = u32::try_from(i).unwrap_or(u32::MAX);
+        let g = if fading_out {
+            level.saturating_sub(i).saturating_sub(1)
+        } else {
+            level.saturating_add(i).saturating_add(1)
+        };
+        edge_gain(g, len)
+    }
+
+    /// Scales the first `frames` frames of `buf` (interleaved, `channels`
+    /// per frame) by the ramp, from `level`.
+    fn apply(buf: &mut [f32], channels: usize, frames: usize, level: u32, out: bool, len: u32) {
+        for (i, frame) in buf.chunks_exact_mut(channels.max(1)).take(frames).enumerate() {
+            let g = Self::gain(level, i, out, len);
+            frame.iter_mut().for_each(|x| *x *= g);
+        }
+    }
+
+    /// After an operation of `n` frames that started at `level`: the level
+    /// it ends at and, for audio through the open gate, where it was.
+    fn advance(&self, level: u32, n: usize, open: Option<(u64, i64)>, len: u32) {
+        let n = u32::try_from(n).unwrap_or(u32::MAX);
+        let level = match open {
+            Some((generation, off)) => {
+                self.generation.store(generation, Ordering::Relaxed);
+                self.off.store(off, Ordering::Relaxed);
+                level.min(len).saturating_add(n).min(len)
+            }
+            None => level.saturating_sub(n),
+        };
+        self.level.store(level, Ordering::Relaxed);
+    }
+}
+
+/// Where an IO operation moves audio: the attachment and the ring offset,
+/// and whether that is through the open gate or the rest of a fade-out at
+/// the last open position.
+#[derive(Clone, Copy)]
+struct Source<'a> {
+    a: &'a Attachment,
+    off: i64,
+    open: bool,
+}
+
 /// The timeline tuning for a configuration: the defaults, plus the
 /// configuration's debug jitter.
 fn timeline_params(cfg: &DriverConfig) -> TimelineParams {
@@ -229,6 +354,7 @@ struct IoCounters {
     last_frames: AtomicU64,
     io_heartbeat_ns: AtomicU64,
     frames_capped: AtomicU64,
+    non_finite_out: AtomicU64,
 }
 
 impl IoCounters {
@@ -252,6 +378,7 @@ impl IoCounters {
             last_frames: AtomicU64::new(0),
             io_heartbeat_ns: AtomicU64::new(0),
             frames_capped: AtomicU64::new(0),
+            non_finite_out: AtomicU64::new(0),
         }
     }
 
@@ -284,6 +411,7 @@ impl IoCounters {
         copy(&self.io_heartbeat_ns, &p.io_heartbeat_ns);
         p.faulted.store(u64::from(faulted), Ordering::Relaxed);
         copy(&self.frames_capped, &p.frames_capped);
+        copy(&self.non_finite_out, &p.non_finite_out);
     }
 }
 
@@ -329,6 +457,9 @@ pub struct IoSnapshot {
     pub far_input_cycles: u64,
     /// IO operations longer than `IO_FRAMES_CAP`.
     pub frames_capped: u64,
+    /// Channel-frames of host output that were NaN or infinite, sent as
+    /// silence.
+    pub non_finite_out: u64,
     /// Reads of the clock block that found it contended.
     pub clock_read_failures: u64,
     /// The daemon's TX underruns, 0 when detached.
@@ -365,6 +496,9 @@ pub struct IoEngine {
     io_clients: AtomicU32,
     faulted: AtomicBool,
     counters: IoCounters,
+    /// The gain ramps at the gate's edges, for ReadInput and WriteMix.
+    input_ramp: EdgeRamp,
+    output_ramp: EdgeRamp,
     trace: Trace,
     slot: AttachSlot,
 }
@@ -385,6 +519,8 @@ impl IoEngine {
             io_clients: AtomicU32::new(0),
             faulted: AtomicBool::new(false),
             counters: IoCounters::new(),
+            input_ramp: EdgeRamp::new(),
+            output_ramp: EdgeRamp::new(),
             trace: Trace::new(),
             slot: AttachSlot::new(),
         }
@@ -440,8 +576,8 @@ impl IoEngine {
 
     /// StartIO. The first client prefaults the active rings, restarts the
     /// device time near 0 (as Apple's NullAudio does; the ring offset keeps
-    /// the ring mapping), resets the margin minima and starts an IO trace
-    /// session. Never waits on the daemon.
+    /// the ring mapping), resets the margin minima, starts an IO trace
+    /// session and makes audio fade in. Never waits on the daemon.
     ///
     /// Returns whether this was the first client, so the device's 'goin'
     /// changed.
@@ -450,6 +586,9 @@ impl IoEngine {
             return false;
         }
         self.counters.reset_margins();
+        // The previous session's last position means nothing now.
+        self.input_ramp.cut();
+        self.output_ramp.cut();
         let mut st = self.clocked.lock_spin();
         {
             let guard = self.slot.enter();
@@ -664,6 +803,12 @@ impl IoEngine {
     /// is faulted, input is silence and output is dropped. At most
     /// `IO_FRAMES_CAP` frames move; input beyond that is silence.
     ///
+    /// At the gate's edges audio ramps instead of stepping (see
+    /// `EdgeRamp`): it fades in over the first [`edge_ramp_frames`] once
+    /// the gate opens, and fades out at the last open position over as many
+    /// frames once it closes. Operations that only fade out count as
+    /// silenced.
+    ///
     /// # Safety
     /// `main` must be null or the HAL's buffer for this operation: `frames`
     /// interleaved Float32 frames at the stream's channel count, which is
@@ -687,6 +832,13 @@ impl IoEngine {
         let off = self.off.load(Ordering::Acquire);
         let faulted = self.faulted.load(Ordering::Acquire);
         let open = a.filter(|a| gate != 0 && a.generation == gate && !faulted);
+        let ramp = if input { &self.input_ramp } else { &self.output_ramp };
+        let source = match open {
+            Some(a) => Some(Source { a, off, open: true }),
+            None if !faulted => ramp.tail(a).map(|(a, off)| Source { a, off, open: false }),
+            None => None,
+        };
+        let ramp_len = edge_ramp_frames(self.config.sample_rate.load(Ordering::Relaxed));
         let n = (frames as usize).min(IO_FRAMES_CAP);
         let c = &self.counters;
         if n < frames as usize {
@@ -695,9 +847,9 @@ impl IoEngine {
         // SAFETY: the caller's guarantee for `main`.
         let moved = unsafe {
             if input {
-                self.read_input(open, off, frames, n, cycle, main)
+                self.read_input(source, ramp_len, frames, n, cycle, main)
             } else {
-                self.write_mix(open, off, frames, n, cycle, main)
+                self.write_mix(source, ramp_len, frames, n, cycle, main)
             }
         };
 
@@ -728,42 +880,48 @@ impl IoEngine {
         kAudioHardwareNoError
     }
 
-    /// ReadInput. Returns whether audio was read; if not, the buffer is
-    /// silence.
+    /// ReadInput. Returns whether audio was read through the open gate; if
+    /// not, the buffer is silence, or the rest of a fade-out.
     ///
     /// # Safety
     /// As for [`IoEngine::do_io`].
     unsafe fn read_input(
         &self,
-        open: Option<&Attachment>,
-        off: i64,
+        source: Option<Source<'_>>,
+        ramp_len: u32,
         frames: u32,
         n: usize,
         cycle: &IOCycleInfo,
         main: *mut c_void,
     ) -> bool {
+        let ramp = &self.input_ramp;
         let channels = self.config.input_channels.load(Ordering::Acquire) as usize;
         let len = (frames as usize).saturating_mul(channels);
         if main.is_null() || len == 0 {
+            ramp.cut();
             return false;
         }
         // SAFETY: the HAL's ReadInput buffer holds `frames` frames of
         // `channels` floats (the caller's guarantee).
         let buf = unsafe { slice::from_raw_parts_mut(main.cast::<f32>(), len) };
         let t = cycle.mInputTime.mSampleTime;
-        let Some(a) = open.filter(|_| t.is_finite()) else {
+        let Some(src) = source.filter(|_| t.is_finite()) else {
             buf.fill(0.0);
+            ramp.cut();
             return false;
         };
+        let level = ramp.start(&src);
+        // A fade-out reads only the frames it still has gain for.
+        let n_read = if src.open { n } else { n.min(level as usize) };
         let read_delay = i64::from(self.config.read_delay.load(Ordering::Relaxed));
-        let m0 = (t.floor() as i64).wrapping_add(off).wrapping_sub(read_delay) as u64;
+        let m0 = (t.floor() as i64).wrapping_add(src.off).wrapping_sub(read_delay) as u64;
         let mut missing = 0u64;
         // Channel by channel, so each ring is read in order.
         for ch in 0..channels {
-            let column = buf.iter_mut().skip(ch).step_by(channels).take(n);
-            let Some(ring) = a.view.rx(ch) else {
+            let column = buf.iter_mut().skip(ch).step_by(channels).take(n_read);
+            let Some(ring) = src.a.view.rx(ch) else {
                 column.for_each(|x| *x = 0.0);
-                missing = missing.wrapping_add(n as u64);
+                missing = missing.wrapping_add(n_read as u64);
                 continue;
             };
             let mut m = m0;
@@ -778,47 +936,77 @@ impl IoEngine {
                 m = m.wrapping_add(1);
             }
         }
-        if let Some(rest) = buf.get_mut(n.saturating_mul(channels)..) {
+        if let Some(rest) = buf.get_mut(n_read.saturating_mul(channels)..) {
             rest.fill(0.0);
         }
-        self.counters.input_missing.fetch_add(missing, Ordering::Relaxed);
-        true
+        // Unity once a fade-in is done: the steady state is bit-exact.
+        let ramped = if src.open { n.min(ramp_len.saturating_sub(level) as usize) } else { n_read };
+        if ramped > 0 {
+            EdgeRamp::apply(buf, channels, ramped, level, !src.open, ramp_len);
+        }
+        ramp.advance(level, n, src.open.then_some((src.a.generation, src.off)), ramp_len);
+        if src.open {
+            self.counters.input_missing.fetch_add(missing, Ordering::Relaxed);
+        }
+        src.open
     }
 
-    /// WriteMix. Returns whether audio was written; if not, it is dropped.
+    /// WriteMix. Returns whether audio was written through the open gate;
+    /// if not, it is dropped, but for the rest of a fade-out.
     ///
     /// # Safety
     /// As for [`IoEngine::do_io`].
     unsafe fn write_mix(
         &self,
-        open: Option<&Attachment>,
-        off: i64,
+        source: Option<Source<'_>>,
+        ramp_len: u32,
         frames: u32,
         n: usize,
         cycle: &IOCycleInfo,
         main: *mut c_void,
     ) -> bool {
+        let ramp = &self.output_ramp;
         let channels = self.config.output_channels.load(Ordering::Acquire) as usize;
         let len = (frames as usize).saturating_mul(channels);
         let t = cycle.mOutputTime.mSampleTime;
-        let Some(a) = open.filter(|_| t.is_finite() && !main.is_null() && len > 0) else {
+        let Some(src) = source.filter(|_| t.is_finite() && !main.is_null() && len > 0) else {
+            ramp.cut();
             return false;
         };
         // SAFETY: the HAL's WriteMix buffer holds `frames` frames of
         // `channels` floats (the caller's guarantee).
         let buf = unsafe { slice::from_raw_parts(main.cast::<f32>().cast_const(), len) };
-        let m0 = (t.floor() as i64).wrapping_add(off) as u64;
+        let level = ramp.start(&src);
+        // A fade-out writes only the frames it still has gain for: after
+        // them the TX thread finds no sample and sends silence.
+        let n_write = if src.open { n } else { n.min(level as usize) };
+        let ramped =
+            if src.open { n.min(ramp_len.saturating_sub(level) as usize) } else { n_write };
+        let m0 = (t.floor() as i64).wrapping_add(src.off) as u64;
+        let mut non_finite = 0u64;
         for ch in 0..channels {
-            let Some(ring) = a.view.tx(ch) else {
+            let Some(ring) = src.a.view.tx(ch) else {
                 continue;
             };
             let mut m = m0;
-            for &x in buf.iter().skip(ch).step_by(channels).take(n) {
+            for (i, &x) in buf.iter().skip(ch).step_by(channels).take(n_write).enumerate() {
+                // from_f32 sends it as silence; count it, so that a plug-in
+                // that blew up shows in the status rather than as a mystery
+                // dropout.
+                if !x.is_finite() {
+                    non_finite = non_finite.wrapping_add(1);
+                }
+                let x =
+                    if i < ramped { x * EdgeRamp::gain(level, i, !src.open, ramp_len) } else { x };
                 ring.write_one(m, from_f32(x));
                 m = m.wrapping_add(1);
             }
         }
-        true
+        if non_finite > 0 {
+            self.counters.non_finite_out.fetch_add(non_finite, Ordering::Relaxed);
+        }
+        ramp.advance(level, n, src.open.then_some((src.a.generation, src.off)), ramp_len);
+        src.open
     }
 
     /// The margins of design section 8.3, against the device time at
@@ -911,6 +1099,7 @@ impl IoEngine {
             far_output_cycles: c.far_output_cycles.load(r),
             far_input_cycles: c.far_input_cycles.load(r),
             frames_capped: c.frames_capped.load(r),
+            non_finite_out: c.non_finite_out.load(r),
             clock_read_failures: s.clock_read_failures.load(r),
             tx_underruns: a.map_or(0, |a| a.view.daemon().tx_underruns.load(r)),
             faulted: self.faulted.load(Ordering::Acquire),
@@ -1210,12 +1399,17 @@ mod tests {
         for c in 0..8 {
             v.rx(c).unwrap().write(off as u64 + 100, &[c as i32 * 256, -(c as i32) * 256 - 256]);
         }
+        // The gate has just opened, so these are the first frames of the
+        // fade-in.
+        let ramp = edge_ramp_frames(48_000);
+        assert_eq!(ramp, 240);
+        let gain = |i: usize| edge_gain(i as u32 + 1, ramp);
         let mut buf = vec![9.0f32; 8 * 4];
         let op = kAudioServerPlugInIOOperationReadInput;
         assert_eq!(unsafe { io.do_io(3, op, 4, &cycle, buf.as_mut_ptr().cast()) }, 0);
         for c in 0..8 {
-            assert_eq!(buf[c], to_f32(c as i32 * 256));
-            assert_eq!(buf[8 + c], to_f32(-(c as i32) * 256 - 256));
+            assert_eq!(buf[c], to_f32(c as i32 * 256) * gain(0));
+            assert_eq!(buf[8 + c], to_f32(-(c as i32) * 256 - 256) * gain(1));
             assert_eq!((buf[16 + c], buf[24 + c]), (0.0, 0.0));
         }
         assert_eq!(io.snapshot().input_missing, 16);
@@ -1226,7 +1420,7 @@ mod tests {
         for c in 0..8 {
             for i in 0..4 {
                 let got = v.tx(c).unwrap().read_one(off as u64 + 300 + i as u64);
-                assert_eq!(got, Some(from_f32(mix[i * 8 + c])));
+                assert_eq!(got, Some(from_f32(mix[i * 8 + c] * gain(i))));
             }
         }
         // Non-finite times: silence, nothing written.
