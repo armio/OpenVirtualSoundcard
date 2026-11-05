@@ -495,7 +495,10 @@ impl Capture {
         if steer.is_discontinuous() {
             let before = self.w;
             self.shift(steer.shift, steer.ratio);
-            if let Some(now) = now {
+            // Only audio this stream just wrote needs ramping down: while
+            // muted (settling) it writes nothing, and its position may lie
+            // in older audio still in the ring.
+            if let (Some(now), true) = (now, self.timing.audible()) {
                 // The transmitter hasn't sent the newest samples yet: ramp
                 // them down instead of ending in a cut. Moving back, the
                 // samples from the new position on get overwritten anyway.
@@ -1159,6 +1162,41 @@ mod tests {
         assert!((run.stats.latency_ms - base).abs() < 1e-9, "{:?}", run.stats);
         assert_eq!(run.stats.realigns, 2, "{:?}", run.stats);
         assert!(clicks(run.from(1.0)) <= 1, "{} clicks", clicks(run.from(1.0)));
+    }
+
+    #[test]
+    fn capture_fades_out_once_when_it_realigns() {
+        // Before the loop locks, the media clock steps back 100 ms: the
+        // stream realigns 100 ms back and settles. Only the audio written
+        // just before the break ramps down; the settling callbacks, whose
+        // positions now lie in that older audio, must leave it alone (each
+        // used to ramp the 2 ms before its position down, a click per
+        // callback in audio the transmitter sends again after the step).
+        let ring = Arc::new(TimedRing::new(1 << 15));
+        let stats = Arc::new(StatsCell::new());
+        let mut capture = Capture::new(RATE, 24, vec![Some(ring.clone())], 48, LEAD, stats);
+        let input = vec![0.5f32; 128];
+        let step = 4800.0;
+        let at =
+            |i: u64, back: f64| (EPOCH_NS + ((i * 128) as f64 - back) / RATE as f64 * NS) as u64;
+        let mut i = 0;
+        while i * 128 < RATE as u64 {
+            capture.process(Some(at(i, 0.0)), &input);
+            i += 1;
+        }
+        assert!(capture.timing.controller.running() && !capture.timing.controller.locked());
+        let end = capture.w;
+        let span = end - step as u64..end;
+        let level = |ts: u64| ring.read_one(ts).map_or(0.0, |s| s as f64 / 2_147_483_648.0);
+        assert!(span.clone().all(|ts| (level(ts) - 0.5).abs() < 1e-3), "not written");
+        for k in 0..10 {
+            capture.process(Some(at(i + k, step)), &input);
+            assert!(!capture.timing.controller.running());
+        }
+        let tail = (FADE_OUT_SECONDS * RATE as f64) as u64;
+        let changed: Vec<u64> = span.filter(|&ts| (level(ts) - 0.5).abs() > 1e-3).collect();
+        assert!(changed.iter().all(|&ts| ts >= end - tail), "faded at {changed:?}");
+        assert_eq!(changed.len() as u64, tail, "the end ramps down once");
     }
 
     /// A playback scenario: a 997 Hz sine at 0.5 received in 48-sample
