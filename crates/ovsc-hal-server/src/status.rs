@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use tokio::time::MissedTickBehavior;
 use tracing::info;
 
+use ovsc_clock::local_now_ns;
 use ovsc_shm::layout::{IO_TRACE_ENTRIES, RegionRef};
 use ovsc_shm::status::{
     IoTraceEntry, PluginStatus, REGIME_FOLLOWING, REGIME_HOLDOVER, REGIME_SYNTHETIC,
@@ -49,16 +50,36 @@ pub struct HalStatus {
     pub early_input_cycles: u64,
     /// IO operations the gate silenced.
     pub silenced_cycles: u64,
-    /// Input channel-frames that had no sample.
+    /// Input channel-frames that had no sample. Every channel counts,
+    /// subscribed or not, so it grows with an unsubscribed channel too: it
+    /// is no measure of trouble.
     pub input_missing: u64,
     /// Packets the device sent with a channel the driver had not filled.
+    /// Grows whenever no application plays through the device.
     pub tx_underruns: u64,
-    /// Smallest output margin since IO started, in frames.
+    /// Smallest output margin since IO started, in frames (`i64::MAX`
+    /// before the first output cycle).
     pub min_output_margin: i64,
-    /// Smallest input margin since IO started, in frames.
+    /// Smallest input margin since IO started, in frames (`i64::MAX`
+    /// before the first input cycle).
     pub min_input_margin: i64,
-    /// Whether the driver caught a panic and went silent.
+    /// Channel-frames of host output that were NaN or infinite and went out
+    /// as silence: a plug-in in the host blowing up.
+    pub non_finite_out: u64,
+    /// How long ago the driver's IO thread last finished an operation, by
+    /// the host clock both sides share (`ovsc_clock::local_now_ns`); `None`
+    /// if it never did with this region attached. Only meaningful while
+    /// `io_clients > 0`: it grows while IO is stopped.
+    pub io_heartbeat_age: Option<Duration>,
+    /// Whether the driver caught a panic and went silent. Written with the
+    /// IO counters, so only by a driver doing IO: a driver loaded since
+    /// (Core Audio restarted) leaves its predecessor's value until its own
+    /// IO starts.
     pub faulted: bool,
+    /// The random id of the driver instance that last wrote its status
+    /// (plug-in status line 2, on attach and at IO start and stop): a new
+    /// one means Core Audio loaded the driver again. 0 before any.
+    pub plugin_instance: u64,
 }
 
 impl HalStatus {
@@ -70,8 +91,22 @@ impl HalStatus {
         engine_running: bool,
         config_gen: u64,
     ) -> Self {
+        Self::read_at(view, peers, engine_running, config_gen, local_now_ns())
+    }
+
+    /// [`HalStatus::read`] at host time `now_ns`.
+    fn read_at(
+        view: RegionRef<'_>,
+        peers: usize,
+        engine_running: bool,
+        config_gen: u64,
+        now_ns: u64,
+    ) -> Self {
         let p: &PluginStatus = view.plugin();
         let get = |w: &std::sync::atomic::AtomicU64| w.load(Ordering::Relaxed);
+        // The driver stamps its IO operations with mach_absolute_time in
+        // ns, the clock local_now_ns reads on macOS (CLOCK_UPTIME_RAW).
+        let heartbeat = get(&p.io_heartbeat_ns);
         Self {
             peers,
             engine_running,
@@ -88,7 +123,11 @@ impl HalStatus {
             tx_underruns: get(&view.daemon().tx_underruns),
             min_output_margin: get(&p.min_output_margin) as i64,
             min_input_margin: get(&p.min_input_margin) as i64,
+            non_finite_out: get(&p.non_finite_out),
+            io_heartbeat_age: (heartbeat != 0)
+                .then(|| Duration::from_nanos(now_ns.saturating_sub(heartbeat))),
             faulted: get(&p.faulted) != 0,
+            plugin_instance: get(&p.plugin_instance),
         }
     }
 }
@@ -113,6 +152,9 @@ impl fmt::Display for HalStatus {
             self.min_output_margin,
             self.min_input_margin,
         )?;
+        if self.non_finite_out != 0 {
+            write!(f, " non_finite_out={}", self.non_finite_out)?;
+        }
         if !self.engine_running {
             f.write_str(" engine=stopped")?;
         }
@@ -247,9 +289,31 @@ mod tests {
             "peers=1 io=2 gate=1 regime=following absorbs=1 seed=3 late_out=0 early_in=0 \
              silenced=0 in_missing=0 tx_underruns=4 min_out_margin=-5 min_in_margin=0"
         );
+        // No IO operation yet: no heartbeat to age.
+        assert_eq!(s.io_heartbeat_age, None);
+        p.plugin_instance.store(0xfeed, Ordering::Relaxed);
+        assert_eq!(HalStatus::read(r.view(), 1, true, 9).plugin_instance, 0xfeed);
         p.faulted.store(1, Ordering::Relaxed);
+        p.non_finite_out.store(48, Ordering::Relaxed);
         let s = HalStatus::read(r.view(), 0, false, 9);
-        assert!(s.to_string().ends_with(" engine=stopped faulted=1"));
+        assert!(s.to_string().ends_with(" non_finite_out=48 engine=stopped faulted=1"), "{s}");
+        assert_eq!(s.non_finite_out, 48);
+    }
+
+    #[test]
+    fn the_io_heartbeat_ages_by_the_shared_host_clock() {
+        let r = HalRegion::create("test").unwrap();
+        let p = r.view().plugin();
+        p.io_heartbeat_ns.store(5_000_000_000, Ordering::Relaxed);
+        let s = HalStatus::read_at(r.view(), 1, true, 1, 5_250_000_000);
+        assert_eq!(s.io_heartbeat_age, Some(Duration::from_millis(250)));
+        // A heartbeat from the future (another clock) reads as fresh.
+        let s = HalStatus::read_at(r.view(), 1, true, 1, 4_000_000_000);
+        assert_eq!(s.io_heartbeat_age, Some(Duration::ZERO));
+        // The live reading uses the clock the driver stamps with.
+        p.io_heartbeat_ns.store(local_now_ns(), Ordering::Relaxed);
+        let age = HalStatus::read(r.view(), 1, true, 1).io_heartbeat_age.unwrap();
+        assert!(age < Duration::from_secs(5), "{age:?}");
     }
 
     #[test]
