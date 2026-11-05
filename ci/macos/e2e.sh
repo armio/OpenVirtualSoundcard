@@ -13,7 +13,7 @@
 # Each scenario prints PASS or FAIL; the last line is an E2E-SUMMARY. The
 # script exits 1 if any scenario failed.
 # Scenario functions are called indirectly, by name.
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
