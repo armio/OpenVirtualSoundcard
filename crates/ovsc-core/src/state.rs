@@ -1,7 +1,10 @@
 //! Mutable device state shared by the servers, and change notification.
 
+use std::collections::VecDeque;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::SystemTime;
 
 use tokio::sync::{mpsc, watch};
 
@@ -42,6 +45,16 @@ pub struct State {
     /// ([`DeviceInfo::latency_ns`]); a new one takes effect when the device
     /// restarts, which [`Shared::latency_requests`] asks for.
     pub latency_override_ns: Option<u32>,
+    /// The show lock: while it is on, controllers may not change the
+    /// latency, the sample rate or the encoding, which interrupt audio both
+    /// ways, nor the device or channel names, which other devices'
+    /// subscriptions depend on. Subscriptions stay open, and the app's
+    /// changes still apply. See [`Shared::lock_remote_settings`].
+    pub remote_settings_locked: bool,
+    /// The lock as the app last set it, saved with the state so that it
+    /// survives restarts; `None` until then, when the configuration's
+    /// `lock_remote_settings` applies.
+    pub remote_settings_lock_set: Option<bool>,
 }
 
 impl State {
@@ -85,6 +98,48 @@ pub struct FlowStats {
     pub late_packets: AtomicU64,
 }
 
+/// A change a controller made, or tried to make, to a setting that
+/// interrupts audio or that other devices depend on: the latency, the sample
+/// rate, the encoding or a name. Kept so that the app can show who did what
+/// once the audio dropped, or why a controller's change did not take.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteChange {
+    /// When, by the system clock.
+    pub at: SystemTime,
+    /// The controller's address.
+    pub from: SocketAddr,
+    /// What it asked for, in words: "the receive latency to 2 ms".
+    pub what: String,
+    /// Whether it was refused because remote settings are locked.
+    pub refused: bool,
+}
+
+/// The last few [`RemoteChange`]s, oldest first. Clones share the log: a
+/// daemon hands it to the device it restarts
+/// ([`crate::StartOptions::remote_changes`]), so that a latency change that
+/// restarted the device is still listed afterwards.
+#[derive(Clone, Debug, Default)]
+pub struct RemoteChanges(Arc<Mutex<VecDeque<RemoteChange>>>);
+
+impl RemoteChanges {
+    /// How many changes the log keeps.
+    pub const KEPT: usize = 8;
+
+    /// Adds `change`, dropping the oldest beyond [`RemoteChanges::KEPT`].
+    pub fn push(&self, change: RemoteChange) {
+        let mut log = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if log.len() == Self::KEPT {
+            log.pop_front();
+        }
+        log.push_back(change);
+    }
+
+    /// The changes kept, oldest first.
+    pub fn recent(&self) -> Vec<RemoteChange> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect()
+    }
+}
+
 /// A sample rate or bit depth that a controller asked for, applied when the
 /// device next starts; see [`Shared::request_format`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -113,6 +168,8 @@ pub struct Shared {
     pub format_configurable: bool,
     /// The latest format asked for; see [`Shared::request_format`].
     format_request: watch::Sender<FormatRequest>,
+    /// What controllers changed or tried to change; see [`RemoteChange`].
+    pub remote_changes: RemoteChanges,
 }
 
 impl Shared {
@@ -126,6 +183,7 @@ impl Shared {
         ring_capacity: usize,
         rings: Option<ExternalRings>,
         format_configurable: bool,
+        remote_changes: RemoteChanges,
     ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<Notify>)> {
         let (rx_rings, tx_rings) = match rings {
             Some(r) => {
@@ -151,6 +209,7 @@ impl Shared {
             latency_request: watch::channel(None).0,
             format_configurable,
             format_request: watch::channel(FormatRequest::default()).0,
+            remote_changes,
         });
         Ok((shared, notify_rx))
     }
@@ -226,6 +285,27 @@ impl Shared {
     /// The format asked for and not applied yet.
     pub fn pending_format(&self) -> FormatRequest {
         *self.format_request.borrow()
+    }
+
+    /// Whether the show lock is on: see [`State::remote_settings_locked`].
+    pub fn remote_settings_locked(&self) -> bool {
+        self.state().remote_settings_locked
+    }
+
+    /// Turns the show lock on or off, and saves that with the state: from
+    /// then on it replaces the configuration's `lock_remote_settings`. Only
+    /// the device's owner (the app) calls this; controllers cannot.
+    pub fn lock_remote_settings(&self, locked: bool) {
+        self.modify(|s| {
+            s.remote_settings_locked = locked;
+            s.remote_settings_lock_set = Some(locked);
+        });
+    }
+
+    /// Notes a controller's change, or refused attempt, in
+    /// [`Shared::remote_changes`].
+    pub fn record_remote_change(&self, from: SocketAddr, what: String, refused: bool) {
+        self.remote_changes.push(RemoteChange { at: SystemTime::now(), from, what, refused });
     }
 
     /// Subscribes to [`Shared::modify`] notifications.

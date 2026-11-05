@@ -35,7 +35,7 @@ pub use device::{
 };
 pub use info::DeviceInfo;
 pub use persist::SavedState;
-pub use state::FormatRequest;
+pub use state::{FormatRequest, RemoteChange, RemoteChanges};
 
 /// Errors of the device engine.
 #[derive(Debug, thiserror::Error)]
