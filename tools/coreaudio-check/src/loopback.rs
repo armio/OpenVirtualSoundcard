@@ -23,6 +23,7 @@ pub const OPTIONS: &[&str] = &[
     "--expect-rate-ppm",
     "--rate-tol-ppm",
     "--allow-outage",
+    "--allow-missing",
     "--expect-silent-input",
     "--snapshot-prop",
 ];
@@ -39,6 +40,9 @@ struct Options {
     expect_rate_ppm: Option<f64>,
     rate_tol_ppm: f64,
     allow_outage: Option<f64>,
+    /// More bad frames per channel, if they are silence the device itself
+    /// counted as missing input (OpenVirtualSoundcard's `in_missing`).
+    allow_missing: u64,
     expect_silent_input: bool,
     snapshot_prop: Option<u32>,
 }
@@ -62,6 +66,7 @@ impl Options {
             expect_rate_ppm: a.get("--expect-rate-ppm")?,
             rate_tol_ppm: a.get("--rate-tol-ppm")?.unwrap_or(5.0),
             allow_outage: a.get("--allow-outage")?,
+            allow_missing: a.get("--allow-missing")?.unwrap_or(0),
             expect_silent_input: a.switch("--expect-silent-input"),
             snapshot_prop,
         })
@@ -262,6 +267,16 @@ pub fn run(a: &Args) -> Result<i32, String> {
         n_cycles: AtomicUsize::new(0),
     });
 
+    // The input frames the device had no sample for, by its own count, which
+    // --allow-missing needs before and after the run.
+    let in_missing = || analysis::status_counter(&status_string(d), "in_missing");
+    let missing_before = if o.allow_missing > 0 { in_missing() } else { None };
+    if o.allow_missing > 0 && missing_before.is_none() {
+        println!(
+            "--allow-missing: the device's status has no in_missing count, so it allows nothing"
+        );
+    }
+
     let mut proc_id: AudioDeviceIOProcID = None;
     let client = &mut *session as *mut Session as *mut c_void;
     let s = unsafe { AudioDeviceCreateIOProcID(d, io_proc, client, &mut proc_id) };
@@ -295,6 +310,7 @@ pub fn run(a: &Args) -> Result<i32, String> {
     if let Some(prop) = o.snapshot_prop {
         snapshot(d, prop, "at end");
     }
+    let missing_counted = missing_before.and_then(|before| in_missing()?.checked_sub(before));
     let wall = started.elapsed().as_secs_f64();
     let captured = session.captured.load(Ordering::Acquire);
     let n_cycles = session.n_cycles.load(Ordering::Acquire);
@@ -417,11 +433,21 @@ pub fn run(a: &Args) -> Result<i32, String> {
         if jumps > 0 {
             println!("allowing for the jumps: up to {allowed_bad} bad frames per channel");
         }
+        if let Some(counted) = missing_counted.filter(|_| o.allow_missing > 0) {
+            println!(
+                "allowing up to {} more bad frames per channel as silence the device counted \
+                 missing: it counted {counted} input frames missing over the run",
+                o.allow_missing
+            );
+        }
         let period = i64::from(zts_period);
         let mut reports: Vec<ChannelReport> = Vec::new();
         let mut device_hist: BTreeMap<i64, u64> = BTreeMap::new();
         let (mut stale_frames, mut misplaced_frames) = (0, 0);
         let (mut slips, mut host_changes) = (0, 0);
+        // Bad frames beyond the other allowances that the device counted
+        // missing, over all channels.
+        let mut excused = 0;
         for c in 0..channels {
             let r = analysis::analyze(c, c, send_frames, &received(c));
             let hist = analysis::device_delays(&r.samples, &in_map, &out_map);
@@ -512,7 +538,26 @@ pub fn run(a: &Args) -> Result<i32, String> {
                     }
                 }
                 if bad > allowed_bad {
-                    failures.push(format!("input {c}: {bad} bad frames (max {allowed_bad})"));
+                    // Silence where the device had no sample to read: input
+                    // that arrived too late, by its own count, rather than
+                    // audio it lost or misplaced. The counts are checked
+                    // against each other below.
+                    let excess = bad - allowed_bad;
+                    if missing_counted.is_some()
+                        && excess <= o.allow_missing
+                        && r.zeros == r.mismatched
+                    {
+                        excused += excess;
+                    } else if o.allow_missing > 0 {
+                        failures.push(format!(
+                            "input {c}: {bad} bad frames (max {allowed_bad}, or {} if all are \
+                             silence the device counted missing; {} are silence)",
+                            allowed_bad + o.allow_missing,
+                            r.zeros
+                        ));
+                    } else {
+                        failures.push(format!("input {c}: {bad} bad frames (max {allowed_bad})"));
+                    }
                 }
                 if changes.slips > allowed_slips {
                     failures
@@ -527,6 +572,19 @@ pub fn run(a: &Args) -> Result<i32, String> {
         let delays: Vec<Option<i64>> = reports.iter().map(|r| r.delay).collect();
         if outage_frames.is_none() && delays.windows(2).any(|w| w[0] != w[1]) {
             failures.push(format!("channels came back with different delays: {delays:?}"));
+        }
+        if excused > 0 {
+            let counted = missing_counted.unwrap_or(0);
+            println!(
+                "{excused} bad frames beyond the other allowances, all silence, against \
+                 {counted} input frames the device counted missing"
+            );
+            if excused > counted {
+                failures.push(format!(
+                    "{excused} silent bad frames beyond the other allowances, but the device \
+                     counted only {counted} input frames missing"
+                ));
+            }
         }
         println!("device-time delay over all channels: {device_hist:?}");
         if let Some(want) = o.expect_device_delay {
@@ -559,6 +617,9 @@ pub fn run(a: &Args) -> Result<i32, String> {
         result.insert("slips", slips.to_string());
         result.insert("host_changes", host_changes.to_string());
         result.insert("runs", reports.iter().map(|r| r.bad_runs.len()).sum::<usize>().to_string());
+        if let Some(counted) = missing_counted {
+            result.insert("in_missing", counted.to_string());
+        }
     }
 
     let pass = failures.is_empty();

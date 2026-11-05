@@ -358,6 +358,12 @@ impl DeviceTime<'_> {
     }
 }
 
+/// The number `key` has in a status line of `key=value` words, such as
+/// OpenVirtualSoundcard's (`ovst`).
+pub fn status_counter(status: &str, key: &str) -> Option<u64> {
+    status.split_whitespace().find_map(|w| w.strip_prefix(key)?.strip_prefix('=')?.parse().ok())
+}
+
 /// True when every captured sample is exactly zero.
 pub fn is_silent(received: &[f32]) -> bool {
     received.iter().all(|&x| x == 0.0)
@@ -725,6 +731,16 @@ mod tests {
         assert_eq!(input.cycle_of(19 * 512 + 3), Some((19 * 512, 512, 10_000.0 + 19.0 * 512.0)));
         assert_eq!(input.cycle_of(20 * 512), Some((20 * 512, 512, 11_000.0 + 20.0 * 512.0)));
         assert_eq!(input.cycle_of(60 * 512), None);
+    }
+
+    #[test]
+    fn counters_from_a_status_line() {
+        let s = "daemon=attached clock=following missing=3 in_missing=6488 tx_underruns=x";
+        assert_eq!(status_counter(s, "in_missing"), Some(6488));
+        assert_eq!(status_counter(s, "missing"), Some(3));
+        assert_eq!(status_counter(s, "tx_underruns"), None);
+        assert_eq!(status_counter(s, "late_out"), None);
+        assert_eq!(status_counter("error 'who?'", "in_missing"), None);
     }
 
     #[test]
