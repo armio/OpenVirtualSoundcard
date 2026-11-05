@@ -42,7 +42,7 @@ pub struct Device {
     /// Closes once the receive manager and all its threads have exited (see
     /// [`RxManager::new`]).
     rx_threads: mpsc::Receiver<()>,
-    tx_commands: std::sync::mpsc::Sender<TxCommand>,
+    tx_commands: std::sync::mpsc::SyncSender<TxCommand>,
     tx_thread: Option<std::thread::JoinHandle<()>>,
     /// Forgets samples in the rings whose writer stopped, before their
     /// 32-bit tags could match again (see [`Sweeper`]).

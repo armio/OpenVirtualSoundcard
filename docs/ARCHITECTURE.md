@@ -101,7 +101,10 @@ and drains keepalives. Flows without keepalives for 4 s expire.
   the manager replaces whole. It then publishes per-channel status for ARC.
 * **Flow-control server** validates requests (rate, bit depth, channel ids,
   packet size), allocates flow ids and handles, and hands flows to the
-  transmit thread.
+  transmit thread. Every 100 ms it takes back the flows and channel lists
+  the thread is done with, and removes the flows the thread found silent,
+  so that the thread never allocates, frees, closes a socket or wakes a
+  task.
 
 ## System sound card
 

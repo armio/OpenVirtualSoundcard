@@ -6,11 +6,11 @@
 //! guard keeps receivers from seeing timestamps from their future when our
 //! clock runs slightly ahead of theirs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket as StdUdpSocket};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::time::Duration;
 
@@ -49,12 +49,26 @@ const BACKWARD_STEP_NS: u64 = 100_000_000;
 /// How often the flow-control task reports what the transmit thread
 /// counted. The thread itself never logs: a log write can block it.
 const REPORT_INTERVAL: Duration = Duration::from_secs(5);
+/// How often flow control looks for the flows the transmit thread found
+/// silent ([`Expiries`]) and takes back what the thread is done with
+/// ([`Retired`]). The thread tells it neither through a channel that wakes
+/// a task: that can allocate, and takes the runtime's lock. Next to
+/// `KEEPALIVE_TIMEOUT_NS`, the delay is nothing.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// Commands the transmit thread's queue holds: a removal and an addition
+/// for every flow. Flow control keeps any more until there is room.
+const COMMAND_QUEUE: usize = 2 * MAX_TX_FLOWS;
+/// The most flows and channel lists flow control has handed to the
+/// transmit thread and not had back: every flow the thread can run, and as
+/// many again on their way in or out. The queue that hands them back holds
+/// as many, so that the thread never finds it full.
+const IN_FLIGHT_MAX: usize = 2 * MAX_TX_FLOWS;
 
 pub enum TxCommand {
     Add(TxFlow),
     Remove(u16),
     /// New channels for flow `id`, promised to its receiver as
-    /// `generation` (see [`TxEvent::Expired`]).
+    /// `generation` (see [`Expiries`]).
     SetChannels {
         id: u16,
         channels: Vec<Option<usize>>,
@@ -64,14 +78,62 @@ pub enum TxCommand {
 }
 
 pub enum TxEvent {
-    /// Flow `id` heard nothing from its receiver for `KEEPALIVE_TIMEOUT_NS`
-    /// and stopped sending. `generation` is the promise to the receiver that
-    /// expired: flow control removes the flow only if it has not promised
-    /// it again (or replaced it) since, because a later promise revives the
-    /// flow in the transmit thread.
-    Expired { id: u16, generation: u32 },
     /// The transmit thread panicked and stopped: no flow sends any more.
     Failed,
+}
+
+/// What the transmit thread is done with: a flow removed or replaced, or
+/// the channel list a flow had before an update (or an update for a flow it
+/// no longer has). It hands them back to flow control, which drops them:
+/// dropping a flow closes its socket and frees memory, which must not
+/// happen on the thread.
+enum Retired {
+    // Never read: held only to be dropped where that does no harm.
+    #[allow(dead_code)]
+    Flow(TxFlow),
+    #[allow(dead_code)]
+    Channels(Vec<Option<usize>>),
+}
+
+/// Per flow id, the latest promise (generation) of a flow that the transmit
+/// thread found silent for `KEEPALIVE_TIMEOUT_NS`, for flow control to
+/// poll. The flow stops sending; flow control removes it only if it has
+/// not promised it again (or replaced it) since, because a later promise
+/// revives the flow in the thread. A store is all the thread does.
+pub struct Expiries([AtomicU64; MAX_TX_FLOWS]);
+
+/// Marks an [`Expiries`] slot that holds a generation (which can be 0).
+const EXPIRED: u64 = 1 << 32;
+
+impl Expiries {
+    fn new() -> Self {
+        Self(std::array::from_fn(|_| AtomicU64::new(0)))
+    }
+
+    /// Notes that flow `id` expired at `generation`. This replaces an
+    /// earlier expiry of the same id that flow control has not taken yet,
+    /// which a later promise made stale.
+    fn report(&self, id: u16, generation: u32) {
+        if let Some(slot) = usize::from(id).checked_sub(1).and_then(|i| self.0.get(i)) {
+            slot.store(EXPIRED | u64::from(generation), Ordering::Release);
+        }
+    }
+
+    /// The expiries reported since the last call, as (id, generation).
+    fn take(&self) -> impl Iterator<Item = (u16, u32)> + '_ {
+        self.0.iter().zip(1u16..).filter_map(|(slot, id)| {
+            let value = slot.swap(0, Ordering::Acquire);
+            (value & EXPIRED != 0).then_some((id, value as u32))
+        })
+    }
+}
+
+/// Flow control's end of what the transmit thread reports back: see
+/// [`spawn_engine`] and [`FlowControl::run`].
+pub struct TxLink {
+    events: mpsc::UnboundedReceiver<TxEvent>,
+    retired: std_mpsc::Receiver<Retired>,
+    expiries: Arc<Expiries>,
 }
 
 /// A flow as owned by the transmit thread.
@@ -122,16 +184,30 @@ impl TxFlow {
 }
 
 /// Starts the transmit thread.
+///
+/// Its command queue and the queue that hands flows back are bounded
+/// (`std::sync::mpsc::sync_channel`): their buffers are allocated here, and
+/// taking from or adding to them neither allocates nor frees, nor locks
+/// while nobody blocks on them. Flow control never does (`try_send`); a
+/// blocking send to the command queue, as for [`TxCommand::Shutdown`],
+/// waits at most until the thread's next wake.
 pub fn spawn_engine(
     shared: Arc<Shared>,
-) -> (std_mpsc::Sender<TxCommand>, mpsc::UnboundedReceiver<TxEvent>, std::thread::JoinHandle<()>) {
-    let (cmd_tx, cmd_rx) = std_mpsc::channel();
+) -> (std_mpsc::SyncSender<TxCommand>, TxLink, std::thread::JoinHandle<()>) {
+    let (cmd_tx, cmd_rx) = std_mpsc::sync_channel(COMMAND_QUEUE);
+    let (retired_tx, retired_rx) = std_mpsc::sync_channel(IN_FLIGHT_MAX);
     let (ev_tx, ev_rx) = mpsc::unbounded_channel();
+    let expiries = Arc::new(Expiries::new());
+    let thread_expiries = expiries.clone();
     let thread = std::thread::Builder::new()
         .name("ovsc-tx".into())
-        .spawn(move || supervise(&shared.counters, &ev_tx, || engine(&shared, cmd_rx, &ev_tx)))
+        .spawn(move || {
+            supervise(&shared.counters, &ev_tx, || {
+                engine(&shared, cmd_rx, &retired_tx, &thread_expiries)
+            })
+        })
         .expect("spawn transmit thread");
-    (cmd_tx, ev_rx, thread)
+    (cmd_tx, TxLink { events: ev_rx, retired: retired_rx, expiries }, thread)
 }
 
 /// Runs the transmit thread's `body` and reports a panic in it, which would
@@ -201,10 +277,19 @@ fn plan(now: u64, next: Option<u64>, guard: u64, fpp: u64, window: u64, backward
     Plan { first, count, skipped, restarted }
 }
 
+/// Hands `value` back to flow control, from the transmit thread.
+fn retire(retired: &std_mpsc::SyncSender<Retired>, value: Retired) {
+    // The queue is never full: flow control keeps no more values out than
+    // it holds (IN_FLIGHT_MAX). Only once flow control has gone, with the
+    // device, does this fail, and the value is dropped here then.
+    let _ = retired.try_send(value);
+}
+
 fn engine(
     shared: &Shared,
     commands: std_mpsc::Receiver<TxCommand>,
-    events: &mpsc::UnboundedSender<TxEvent>,
+    retired: &std_mpsc::SyncSender<Retired>,
+    expiries: &Expiries,
 ) {
     let counters = &*shared.counters;
     let realtime = crate::rt::raise_priority("transmit", crate::rt::RtClass::Transmit);
@@ -213,7 +298,8 @@ fn engine(
     let guard = ns_to_samples(shared.info.tx_guard_ns, rate);
     let window = catch_up_window(shared.info.latency_samples, rate);
     let backward = ns_to_samples(BACKWARD_STEP_NS, rate);
-    let mut flows: Vec<TxFlow> = Vec::new();
+    // Room for every flow from the start: growing would allocate.
+    let mut flows: Vec<TxFlow> = Vec::with_capacity(MAX_TX_FLOWS);
     let mut packet = vec![0u8; MAX_DATAGRAM];
     let mut scratch = [0u8; 64];
     // Local time (ovsc_clock::local_now_ns) of the next wake-up.
@@ -221,6 +307,10 @@ fn engine(
 
     // Nothing in this loop logs: a log write is file I/O that can block
     // every flow. Problems go to `counters`, which flow control reports.
+    // Nor does anything in it allocate, free, close a socket or wake a
+    // task, any of which can wait on a lock held by a thread without
+    // real-time priority: what the thread is done with goes back to flow
+    // control (`retire`), and the flows it finds silent go to `expiries`.
     loop {
         // Every turn blocks here until the next packet is due, at most
         // MAX_WAIT_NS. The thread must keep blocking: XNU demotes a
@@ -228,21 +318,35 @@ fn engine(
         crate::rt::sleep_until(wake_ns);
         loop {
             match commands.try_recv() {
-                Ok(TxCommand::Add(flow)) => {
-                    flows.retain(|f| f.id != flow.id);
-                    flows.push(flow);
+                Ok(TxCommand::Add(flow)) => match flows.iter().position(|f| f.id == flow.id) {
+                    Some(i) => {
+                        let old = std::mem::replace(&mut flows[i], flow);
+                        retire(retired, Retired::Flow(old));
+                    }
+                    None if flows.len() < flows.capacity() => flows.push(flow),
+                    // Flow control runs at most MAX_TX_FLOWS flows, so this
+                    // does not happen; growing `flows` would allocate.
+                    None => retire(retired, Retired::Flow(flow)),
+                },
+                Ok(TxCommand::Remove(id)) => {
+                    if let Some(i) = flows.iter().position(|f| f.id == id) {
+                        retire(retired, Retired::Flow(flows.remove(i)));
+                    }
                 }
-                Ok(TxCommand::Remove(id)) => flows.retain(|f| f.id != id),
                 Ok(TxCommand::SetChannels { id, channels, generation }) => {
-                    if let Some(f) = flows.iter_mut().find(|f| f.id == id) {
-                        f.channels = channels;
-                        f.generation = generation;
-                        // Promised to the receiver again. This revives a
-                        // flow this thread found silent after flow control
-                        // made the promise, and flow control then ignores
-                        // the expiry as stale.
-                        f.last_heard_ns = local_now_ns();
-                        f.expired = false;
+                    match flows.iter_mut().find(|f| f.id == id) {
+                        Some(f) => {
+                            let old = std::mem::replace(&mut f.channels, channels);
+                            retire(retired, Retired::Channels(old));
+                            f.generation = generation;
+                            // Promised to the receiver again. This revives
+                            // a flow this thread found silent after flow
+                            // control made the promise, and flow control
+                            // then ignores the expiry as stale.
+                            f.last_heard_ns = local_now_ns();
+                            f.expired = false;
+                        }
+                        None => retire(retired, Retired::Channels(channels)),
                     }
                 }
                 Ok(TxCommand::Shutdown) | Err(std_mpsc::TryRecvError::Disconnected) => return,
@@ -274,7 +378,7 @@ fn engine(
             }
             if flow.unicast && local.saturating_sub(flow.last_heard_ns) > KEEPALIVE_TIMEOUT_NS {
                 flow.expired = true;
-                let _ = events.send(TxEvent::Expired { id: flow.id, generation: flow.generation });
+                expiries.report(flow.id, flow.generation);
                 continue;
             }
 
@@ -438,7 +542,7 @@ impl TxHealth {
 struct ServerFlow {
     cookie: u32,
     /// The latest promise of this flow to its receiver: a new flow, a
-    /// channel update or a re-request (see [`TxEvent::Expired`]).
+    /// channel update or a re-request (see [`Expiries`]).
     generation: u32,
     dst: SocketAddrV4,
     fpp: u16,
@@ -460,7 +564,13 @@ fn split_handle(h: FlowHandle) -> (u16, u32) {
 /// The flow-control server (port 4455 by default).
 pub struct FlowControl {
     shared: Arc<Shared>,
-    commands: std_mpsc::Sender<TxCommand>,
+    commands: std_mpsc::SyncSender<TxCommand>,
+    /// Commands for the transmit thread that wait, oldest first, for room
+    /// in its queue or for values to come back ([`FlowControl::flush`]).
+    backlog: VecDeque<TxCommand>,
+    /// Flows and channel lists handed to the transmit thread and not had
+    /// back ([`Retired`]): at most `IN_FLIGHT_MAX`.
+    in_flight: usize,
     flows: BTreeMap<u16, ServerFlow>,
     /// The last generation handed out, across all flows, so that an expiry
     /// can never match a flow promised since, whatever its id.
@@ -470,12 +580,23 @@ pub struct FlowControl {
 }
 
 impl FlowControl {
-    pub fn new(shared: Arc<Shared>, commands: std_mpsc::Sender<TxCommand>) -> Self {
-        Self { shared, commands, flows: BTreeMap::new(), generation: 0, engine_failed: false }
+    pub fn new(shared: Arc<Shared>, commands: std_mpsc::SyncSender<TxCommand>) -> Self {
+        Self {
+            shared,
+            commands,
+            backlog: VecDeque::new(),
+            in_flight: 0,
+            flows: BTreeMap::new(),
+            generation: 0,
+            engine_failed: false,
+        }
     }
 
-    pub async fn run(mut self, socket: UdpSocket, mut events: mpsc::UnboundedReceiver<TxEvent>) {
+    pub async fn run(mut self, socket: UdpSocket, link: TxLink) {
+        let TxLink { mut events, retired, expiries } = link;
         let mut buf = vec![0u8; 2048];
+        let mut poll = tokio::time::interval(POLL_INTERVAL);
+        poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut report = tokio::time::interval(REPORT_INTERVAL);
         report.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut reported = TxHealth::read(&self.shared.counters);
@@ -494,11 +615,11 @@ impl FlowControl {
                 // After a failure the thread is gone; keep answering
                 // receivers, with refusals, rather than let them time out.
                 ev = events.recv(), if !self.engine_failed => match ev {
-                    Some(TxEvent::Expired { id, generation }) => self.expired(id, generation),
                     Some(TxEvent::Failed) => self.engine_stopped(),
                     // The thread was shut down with the device.
                     None => return,
                 },
+                _ = poll.tick() => self.poll(&retired, &expiries),
                 _ = report.tick() => {
                     let health = TxHealth::read(&self.shared.counters);
                     if let Some(problems) = health.problems_since(&reported) {
@@ -519,9 +640,59 @@ impl FlowControl {
         self.shared.state().tx_flows = infos;
     }
 
+    /// Takes back what the transmit thread is done with, removes the flows
+    /// it found silent, and hands it the commands that waited.
+    fn poll(&mut self, retired: &std_mpsc::Receiver<Retired>, expiries: &Expiries) {
+        while let Ok(value) = retired.try_recv() {
+            // Here, off the transmit thread, this closes a flow's socket
+            // and frees its channel list.
+            drop(value);
+            self.in_flight = self.in_flight.saturating_sub(1);
+        }
+        for (id, generation) in expiries.take() {
+            self.expired(id, generation);
+        }
+        self.flush();
+    }
+
+    /// Queues `command` for the transmit thread, behind any that wait.
+    /// False if the thread is gone.
+    fn send(&mut self, command: TxCommand) -> bool {
+        self.backlog.push_back(command);
+        self.flush()
+    }
+
+    /// Moves the commands that wait into the transmit thread's queue, in
+    /// order, while it has room and while the thread could hand back all
+    /// they give it without finding that queue full (`IN_FLIGHT_MAX`). The
+    /// rest wait for [`FlowControl::poll`]: flow control never blocks on
+    /// the thread, nor drops a command. False if the thread is gone.
+    fn flush(&mut self) -> bool {
+        while let Some(command) = self.backlog.pop_front() {
+            let gives =
+                usize::from(matches!(command, TxCommand::Add(_) | TxCommand::SetChannels { .. }));
+            if self.in_flight + gives > IN_FLIGHT_MAX {
+                self.backlog.push_front(command);
+                break;
+            }
+            match self.commands.try_send(command) {
+                Ok(()) => self.in_flight += gives,
+                Err(std_mpsc::TrySendError::Full(command)) => {
+                    self.backlog.push_front(command);
+                    break;
+                }
+                Err(std_mpsc::TrySendError::Disconnected(_)) => {
+                    self.backlog.clear();
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     fn remove(&mut self, id: u16) {
         if self.flows.remove(&id).is_some() {
-            let _ = self.commands.send(TxCommand::Remove(id));
+            self.send(TxCommand::Remove(id));
             self.publish();
         }
     }
@@ -567,7 +738,7 @@ impl FlowControl {
         if let Some(f) = self.flows.get_mut(&id) {
             f.info.channels = ids;
             f.generation = generation;
-            let _ = self.commands.send(TxCommand::SetChannels { id, channels, generation });
+            self.send(TxCommand::SetChannels { id, channels, generation });
             self.publish();
         }
     }
@@ -715,7 +886,7 @@ impl FlowControl {
         let generation = self.next_generation();
         let unicast = !req.rx_addr.is_multicast();
         let flow = TxFlow::new(id, generation, socket, channels, req.fpp, format, unicast);
-        if self.commands.send(TxCommand::Add(flow)).is_err() {
+        if !self.send(TxCommand::Add(flow)) {
             return respond(h, result::FAILURE, &[]);
         }
         self.flows.insert(
@@ -880,7 +1051,7 @@ mod tests {
     #[test]
     fn flows_beyond_what_we_advertise_are_refused() {
         let shared = test_shared(16);
-        let (cmd_tx, commands) = std_mpsc::channel();
+        let (cmd_tx, commands) = std_mpsc::sync_channel(COMMAND_QUEUE);
         let mut fc = FlowControl::new(shared.clone(), cmd_tx);
         let invalid = dbcp::error::INVALID_PARAMETER;
         // fpp outside the advertised 2..=32, too many slots, no slots, an
@@ -916,7 +1087,7 @@ mod tests {
     #[test]
     fn a_re_request_with_other_packets_gets_a_new_flow() {
         let shared = test_shared(8);
-        let (cmd_tx, commands) = std_mpsc::channel();
+        let (cmd_tx, commands) = std_mpsc::sync_channel(COMMAND_QUEUE);
         let mut fc = FlowControl::new(shared.clone(), cmd_tx);
         fn fpp_of(shared: &Shared) -> Vec<u16> {
             shared.state().tx_flows.iter().map(|f| f.fpp).collect()
@@ -982,7 +1153,7 @@ mod tests {
     #[test]
     fn a_stale_expiry_does_not_remove_a_flow_promised_again() {
         let shared = test_shared(4);
-        let (cmd_tx, commands) = std_mpsc::channel();
+        let (cmd_tx, commands) = std_mpsc::sync_channel(COMMAND_QUEUE);
         let mut fc = FlowControl::new(shared.clone(), cmd_tx);
         let (_, handle) = request(&mut fc, &flow_request(40_003, 16, 24, &[1]));
         let [Sent::Add { id, generation: g1, .. }] = sent(&commands)[..] else { panic!() };
@@ -1016,6 +1187,221 @@ mod tests {
         fc.expired(id, g3);
         assert_eq!(shared.state().tx_flows.len(), 1);
         assert_ne!(other, handle);
+    }
+
+    #[test]
+    fn flow_control_polls_for_expiries_and_waits_for_room() {
+        let shared = test_shared(4);
+        // A queue of one command, to see the next wait for room.
+        let (cmd_tx, commands) = std_mpsc::sync_channel(1);
+        let (_retire, retired) = std_mpsc::sync_channel(IN_FLIGHT_MAX);
+        let expiries = Expiries::new();
+        let mut fc = FlowControl::new(shared.clone(), cmd_tx);
+
+        // Both flows are granted and listed at once; the second goes to the
+        // thread once its queue has room.
+        assert_eq!(request(&mut fc, &flow_request(40_010, 16, 24, &[1])).0, result::SUCCESS);
+        assert_eq!(request(&mut fc, &flow_request(40_011, 16, 24, &[2])).0, result::SUCCESS);
+        assert_eq!(shared.state().tx_flows.len(), 2);
+        let [Sent::Add { id: 1, generation: g1, .. }] = sent(&commands)[..] else { panic!() };
+        fc.poll(&retired, &expiries);
+        let [Sent::Add { id: 2, generation: g2, .. }] = sent(&commands)[..] else { panic!() };
+
+        // The thread found both flows silent; flow 2's receiver asked again
+        // before the poll, which makes its expiry stale.
+        expiries.report(1, g1);
+        expiries.report(2, g2);
+        assert_eq!(request(&mut fc, &flow_request(40_011, 16, 24, &[2, 3])).0, result::SUCCESS);
+        let [Sent::SetChannels { id: 2, slots: 2, .. }] = sent(&commands)[..] else { panic!() };
+        assert_eq!(shared.state().tx_flows.len(), 2, "nothing removed before the poll");
+        fc.poll(&retired, &expiries);
+        assert_eq!(sent(&commands), [Sent::Remove(1)]);
+        let listed: Vec<u16> = shared.state().tx_flows.iter().map(|f| f.id).collect();
+        assert_eq!(listed, [2]);
+        assert_eq!(shared.counters.tx_expired_flows.load(Ordering::Relaxed), 1);
+        // Each expiry is taken once.
+        fc.poll(&retired, &expiries);
+        assert!(sent(&commands).is_empty());
+    }
+
+    #[test]
+    fn flow_control_hands_out_no_more_than_the_thread_can_hand_back() {
+        let shared = test_shared(4);
+        let (cmd_tx, commands) = std_mpsc::sync_channel(4 * IN_FLIGHT_MAX);
+        let (retire, retired) = std_mpsc::sync_channel(IN_FLIGHT_MAX);
+        let expiries = Expiries::new();
+        let mut fc = FlowControl::new(shared.clone(), cmd_tx);
+        let handle = request(&mut fc, &flow_request(40_012, 16, 24, &[1])).1.unwrap();
+        let update = |fc: &mut FlowControl, seq| {
+            call(fc, &dbcp::encode_update_flow(seq, handle, &[seq % 4 + 1])).0
+        };
+
+        // The flow and IN_FLIGHT_MAX - 1 channel lists go to the thread...
+        for seq in 1..IN_FLIGHT_MAX as u16 {
+            assert_eq!(update(&mut fc, seq), result::SUCCESS);
+        }
+        assert_eq!(sent(&commands).len(), IN_FLIGHT_MAX);
+        // ...and the next update, answered all the same, waits until the
+        // thread hands something back, and a stop behind it waits too.
+        assert_eq!(update(&mut fc, 100), result::SUCCESS);
+        assert_eq!(call(&mut fc, &dbcp::encode_stop_flow(101, handle)).0, result::SUCCESS);
+        assert!(sent(&commands).is_empty());
+        fc.poll(&retired, &expiries);
+        assert!(sent(&commands).is_empty(), "nothing came back yet");
+        retire.send(Retired::Channels(vec![Some(0)])).unwrap();
+        fc.poll(&retired, &expiries);
+        let cmds = sent(&commands);
+        assert!(
+            matches!(cmds[..], [Sent::SetChannels { id: 1, slots: 1, .. }, Sent::Remove(1)]),
+            "{cmds:?}"
+        );
+        assert_eq!(fc.in_flight, IN_FLIGHT_MAX);
+    }
+
+    /// Counts the allocations and frees of the threads that ask for it while
+    /// armed, as the driver's test of its real-time paths does
+    /// (crates/ovsc-hal/tests/io_noalloc.rs).
+    mod counting {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        pub static ALLOCS: AtomicU64 = AtomicU64::new(0);
+        pub static FREES: AtomicU64 = AtomicU64::new(0);
+        static ARMED: AtomicBool = AtomicBool::new(false);
+
+        thread_local! {
+            static WATCHED: Cell<bool> = const { Cell::new(false) };
+        }
+
+        /// Counts what the calling thread allocates and frees while armed.
+        pub fn watch_this_thread() {
+            WATCHED.with(|w| w.set(true));
+        }
+
+        pub fn arm(on: bool) {
+            ARMED.store(on, Ordering::SeqCst);
+        }
+
+        fn count(counter: &AtomicU64) {
+            if ARMED.load(Ordering::Relaxed) && WATCHED.try_with(Cell::get).unwrap_or(false) {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        struct Counting;
+
+        // SAFETY: every call goes straight to the system allocator.
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                count(&ALLOCS);
+                unsafe { System.alloc(layout) }
+            }
+
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                count(&ALLOCS);
+                unsafe { System.alloc_zeroed(layout) }
+            }
+
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                count(&ALLOCS);
+                count(&FREES);
+                unsafe { System.realloc(ptr, layout, new_size) }
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                count(&FREES);
+                unsafe { System.dealloc(ptr, layout) }
+            }
+        }
+
+        #[global_allocator]
+        static ALLOCATOR: Counting = Counting;
+    }
+
+    /// Takes `n` values the transmit thread handed back, as flow control
+    /// does: without blocking, which would make the thread wake this one.
+    fn take_back(retired: &std_mpsc::Receiver<Retired>, n: usize) -> Vec<Retired> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut back = Vec::new();
+        while back.len() < n {
+            match retired.try_recv() {
+                Ok(value) => back.push(value),
+                Err(_) => {
+                    assert!(Instant::now() < deadline, "{} of {n} values handed back", back.len());
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+        back
+    }
+
+    /// Flows come and go mid-show (a receiver subscribes, is re-patched,
+    /// disappears): the transmit thread does all of it without allocating,
+    /// freeing or closing anything, and reports silent flows without a
+    /// channel that wakes a task.
+    #[test]
+    fn flow_changes_neither_allocate_nor_free_on_the_transmit_thread() {
+        let shared = test_shared(4);
+        let (commands, queue) = std_mpsc::sync_channel(COMMAND_QUEUE);
+        let (retire, retired) = std_mpsc::sync_channel(IN_FLIGHT_MAX);
+        let expiries = Arc::new(Expiries::new());
+        let thread = {
+            let (shared, expiries) = (shared.clone(), expiries.clone());
+            std::thread::spawn(move || {
+                counting::watch_this_thread();
+                engine(&shared, queue, &retire, &expiries);
+            })
+        };
+        let mut buf = [0u8; 2048];
+        let (first_rx, first) = flow_to_new_receiver(1, 1, 16, vec![Some(0), Some(1)]);
+        commands.send(TxCommand::Add(first)).unwrap();
+        // Once it sends, the thread is past its setup, which allocates.
+        first_rx.recv(&mut buf).expect("packets from flow 1");
+        counting::arm(true);
+
+        // A flow whose receiver has been silent for longer than the
+        // keepalive timeout: the thread reports it at once.
+        let (_silent_rx, mut silent) = flow_to_new_receiver(2, 2, 16, vec![Some(0)]);
+        silent.last_heard_ns = 0;
+        commands.send(TxCommand::Add(silent)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !expiries.take().any(|e| e == (2, 2)) {
+            assert!(Instant::now() < deadline, "flow 2 not reported silent");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // New channels for flow 1, and for a flow the thread does not have;
+        // flow 1 replaced by a flow to another receiver; flow 2 removed.
+        let update = |id, channels, generation| TxCommand::SetChannels { id, channels, generation };
+        commands.send(update(1, vec![Some(2)], 3)).unwrap();
+        commands.send(update(9, vec![Some(3)], 4)).unwrap();
+        let (second_rx, second) = flow_to_new_receiver(1, 5, 16, vec![Some(1)]);
+        commands.send(TxCommand::Add(second)).unwrap();
+        commands.send(TxCommand::Remove(2)).unwrap();
+        second_rx.recv(&mut buf).expect("packets from the new flow 1");
+        // Everything it is done with comes back, in order.
+        let back = take_back(&retired, 4);
+        counting::arm(false);
+
+        let [
+            Retired::Channels(before_update),
+            Retired::Channels(unknown_flow),
+            Retired::Flow(replaced),
+            Retired::Flow(removed),
+        ] = &back[..]
+        else {
+            panic!("not handed back in order");
+        };
+        assert_eq!(before_update, &[Some(0), Some(1)]);
+        assert_eq!(unknown_flow, &[Some(3)]);
+        assert_eq!((replaced.id, replaced.generation), (1, 3));
+        assert_eq!(replaced.channels, [Some(2)]);
+        assert_eq!((removed.id, removed.generation, removed.expired), (2, 2, true));
+        commands.send(TxCommand::Shutdown).unwrap();
+        thread.join().unwrap();
+        let allocs = counting::ALLOCS.load(Ordering::Relaxed);
+        let frees = counting::FREES.load(Ordering::Relaxed);
+        assert_eq!((allocs, frees), (0, 0), "allocations and frees on the transmit thread");
     }
 
     #[test]
@@ -1101,7 +1487,7 @@ mod tests {
     #[tokio::test]
     async fn flow_control_refuses_flows_once_the_transmit_thread_stopped() {
         let shared = test_shared(4);
-        let (cmd_tx, _commands) = std_mpsc::channel();
+        let (cmd_tx, _commands) = std_mpsc::sync_channel(COMMAND_QUEUE);
         let mut fc = FlowControl::new(shared.clone(), cmd_tx);
         assert_eq!(request(&mut fc, &flow_request(40_005, 16, 24, &[1])).0, result::SUCCESS);
         assert_eq!(shared.state().tx_flows.len(), 1);
@@ -1109,7 +1495,9 @@ mod tests {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = socket.local_addr().unwrap();
         let (events, events_rx) = mpsc::unbounded_channel();
-        let server = tokio::spawn(fc.run(socket, events_rx));
+        let (_retire, retired) = std_mpsc::sync_channel(IN_FLIGHT_MAX);
+        let link = TxLink { events: events_rx, retired, expiries: Arc::new(Expiries::new()) };
+        let server = tokio::spawn(fc.run(socket, link));
         events.send(TxEvent::Failed).unwrap();
         drop(events);
         // Let it handle the failure before asking for a flow.
@@ -1141,17 +1529,29 @@ mod tests {
         shared: &Arc<Shared>,
         fpp: u16,
         slots: usize,
-    ) -> (StdUdpSocket, SocketAddr, std_mpsc::Sender<TxCommand>, std::thread::JoinHandle<()>) {
+    ) -> (StdUdpSocket, SocketAddr, std_mpsc::SyncSender<TxCommand>, std::thread::JoinHandle<()>)
+    {
+        let (receiver, flow) = flow_to_new_receiver(1, 1, fpp, (0..slots).map(Some).collect());
+        let source = flow.socket.local_addr().unwrap();
+        let (commands, _link, thread) = spawn_engine(shared.clone());
+        commands.send(TxCommand::Add(flow)).unwrap();
+        (receiver, source, commands, thread)
+    }
+
+    /// A unicast flow `id`, promised as `generation`, to a new local socket
+    /// (returned with it), which waits up to 2 s for each packet.
+    fn flow_to_new_receiver(
+        id: u16,
+        generation: u32,
+        fpp: u16,
+        channels: Vec<Option<usize>>,
+    ) -> (StdUdpSocket, TxFlow) {
         let receiver = StdUdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         receiver.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let SocketAddr::V4(dst) = receiver.local_addr().unwrap() else { unreachable!() };
         let socket = open_flow_socket(Ipv4Addr::LOCALHOST, dst).unwrap();
-        let source = socket.local_addr().unwrap();
-        let (commands, _events, thread) = spawn_engine(shared.clone());
-        let channels = (0..slots).map(Some).collect();
-        let flow = TxFlow::new(1, 1, socket, channels, fpp, SampleFormat::S24, true);
-        commands.send(TxCommand::Add(flow)).unwrap();
-        (receiver, source, commands, thread)
+        let flow = TxFlow::new(id, generation, socket, channels, fpp, SampleFormat::S24, true);
+        (receiver, flow)
     }
 
     #[test]

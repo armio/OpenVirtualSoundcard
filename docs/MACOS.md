@@ -277,7 +277,9 @@ With the show lock on, the daemon refuses controllers' changes of the
 latency, the sample rate, the encoding, the device name and the channel
 names. Dante Controller gets an error for a latency write or a rename (the
 error result OpenVirtualSoundcard also gives for a value out of range), and
-the device reports the sample rate and encoding as not writable. The log says
+the device reports the sample rate and encoding as not writable, and no
+longer as configurable; it tells Dante Controller so, unasked, whenever the
+lock is turned on or off. The log says
 `refusing ... from the controller at ...: remote settings are locked`.
 Subscriptions stay open, so the console can still patch to and from
 OpenVirtualSoundcard, and the app's own changes still apply. A write that
