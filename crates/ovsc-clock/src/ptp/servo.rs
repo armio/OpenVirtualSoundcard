@@ -105,9 +105,10 @@
 //!   samples.
 //! * Holdover runs at the frequency estimate, from the time the clock
 //!   shows. In simulation (`tests/servo_sim.rs`, `holdover_sweep`) that
-//!   stays closer to the master than any average of the published rate,
-//!   whose phase corrections are not frequency. The driver follows the
-//!   daemon's holdover, so the two never drift apart.
+//!   stayed closer to the master than the averages of the published rate
+//!   that were tried (over 1 to 16 s), whose phase corrections are not
+//!   frequency. The driver follows the daemon's holdover, so the two never
+//!   drift apart.
 //! * A new master ([`Servo::change_master`]) and a master heard again after
 //!   holdover are checked against the running clock rather than acquired
 //!   from scratch. Until the servo locks again, an error beyond

@@ -115,7 +115,8 @@ pub struct ClockStatus {
     pub master_changes: u32,
     /// Times the master went silent with no other to take over.
     pub master_losses: u32,
-    /// Masters currently heard besides the one followed.
+    /// Other masters heard within the master timeout (5 s by default),
+    /// besides the one followed.
     pub other_masters: u32,
     /// Local time ([`local_now_ns`]) of the last Sync used from the master
     /// followed, 0 if none yet.

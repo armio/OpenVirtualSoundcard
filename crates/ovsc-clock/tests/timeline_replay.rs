@@ -81,8 +81,9 @@ enum Scenario {
     /// new one starts at 91 s.
     StepAndRestart,
     /// The leader reboots at 55 s. Another device, which was synchronised
-    /// to it, takes over: 2 us and 0.05 ppm away from it. The follower
-    /// keeps the silent leader until its 5 s timeout, then switches.
+    /// to it, takes over: 2 us and 0.05 ppm away from it. Its Syncs start
+    /// at 60 s, when the silent leader also times out, and the follower
+    /// switches then.
     LeaderChange,
     /// At 60 s a preferred leader whose time is 10 ms off takes over.
     DistantLeader,
@@ -727,8 +728,9 @@ fn replay_through_sync_congestion() {
 
 /// Finding clock#3: a master lost soon after a re-lock held over at the raw
 /// frequency estimate, and the driver at its own rate, until the two drifted
-/// apart and the gate shut. Now holdover runs at the averaged published rate
-/// and the driver follows the daemon's holdover.
+/// apart and the gate shut. Now the unlock keeps the frequency estimate
+/// instead of re-fitting it to the disturbance, holdover runs at that
+/// estimate, and the driver follows the daemon's holdover.
 #[test]
 fn replay_through_holdover_after_a_relock() {
     let results = sweep(Scenario::HoldoverAfterRelock, FAULT_SEEDS);
