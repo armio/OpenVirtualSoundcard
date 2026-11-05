@@ -30,7 +30,7 @@ use ovsc_clock::ptp::{PtpConfig, PtpFollower};
 use ovsc_clock::{MediaClock, free_running_clock_with_rate};
 use ovsc_control::{Restart, SettingsChange};
 use ovsc_core::net::Interface;
-use ovsc_core::{Device, FormatRequest, StartOptions};
+use ovsc_core::{Device, FormatRequest, RemoteChanges, StartOptions};
 use ovsc_hal_server::{EngineInfo, HalRegion, HalServer, ShmClockMirror};
 use ovsc_ipc::transport::ServerTransport;
 
@@ -433,7 +433,7 @@ impl Engine {
             ClockSource::System => anyhow::bail!("the driver cannot follow the system clock"),
         };
         clock.set_mirror(Some(ShmClockMirror::new(region.clone())))?;
-        let device = match Self::start_device(cfg, region, &clock).await {
+        let device = match Self::start_device(cfg, region, &clock, None).await {
             Ok(device) => device,
             Err(e) => {
                 if let Some(f) = follower {
@@ -452,20 +452,27 @@ impl Engine {
         Ok(Engine { device, clock, follower, started: std::time::Instant::now() })
     }
 
-    /// Starts the device on `region`'s rings, following `clock`.
+    /// Starts the device on `region`'s rings, following `clock`. It notes
+    /// controllers' changes in `remote_changes`, or in a new log.
     async fn start_device(
         cfg: &AppConfig,
         region: &Arc<HalRegion>,
         clock: &MediaClock,
+        remote_changes: Option<RemoteChanges>,
     ) -> anyhow::Result<Device> {
         let d = &cfg.device;
         let rings = region
             .external_rings(d.rx_channels.names().len(), d.tx_channels.names().len())
             .context("placing the rings in the shared region")?;
         // Controllers may change the sample rate and the bit depth: the
-        // daemon applies them (run_engine).
-        let options =
-            StartOptions { rings: Some(rings), format_configurable: true, ..Default::default() };
+        // daemon applies them (run_engine), unless the show lock
+        // (`[device] lock_remote_settings`, or the app) refuses them.
+        let options = StartOptions {
+            rings: Some(rings),
+            format_configurable: true,
+            remote_changes,
+            ..Default::default()
+        };
         Ok(Device::start_with_options(d.clone(), clock.clone(), options).await?)
     }
 
@@ -480,8 +487,13 @@ impl Engine {
         let Engine { device, clock, follower, started } = self;
         let mut cfg = cfg.clone();
         cfg.device.latency_ms = device.configured_latency_ns() as f64 / 1e6;
+        // The show lock and the list of controllers' changes carry over: the
+        // state file keeps the lock, but there may be none, and the list
+        // explains the very dropout this restart causes.
+        cfg.device.lock_remote_settings = device.remote_settings_locked();
+        let remote_changes = device.remote_changes();
         device.shutdown().await;
-        match Self::start_device(&cfg, region, &clock).await {
+        match Self::start_device(&cfg, region, &clock, Some(remote_changes)).await {
             Ok(device) => Ok(Engine { device, clock, follower, started }),
             Err(e) => {
                 if let Some(f) = follower {
@@ -785,6 +797,147 @@ mod tests {
         let (result, ()) = tokio::join!(daemon, app);
         result.unwrap();
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Sends Dante Controller's latency write for `ns` to ARC on `port` and
+    /// returns the result code.
+    async fn controller_sets_latency(port: u16, ns: u32) -> u16 {
+        use ovsc_core::client;
+        use ovsc_proto::{arc, frame::Frame};
+        let to = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+        let packet = arc::encode_set_latency_request(client::next_seq(), ns, 16);
+        let answer = client::transact(
+            std::net::Ipv4Addr::LOCALHOST,
+            to,
+            &packet,
+            Duration::from_millis(500),
+            3,
+        )
+        .await
+        .unwrap();
+        Frame::parse(&answer).unwrap().header.result
+    }
+
+    async fn status(path: &Path) -> ovsc_control::Status {
+        match ask(path, Request::Status).await {
+            Response::Status(s) => *s,
+            other => panic!("not a status: {other:?}"),
+        }
+    }
+
+    async fn apply(path: &Path, change: SettingsChange) -> Restart {
+        match ask(path, Request::Apply { change }).await {
+            Response::Applied { restart } => restart,
+            other => panic!("not applied: {other:?}"),
+        }
+    }
+
+    /// The show lock, set from the app, refuses Dante Controller's latency
+    /// write, so nothing restarts; it holds across a restart the app asks
+    /// for; and the app lists what controllers did, also after the restart
+    /// a controller's change causes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_show_lock_refuses_a_controller_and_survives_restarts() {
+        use ovsc_proto::frame::result;
+
+        const PORT: u16 = 24856;
+        let dir = std::env::temp_dir().join(format!("ovsc-ca-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let socket = dir.join("control.sock");
+        let mut cfg = app_config("127.0.0.1", PORT);
+        cfg.coreaudio.control_socket = socket.to_str().unwrap().into();
+        cfg.device.state_file = Some(dir.join("state.toml"));
+        cfg.device.latency_ms = 4.0;
+        let registry = MemRegistry::new();
+        let (stop_tx, mut stop) = mpsc::unbounded_channel();
+        let daemon = serve(cfg, None, service(&registry), &mut stop);
+        let app = async {
+            let (_client, received, w) = attach(&registry).await;
+            let (_mapped, view) = map(&w);
+            let d = view.daemon();
+            let running = || d.flags.load(Ordering::Acquire) & DAEMON_ENGINE_RUNNING != 0;
+            wait_for("the engine", running).await;
+            let locked =
+                |s: &ovsc_control::Status| s.device.as_ref().unwrap().remote_settings_locked;
+            assert!(!locked(&status(&socket).await));
+
+            let lock = |on| SettingsChange { lock_remote_settings: Some(on), ..Default::default() };
+            assert_eq!(apply(&socket, lock(true)).await, Restart::None);
+            assert!(locked(&status(&socket).await));
+            match ask(&socket, Request::Settings).await {
+                Response::Settings(s) => assert!(s.lock_remote_settings),
+                other => panic!("no settings: {other:?}"),
+            }
+
+            // Refused: an error result, and the device keeps running at 4 ms.
+            assert_eq!(controller_sets_latency(PORT, 2_000_000).await, result::ERROR);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(latency_ms(&socket).await, Some(4.0));
+            let refused = "tried to change the receive latency to 2 ms";
+            assert!(status(&socket).await.warnings.iter().any(|w| w.contains(refused)));
+
+            // The app's own change applies; the device restarts locked and
+            // still lists the refusal.
+            let change = SettingsChange { latency_ms: Some(2.0), ..Default::default() };
+            assert_eq!(apply(&socket, change).await, Restart::Device);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while latency_ms(&socket).await != Some(2.0) {
+                assert!(Instant::now() < deadline, "the device did not restart at 2 ms");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let s = status(&socket).await;
+            assert!(locked(&s));
+            assert!(s.warnings.iter().any(|w| w.contains(refused)), "{:?}", s.warnings);
+
+            // Unlocked, the controller's change restarts the device, and is
+            // listed afterwards.
+            assert_eq!(apply(&socket, lock(false)).await, Restart::None);
+            assert_eq!(controller_sets_latency(PORT, 3_000_000).await, result::SUCCESS);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while latency_ms(&socket).await != Some(3.0) {
+                assert!(Instant::now() < deadline, "the device did not restart at 3 ms");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let s = status(&socket).await;
+            assert!(!locked(&s));
+            // Newest first: the change that explains the dropout leads.
+            let at = |text: &str| s.warnings.iter().position(|w| w.contains(text));
+            let changed = "changed the receive latency to 3 ms";
+            assert!(at(changed).unwrap() < at(refused).unwrap(), "{:?}", s.warnings);
+            let saved = std::fs::read_to_string(dir.join("state.toml")).unwrap();
+            assert!(saved.contains("lock_remote_settings = false"), "{saved}");
+            assert!(!received.got_bye());
+            stop_tx.send("test").unwrap();
+            wait_for("the bye", || received.got_bye()).await;
+        };
+        let (result, ()) = tokio::join!(daemon, app);
+        result.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Without a state file the lock lives only in the running device, so
+    /// the restart for a new latency hands it on, with the list of
+    /// controllers' changes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_device_restart_keeps_the_lock_and_the_remote_changes() {
+        let cfg = app_config("127.0.0.1", 24866);
+        assert!(cfg.device.state_file.is_none() && !cfg.device.lock_remote_settings);
+        let region = HalRegion::create(VERSION).unwrap();
+        let engine = Engine::start(&cfg, &region).await.unwrap();
+        engine.device.lock_remote_settings(true);
+        let change = ovsc_core::RemoteChange {
+            at: std::time::SystemTime::now(),
+            from: std::net::SocketAddr::from(([192, 168, 1, 20], 4440)),
+            what: "the receive latency to 2 ms".into(),
+            refused: true,
+        };
+        engine.device.remote_changes().push(change.clone());
+        engine.device.request_latency(2_000_000).unwrap();
+        let engine = engine.restart_device(&cfg, &region).await.unwrap();
+        assert_eq!(engine.device.info().latency_ns, 2_000_000);
+        assert!(engine.device.remote_settings_locked());
+        assert_eq!(engine.device.remote_changes().recent(), [change]);
+        engine.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

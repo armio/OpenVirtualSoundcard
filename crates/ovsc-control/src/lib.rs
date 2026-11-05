@@ -73,18 +73,22 @@ pub enum Response {
     },
 }
 
-/// What restarts to apply a change.
+/// What restarts to apply a change. Either restart stops audio both ways:
+/// the device's inputs, and every flow other devices receive from it (such
+/// as returns to a console), which they must request again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Restart {
-    /// Nothing: applied at once (a new name).
+    /// Nothing: applied at once (a new name, the show lock). A new name
+    /// still leaves other devices' subscriptions to this one unresolved.
     None,
     /// The network engine restarts, the clock keeps running: audio stops
-    /// for a second or two (a new latency).
+    /// for a second or two, and devices receiving from this one may take
+    /// several more seconds to subscribe again (a new latency).
     Device,
     /// The whole daemon restarts and the clock locks again: audio stops for
-    /// ten to twenty seconds (a new interface, sample rate or channel
-    /// count).
+    /// ten to twenty seconds (a new interface, sample rate, bit depth or
+    /// channel count).
     Daemon,
 }
 
@@ -124,6 +128,11 @@ pub struct DeviceStatus {
     /// Flows other devices receive from this one.
     pub tx_flows: Vec<TxFlowStatus>,
     pub packets: PacketCounts,
+    /// Whether the show lock keeps controllers such as Dante Controller
+    /// from changing the latency, sample rate, encoding and names
+    /// ([`Settings::lock_remote_settings`]).
+    #[serde(default)]
+    pub remote_settings_locked: bool,
 }
 
 /// One receive channel.
@@ -208,6 +217,13 @@ pub struct Settings {
     pub tx_channels: u16,
     /// Receive latency, ms.
     pub latency_ms: f64,
+    /// The show lock: controllers on the network (Dante Controller) may not
+    /// change the latency, sample rate, encoding or names, which interrupt
+    /// audio or break other devices' subscriptions. Subscriptions stay
+    /// open, and changes from the app still apply. Saved with the device's
+    /// state, like the name and latency.
+    #[serde(default)]
+    pub lock_remote_settings: bool,
 }
 
 /// A change of [`Settings`]: fields left out keep their value.
@@ -228,6 +244,8 @@ pub struct SettingsChange {
     pub tx_channels: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_remote_settings: Option<bool>,
 }
 
 impl SettingsChange {
@@ -343,6 +361,7 @@ mod tests {
                 rx_channels: 8,
                 tx_channels: 8,
                 latency_ms: 4.0,
+                lock_remote_settings: true,
             }),
         ];
         for r in responses {
@@ -351,6 +370,23 @@ mod tests {
         assert_eq!(
             encode_line(&Response::Applied { restart: Restart::None }),
             "{\"result\":\"applied\",\"restart\":\"none\"}\n"
+        );
+    }
+
+    #[test]
+    fn the_show_lock_is_optional_on_the_wire() {
+        // A daemon from before the lock: unlocked.
+        let old = r#"{"result":"settings","name":"m1","interface":"","sample_rate":48000,
+            "bits_per_sample":24,"rx_channels":8,"tx_channels":8,"latency_ms":4.0}"#
+            .replace('\n', " ");
+        let Response::Settings(s) = decode_line(&old).unwrap() else { panic!("no settings") };
+        assert!(!s.lock_remote_settings);
+        let lock = Request::Apply {
+            change: SettingsChange { lock_remote_settings: Some(true), ..Default::default() },
+        };
+        assert_eq!(
+            encode_line(&lock),
+            "{\"op\":\"apply\",\"change\":{\"lock_remote_settings\":true}}\n"
         );
     }
 

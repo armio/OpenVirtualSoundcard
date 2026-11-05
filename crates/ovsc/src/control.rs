@@ -3,7 +3,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, bail};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -16,7 +16,7 @@ use ovsc_control::{
     self as ctl, ClockInfo, DeviceStatus, DriverInfo, InterfaceInfo, PacketCounts, Request,
     Response, Restart, RxChannelStatus, Settings, SettingsChange, Status, TxFlowStatus,
 };
-use ovsc_core::{Device, SavedState};
+use ovsc_core::{Device, RemoteChange, SavedState};
 use ovsc_hal_server::HalStatus;
 use ovsc_proto::arc::SubscriptionStatus;
 use ovsc_proto::discovery::validate_device_name;
@@ -220,6 +220,13 @@ fn status(view: &View<'_>) -> Status {
                 d.info().iface.name
             ));
         }
+        let now = SystemTime::now();
+        let locked = d.remote_settings_locked();
+        // Newest first: the change that explains a dropout is usually the
+        // last one.
+        for c in d.remote_changes().recent().iter().rev() {
+            warnings.push(remote_change_words(c, now, locked));
+        }
     }
     Status {
         protocol: ctl::PROTOCOL_VERSION,
@@ -231,6 +238,57 @@ fn status(view: &View<'_>) -> Status {
         driver,
         warnings,
     }
+}
+
+/// A controller's change, or refused attempt, as a warning for the app:
+/// who, what and when, so that a dropout mid-show has an explanation.
+/// `locked` is whether the show lock is on now.
+fn remote_change_words(c: &RemoteChange, now: SystemTime, locked: bool) -> String {
+    let ago = ago(now.duration_since(c.at).unwrap_or_default());
+    // Dante Controller on this Mac reaches ARC over 127.0.0.1.
+    let who = if c.from.ip().is_loopback() {
+        "A controller on this Mac".to_owned()
+    } else {
+        format!("A controller at {}", c.from.ip())
+    };
+    if c.refused {
+        format!(
+            "{who} tried to change {} {ago}. It was refused: settings from the network are \
+             locked.",
+            c.what
+        )
+    } else if locked {
+        format!("{who} changed {} {ago}, before the settings were locked.", c.what)
+    } else {
+        format!(
+            "{who} changed {} {ago}. To refuse such changes during a show, lock the settings \
+             from the network (Settings).",
+            c.what
+        )
+    }
+}
+
+/// How long ago, in words: `12 s ago`, `5 min ago`, `2 h 5 min ago`.
+fn ago(d: Duration) -> String {
+    let s = d.as_secs();
+    match s {
+        0..60 => format!("{s} s ago"),
+        60..3600 => format!("{} min ago", s / 60),
+        _ => format!("{} h {} min ago", s / 3600, s % 3600 / 60),
+    }
+}
+
+/// The devices receiving flows from `d`, for a log line: their names, or
+/// their addresses when they gave none.
+fn receivers(d: &Device) -> String {
+    let flows = d.tx_flows();
+    let mut names: Vec<String> = flows
+        .iter()
+        .map(|f| f.receiver.clone().unwrap_or_else(|| f.destination.ip().to_string()))
+        .collect();
+    names.sort();
+    names.dedup();
+    names.join(", ")
 }
 
 fn clock_source(cfg: &AppConfig) -> &'static str {
@@ -294,6 +352,7 @@ fn device_status(d: &Device) -> DeviceStatus {
             rx: stats.rx_packets,
             rx_late: stats.rx_late_packets,
         },
+        remote_settings_locked: d.remote_settings_locked(),
     }
 }
 
@@ -315,11 +374,14 @@ fn subscription_words(s: SubscriptionStatus) -> &'static str {
 fn settings(view: &View<'_>) -> Settings {
     let d = &view.cfg.device;
     let saved = d.state_file.as_deref().and_then(SavedState::load).unwrap_or_default();
-    let (name, latency_ns) = match view.engine {
-        Some((dev, _, _)) => (dev.name(), dev.configured_latency_ns()),
+    let (name, latency_ns, locked) = match view.engine {
+        Some((dev, _, _)) => {
+            (dev.name(), dev.configured_latency_ns(), dev.remote_settings_locked())
+        }
         None => (
             saved.name.clone().unwrap_or_else(|| d.name.clone()),
             saved.latency_ns.unwrap_or_else(|| d.latency_ns()),
+            saved.lock_remote_settings.unwrap_or(d.lock_remote_settings),
         ),
     };
     Settings {
@@ -330,6 +392,7 @@ fn settings(view: &View<'_>) -> Settings {
         rx_channels: d.rx_channels.names().len() as u16,
         tx_channels: d.tx_channels.names().len() as u16,
         latency_ms: latency_ns as f64 / 1e6,
+        lock_remote_settings: locked,
     }
 }
 
@@ -346,8 +409,9 @@ fn interfaces() -> Vec<InterfaceInfo> {
 }
 
 /// Checks `change`, then saves it: the interface, sample rate, bit depth
-/// and channel counts in the configuration file, the name and latency with
-/// the device's saved state, like a controller's changes.
+/// and channel counts in the configuration file, the name, latency and
+/// show lock with the device's saved state, like a controller's changes.
+/// The show lock only stops controllers: the app's own changes apply.
 pub fn apply(view: &View<'_>, change: &SettingsChange) -> anyhow::Result<Restart> {
     let cfg = view.cfg;
     let device = view.engine.map(|(d, _, _)| d);
@@ -382,8 +446,12 @@ pub fn apply(view: &View<'_>, change: &SettingsChange) -> anyhow::Result<Restart
         None
     };
     let state_file: Option<PathBuf> = cfg.device.state_file.clone();
-    if (change.name.is_some() || latency_ns.is_some()) && state_file.is_none() && device.is_none() {
-        bail!("the configuration has no state_file to save the name and latency in");
+    let lock = change.lock_remote_settings;
+    if (change.name.is_some() || latency_ns.is_some() || lock.is_some())
+        && state_file.is_none()
+        && device.is_none()
+    {
+        bail!("the configuration has no state_file to save the name, latency and lock in");
     }
 
     // Everything checked: save.
@@ -400,15 +468,44 @@ pub fn apply(view: &View<'_>, change: &SettingsChange) -> anyhow::Result<Restart
             if let Some(ns) = latency_ns {
                 s.latency_ns = Some(ns);
             }
+            if lock.is_some() {
+                s.lock_remote_settings = lock;
+            }
         })
         .with_context(|| format!("saving {}", path.display()))?;
     }
     if let Some(d) = device {
+        if let Some(locked) = lock {
+            if locked != d.remote_settings_locked() {
+                info!(
+                    "settings from the network {} by the app",
+                    if locked { "locked" } else { "unlocked" }
+                );
+            }
+            d.lock_remote_settings(locked);
+        }
         if let Some(name) = &change.name {
+            let old = d.name();
+            if *name != old && !d.tx_flows().is_empty() {
+                // Receivers subscribe by `channel@device`; the old names'
+                // records are withdrawn (mDNS goodbyes).
+                warn!(
+                    "renaming the device from {old} to {name} while {} receive from it: their \
+                     subscriptions to {old}'s channels stop resolving until they are patched again",
+                    receivers(d)
+                );
+            }
             d.rename(name)?;
         }
         if let Some(ns) = latency_ns {
             if ns != d.info().latency_ns && restart != Restart::Daemon {
+                if !d.tx_flows().is_empty() {
+                    warn!(
+                        "the new latency restarts the network engine: the flows {} receive from \
+                         this device stop until each of them requests its flow again",
+                        receivers(d)
+                    );
+                }
                 d.request_latency(ns)?;
                 restart = Restart::Device;
             } else if ns != d.configured_latency_ns() {
@@ -522,6 +619,44 @@ backend = "coreaudio"
         assert!(edit_config(CONFIG, &bad).is_err());
         let none = SettingsChange { rx_channels: Some(0), ..Default::default() };
         assert!(edit_config(CONFIG, &none).is_err());
+    }
+
+    #[test]
+    fn controllers_changes_read_as_warnings() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let change = |refused| RemoteChange {
+            at,
+            from: "192.168.1.20:51000".parse().unwrap(),
+            what: "the receive latency to 2 ms".into(),
+            refused,
+        };
+        let later = |s| at + Duration::from_secs(s);
+        assert_eq!(
+            remote_change_words(&change(false), later(300), false),
+            "A controller at 192.168.1.20 changed the receive latency to 2 ms 5 min ago. To \
+             refuse such changes during a show, lock the settings from the network (Settings)."
+        );
+        assert_eq!(
+            remote_change_words(&change(false), later(5), true),
+            "A controller at 192.168.1.20 changed the receive latency to 2 ms 5 s ago, before \
+             the settings were locked."
+        );
+        assert_eq!(
+            remote_change_words(&change(true), later(7_500), true),
+            "A controller at 192.168.1.20 tried to change the receive latency to 2 ms 2 h 5 min \
+             ago. It was refused: settings from the network are locked."
+        );
+        // A clock set back reads as just now.
+        assert!(
+            remote_change_words(&change(true), later(0) - Duration::from_secs(9), true)
+                .contains(" 0 s ago")
+        );
+        // Dante Controller on this Mac talks to the device over 127.0.0.1.
+        let local = RemoteChange { from: "127.0.0.1:51000".parse().unwrap(), ..change(true) };
+        assert!(
+            remote_change_words(&local, later(60), true)
+                .starts_with("A controller on this Mac tried to change")
+        );
     }
 
     #[test]
