@@ -193,8 +193,9 @@ pub struct RemoteChange {
 
 /// The last few [`RemoteChange`]s, oldest first. Clones share the log: a
 /// daemon hands it to the device it restarts
-/// ([`crate::StartOptions::remote_changes`]), so that a latency change that
-/// restarted the device is still listed afterwards.
+/// ([`crate::StartOptions::remote_changes`]), so that what controllers
+/// changed before a restart (a new network address) is still listed
+/// afterwards.
 #[derive(Clone, Debug, Default)]
 pub struct RemoteChanges(Arc<Mutex<VecDeque<RemoteChange>>>);
 

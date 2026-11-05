@@ -209,12 +209,12 @@ async fn a_device_announcing_our_name_is_reported() {
     soon(dev.shutdown()).await;
 }
 
-/// A device that the daemons restart in their process (for a new latency,
-/// or on a new address) keeps the name it announced, also while another
-/// device announces that name too: it announces it again without probing,
-/// which the other device would answer, and reports the conflict as it did
-/// before the restart. It never renames itself mid-show. Another name is
-/// probed for, as at a first start.
+/// A device that the daemons restart in their process (on a new address)
+/// keeps the name it announced, also while another device announces that
+/// name too: it announces it again without probing, which the other device
+/// would answer, and reports the conflict as it did before the restart. It
+/// never renames itself mid-show. Another name is probed for, as at a first
+/// start.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restarted_device_keeps_its_name_through_a_live_conflict() {
     let name = unique("keep");

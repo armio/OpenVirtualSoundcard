@@ -233,7 +233,7 @@ fn longest_silence(x: &[f32]) -> usize {
 fn the_gate_fades_audio_in_and_out_both_ways() {
     let mut rig = Rig::new();
     // StartIO, then 1 s of audio; the daemon's engine stops for half a
-    // second (as it does to apply a new latency) and starts again.
+    // second (as it does to restart on a new address) and starts again.
     rig.run(CYCLES_PER_SEC);
     rig.set_engine_running(false);
     rig.run(CYCLES_PER_SEC / 2);

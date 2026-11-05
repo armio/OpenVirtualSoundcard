@@ -633,14 +633,15 @@ result 1 with a 4-record property block echoing the applied values
 **OpenVirtualSoundcard** takes the latency from `8205`, or else `8301`, and refuses (an
 error result, nothing changed) a value outside 1 to 40 ms. It saves the new
 latency with the device's state, answers like netaudio's virtual device
-(`8205`, `0211`, `8301`, `0310` with the applied values), then restarts its
-network engine with it while the PTP clock keeps running: its subscriptions
-drop for about a second and come back, and its transmit flows close, so
-devices receiving from it must request them again. With the show lock on
-(`[device] lock_remote_settings`, or set from the app), it refuses any other
-latency the same way as one out of range, and answers a write of its current
-latency as above without restarting. A pointer past the end of the packet
-reads as no value, so the 5th record above is ignored. ⚠️
+(`8205`, `0211`, `8301`, `0310` with the applied values), then applies it to
+its receive side only: it stops its receive flows and requests them again
+at the new latency, so its subscriptions drop for about a second and come
+back, while its transmit flows, its mDNS records and the PTP clock run on.
+With the show lock on (`[device] lock_remote_settings`, or set from the
+app), it refuses any other latency the same way as one out of range, and
+answers a write of its current latency as above, which changes nothing. A
+pointer past the end of the packet reads as no value, so the 5th record
+above is ignored. ⚠️
 
 **Set AES67 multicast prefix** (protocol 0x2809): content
 `01 01 | 8060 0010 | a b c d` (NAC `commands/settings.rs`). ⚠️

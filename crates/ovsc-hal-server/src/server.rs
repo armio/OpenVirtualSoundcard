@@ -121,8 +121,8 @@ impl HalServer {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         // Taken first thing and held until shutdown, not only while an
         // engine runs: macOS may start an idle sleep as soon as the last
-        // assertion goes, and an engine restart (a new latency, the network
-        // coming back) would otherwise release it for seconds.
+        // assertion goes, and an engine restart (the network coming back, a
+        // new address) would otherwise release it for seconds.
         let power = o.prevent_idle_sleep.then(take_power).flatten();
         let view = region.view();
         let d = view.daemon();

@@ -656,8 +656,8 @@ pub fn apply(view: &View<'_>, change: &SettingsChange) -> anyhow::Result<Restart
 /// A receive latency of `ms` from the app, in ns, if the device allows it
 /// with a transmit guard of `tx_guard_us`: the rule of
 /// `ovsc_core::config::check_latency_ms`, which also holds controllers'
-/// writes and the configuration, so that the device never refuses a
-/// latency it restarts to apply.
+/// writes and the configuration, so that the app cannot set a latency the
+/// device would then refuse to start with.
 fn check_latency(ms: f64, tx_guard_us: u32) -> anyhow::Result<u32> {
     let min = ctl::LATENCY_MIN_MS.max(min_latency_ms(tx_guard_us));
     if !(min..=ctl::LATENCY_MAX_MS).contains(&ms) {

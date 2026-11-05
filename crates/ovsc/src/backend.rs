@@ -195,9 +195,9 @@ pub fn record(io: AudioIo, path: &Path) -> anyhow::Result<Running> {
 }
 
 /// The file of the `n`th recording to `path`, 0 being the first: a device
-/// restarted mid-recording (a new latency, a new network address) records
-/// on into a new file rather than over the old one. `take.wav`, then
-/// `take-2.wav`, `take-3.wav`, …
+/// restarted mid-recording (on a new network address) records on into a
+/// new file rather than over the old one. `take.wav`, then `take-2.wav`,
+/// `take-3.wav`, …
 pub fn numbered(path: &Path, n: u32) -> PathBuf {
     if n == 0 {
         return path.to_owned();
