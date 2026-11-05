@@ -24,7 +24,14 @@ bits_per_sample = 24         # 16, 24 or 32
 # channels its outputs. A count, or a list of names: ["Left", "Right"].
 rx_channels = 8
 tx_channels = 8
-latency_ms = 4.0             # receive latency, 0.25 to 40
+latency_ms = 4.0             # receive latency, 1 to 40
+# Transmit latency, 1 to 40 ms: receivers of the transmit channels (the
+# console) play them at the larger of this and their own latency. Unset:
+# latency_ms, so a longer receive latency also delays the returns. For live
+# use, 1.0 (or the console's latency) keeps the returns as early as the
+# console allows. Both latencies must be at least 1 ms: packets leave
+# 0.5 ms after their time.
+# tx_latency_ms = 1.0
 # Remember renames and subscriptions made from a controller.
 state_file = "/Library/Application Support/OpenVirtualSoundcard/state.toml"
 
@@ -48,11 +55,17 @@ backend = "coreaudio"
 [coreaudio]
 # User IDs allowed to connect: 202 is Core Audio's driver helper.
 # allowed_uids = [202]
-# Margins added to the safety offsets, in microseconds: more tolerates
-# later packets and a busier Mac, at the cost of latency.
+# Margins added to the safety offsets, in microseconds; each adds to the
+# round trip. Both cover this Mac's audio timeline and the network clock
+# disagreeing (by up to 250 us). The input margin also covers packets a
+# little later than latency_ms; the output margin, late HAL wake-ups and
+# late IO cycles.
+# Lower them only as docs/MACOS.md (Latency and safety offsets) describes.
 # input_margin_us = 500
 # output_margin_us = 1000
-# Output latency reported to applications. Default: latency_ms.
+# Output latency reported to applications. Default: the transmit latency
+# (tx_latency_ms, else latency_ms). Receivers play the outputs at the larger
+# of that and their own latency: if the console's is longer, give it here.
 # output_latency_ms = 4.0
 # "safety": the receive latency is part of the input safety offset, so
 # recorded audio lines up with the senders' timestamps. "latency": it is

@@ -543,7 +543,7 @@ fn stats(shared: &Shared) -> DeviceStats {
 fn with_saved_latency(mut config: DeviceConfig, saved: &SavedState) -> DeviceConfig {
     if let Some(ns) = saved.latency_ns {
         let ms = ns as f64 / 1e6;
-        if (crate::config::MIN_LATENCY_MS..=crate::config::MAX_LATENCY_MS).contains(&ms) {
+        if crate::config::check_latency_ms("latency", ms, config.tx_guard_us).is_ok() {
             info!("receive latency {ms} ms, as set by a controller or the app");
             config.latency_ms = ms;
         } else {

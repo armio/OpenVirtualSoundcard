@@ -16,6 +16,7 @@ use ovsc_control::{
     self as ctl, ClockInfo, DeviceStatus, DriverInfo, InterfaceInfo, PacketCounts, Request,
     Response, Restart, RxChannelStatus, Settings, SettingsChange, Status, TxFlowStatus,
 };
+use ovsc_core::config::min_latency_ms;
 use ovsc_core::{Device, SavedState};
 use ovsc_hal_server::HalStatus;
 use ovsc_proto::arc::SubscriptionStatus;
@@ -356,14 +357,7 @@ pub fn apply(view: &View<'_>, change: &SettingsChange) -> anyhow::Result<Restart
             .map_err(|e| anyhow::anyhow!("invalid device name {name:?}: {e}"))?;
     }
     let latency_ns = match change.latency_ms {
-        Some(ms) if !(ctl::LATENCY_MIN_MS..=ctl::LATENCY_MAX_MS).contains(&ms) => {
-            bail!(
-                "the latency must be between {} and {} ms",
-                ctl::LATENCY_MIN_MS,
-                ctl::LATENCY_MAX_MS
-            )
-        }
-        Some(ms) => Some((ms * 1e6).round() as u32),
+        Some(ms) => Some(check_latency(ms, cfg.device.tx_guard_us)?),
         None => None,
     };
     let host = change.interface.is_some()
@@ -417,6 +411,24 @@ pub fn apply(view: &View<'_>, change: &SettingsChange) -> anyhow::Result<Restart
         }
     }
     Ok(restart)
+}
+
+/// A receive latency of `ms` from the app, in ns, if the device allows it
+/// with a transmit guard of `tx_guard_us`: the rule of
+/// `ovsc_core::config::check_latency_ms`, which also holds controllers'
+/// writes and the configuration, so that the device never refuses a
+/// latency it restarts to apply.
+fn check_latency(ms: f64, tx_guard_us: u32) -> anyhow::Result<u32> {
+    let min = ctl::LATENCY_MIN_MS.max(min_latency_ms(tx_guard_us));
+    if !(min..=ctl::LATENCY_MAX_MS).contains(&ms) {
+        bail!(
+            "the latency must be between {min} and {} ms (at least the transmit guard of {} ms \
+             plus 0.5 ms)",
+            ctl::LATENCY_MAX_MS,
+            tx_guard_us as f64 / 1000.0
+        )
+    }
+    Ok((ms * 1e6).round() as u32)
 }
 
 /// `text` with `change`'s host settings in its `[device]` table, keeping
@@ -522,6 +534,33 @@ backend = "coreaudio"
         assert!(edit_config(CONFIG, &bad).is_err());
         let none = SettingsChange { rx_channels: Some(0), ..Default::default() };
         assert!(edit_config(CONFIG, &none).is_err());
+    }
+
+    #[test]
+    fn latencies_from_the_app_follow_the_devices_rule() {
+        use ovsc_core::config::{MAX_LATENCY_MS, MIN_LATENCY_MS, check_latency_ms};
+
+        // The app's limits are the device's, so nothing passes here that the
+        // device would refuse when it restarts with it.
+        assert_eq!((ctl::LATENCY_MIN_MS, ctl::LATENCY_MAX_MS), (MIN_LATENCY_MS, MAX_LATENCY_MS));
+        assert_eq!(check_latency(1.0, 500).unwrap(), 1_000_000);
+        assert_eq!(check_latency(2.5, 500).unwrap(), 2_500_000);
+        for bad in [0.25, 0.5, 0.99, 40.5, f64::NAN] {
+            let e = check_latency(bad, 500).unwrap_err().to_string();
+            assert!(e.starts_with("the latency must be between 1 and 40 ms"), "{e}");
+        }
+        // A longer transmit guard raises the least latency.
+        assert!(check_latency(1.0, 800).is_err());
+        assert_eq!(check_latency(1.3, 800).unwrap(), 1_300_000);
+        for guard in [0, 500, 800, 2000] {
+            for ms in [0.5, 1.0, 1.2, 1.3, 2.5, 3.0, 40.0] {
+                assert_eq!(
+                    check_latency(ms, guard).is_ok(),
+                    check_latency_ms("latency", ms, guard).is_ok(),
+                    "{ms} ms, guard {guard} us"
+                );
+            }
+        }
     }
 
     #[test]

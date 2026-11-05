@@ -169,10 +169,16 @@ pub struct CoreAudioConfig {
     pub allowed_uids: Vec<u32>,
     /// Extra input safety offset against late packets, in µs.
     pub input_margin_us: u32,
-    /// Extra output safety offset against a late transmit thread, in µs.
+    /// Extra output safety offset, in µs, so that output reaches the rings
+    /// before the transmit thread reads it although the driver's timeline
+    /// and the daemon's clock disagree (by up to 250 µs while audio flows),
+    /// the HAL wakes a few frames late or an IO cycle finishes late. (A late
+    /// transmit thread needs none: it only reads later.)
     pub output_margin_us: u32,
     /// Output latency reported to applications, in ms. Default: the
-    /// receive latency.
+    /// transmit latency (`[device] tx_latency_ms`, else `latency_ms`).
+    /// Receivers play the outputs at the larger of that and their own
+    /// latency, so set it to a longer receiver latency.
     pub output_latency_ms: Option<f64>,
     pub input_latency_mode: LatencyMode,
     pub clock_algorithm: ClockAlgorithm,
@@ -329,7 +335,10 @@ sample_rate = 48000          # 44100, 48000, 88200, 96000, 176400 or 192000
 bits_per_sample = 24         # 16, 24 or 32
 tx_channels = 8              # a count, or a list of names: ["Left", "Right"]
 rx_channels = 8
-latency_ms = 4.0             # receive latency
+latency_ms = 4.0             # receive latency, 1 to 40
+# Transmit latency: the least latency receivers of the transmit channels must
+# play them at. Unset: latency_ms.
+# tx_latency_ms = 1.0
 # Remember renames and subscriptions made from a controller.
 state_file = "ovsc-state.toml"
 
@@ -539,6 +548,29 @@ mod tests {
             "[device]\nsample_rate = 192000\nlatency_ms = 40.0\n[coreaudio]\ninput_margin_us = 44000",
         );
         assert!(error(&wide).starts_with("the Core Audio driver cannot take this configuration"));
+    }
+
+    #[test]
+    fn the_output_latency_follows_the_transmit_latency() {
+        let output_latency = |toml: &str| {
+            let cfg = coreaudio(toml);
+            cfg.validate_for(true).unwrap();
+            let engine = EngineInfo::from_config(&cfg.device).unwrap();
+            driver_config(&engine, 1, &cfg.coreaudio.hal_options()).unwrap().output_latency
+        };
+        // At 48 kHz. Unset, the transmit latency is the receive latency.
+        assert_eq!(output_latency("[device]\nlatency_ms = 4.0"), 192);
+        // Receive at 4 ms, ask the console for 1 ms: it plays the outputs
+        // 1 ms after their time.
+        assert_eq!(output_latency("[device]\nlatency_ms = 4.0\ntx_latency_ms = 1.0"), 48);
+        // A console at 2 ms plays them at 2 ms, which the override reports.
+        let longer = "[device]\ntx_latency_ms = 1.0\n[coreaudio]\noutput_latency_ms = 2.0";
+        assert_eq!(output_latency(longer), 96);
+        // Packets leave 0.5 ms after their time: 0.5 ms would always be late.
+        let e = error(&coreaudio("[device]\ntx_latency_ms = 0.5"));
+        assert!(e.contains("tx_latency_ms must be between 1 and 40 ms"), "{e}");
+        let e = error(&coreaudio("[device]\nlatency_ms = 0.5"));
+        assert!(e.contains("latency_ms must be between 1 and 40 ms"), "{e}");
     }
 
     #[test]

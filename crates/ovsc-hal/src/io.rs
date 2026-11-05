@@ -112,7 +112,9 @@ impl IoConfig {
         self.output_channels.store(cfg.output_channels, Ordering::Release);
         self.read_delay.store(cfg.input_read_delay, Ordering::Release);
         // In latency mode the read delay is L; otherwise the output latency
-        // is, unless overridden. Only the margins use it.
+        // stands in, which is L only while the daemon's transmit latency
+        // follows L and no override is set. Only the margins use it, and
+        // clock_input replaces it with the daemon's L before the gate opens.
         let latency =
             if cfg.input_read_delay > 0 { cfg.input_read_delay } else { cfg.output_latency };
         self.latency_samples.store(latency, Ordering::Relaxed);

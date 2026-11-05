@@ -9,9 +9,23 @@ use ovsc_proto::{arc, cmc, conmon, dbcp, discovery};
 
 use crate::{Error, Result};
 
-/// The receive latencies a device may run at, ms.
-pub const MIN_LATENCY_MS: f64 = 0.25;
+/// The receive and transmit latencies a device may run at, ms. 1 ms is the
+/// least Dante Controller offers (ARC `MIN_LATENCY`, `control.rs`) and the
+/// least the default transmit guard allows ([`min_latency_ms`]).
+pub const MIN_LATENCY_MS: f64 = 1.0;
 pub const MAX_LATENCY_MS: f64 = 40.0;
+
+/// How far a latency must reach beyond the transmit guard, in µs.
+///
+/// The transmit thread sends the packet stamped `t` once media time reaches
+/// `t + tx_guard` (`tx.rs`), so it arrives that late plus the thread's
+/// wake-up delay plus the network's transit. A receiver plays frame `t` at
+/// `t + latency` (docs/PROTOCOL.md 8.4), so a latency of `tx_guard` or less
+/// makes every packet late. This is the room left for the wake-up and the
+/// network. It applies to the receive latency too: another device of ours
+/// sends with the same guard, and our receiver does not raise its latency
+/// to a transmitter's `latency_ns`.
+pub const LATENCY_HEADROOM_US: u32 = 500;
 
 /// UDP ports of the device's services.
 ///
@@ -93,6 +107,11 @@ pub struct DeviceConfig {
     pub rx_channels: Channels,
     /// Receive latency: audio is played this long after its timestamp.
     pub latency_ms: f64,
+    /// Transmit latency: the least receive latency the device asks of the
+    /// receivers of its transmit channels (TXT `latency_ns`). They play its
+    /// audio at the larger of this and their own latency (docs/PROTOCOL.md
+    /// 2.2 and 8.4). `None`: `latency_ms`.
+    pub tx_latency_ms: Option<f64>,
     /// How late (after its timestamp) a transmit packet is sent, in µs.
     /// Keeps receivers from seeing timestamps from "the future" when clocks
     /// differ slightly.
@@ -124,6 +143,7 @@ impl Default for DeviceConfig {
             tx_channels: Channels::Count(2),
             rx_channels: Channels::Count(2),
             latency_ms: 4.0,
+            tx_latency_ms: None,
             tx_guard_us: 500,
             max_channels_per_rx_flow: 8,
             ports: Ports::default(),
@@ -174,10 +194,15 @@ impl DeviceConfig {
                 return Err(Error::Config(format!("duplicate {what} channel names")));
             }
         }
-        if !(MIN_LATENCY_MS..=MAX_LATENCY_MS).contains(&self.latency_ms) {
+        if min_latency_ms(self.tx_guard_us) > MAX_LATENCY_MS {
             return Err(Error::Config(format!(
-                "latency_ms must be between {MIN_LATENCY_MS} and {MAX_LATENCY_MS}"
+                "tx_guard_us must be at most {}",
+                MAX_LATENCY_MS as u32 * 1000 - LATENCY_HEADROOM_US
             )));
+        }
+        check_latency_ms("latency_ms", self.latency_ms, self.tx_guard_us)?;
+        if let Some(ms) = self.tx_latency_ms {
+            check_latency_ms("tx_latency_ms", ms, self.tx_guard_us)?;
         }
         if self.max_channels_per_rx_flow == 0 {
             return Err(Error::Config("max_channels_per_rx_flow must be at least 1".into()));
@@ -189,12 +214,52 @@ impl DeviceConfig {
     }
 
     pub fn latency_samples(&self) -> u64 {
-        (self.latency_ms * self.sample_rate as f64 / 1000.0).round() as u64
+        ms_to_samples(self.latency_ms, self.sample_rate)
     }
 
     pub fn latency_ns(&self) -> u32 {
-        (self.latency_ms * 1e6).round() as u32
+        ms_to_ns(self.latency_ms)
     }
+
+    /// The transmit latency in samples: `tx_latency_ms`, or `latency_ms`.
+    pub fn tx_latency_samples(&self) -> u64 {
+        ms_to_samples(self.tx_latency_ms.unwrap_or(self.latency_ms), self.sample_rate)
+    }
+
+    /// The transmit latency in ns: `tx_latency_ms`, or `latency_ms`.
+    pub fn tx_latency_ns(&self) -> u32 {
+        ms_to_ns(self.tx_latency_ms.unwrap_or(self.latency_ms))
+    }
+}
+
+fn ms_to_samples(ms: f64, rate: u32) -> u64 {
+    (ms * rate as f64 / 1000.0).round() as u64
+}
+
+fn ms_to_ns(ms: f64) -> u32 {
+    (ms * 1e6).round() as u32
+}
+
+/// The least receive or transmit latency a device whose transmit guard is
+/// `tx_guard_us` accepts, in ms: [`MIN_LATENCY_MS`], or the guard plus
+/// [`LATENCY_HEADROOM_US`] if that is more.
+pub fn min_latency_ms(tx_guard_us: u32) -> f64 {
+    MIN_LATENCY_MS.max((tx_guard_us as f64 + LATENCY_HEADROOM_US as f64) / 1000.0)
+}
+
+/// Checks a receive or transmit latency (`what`) of `ms` against
+/// [`min_latency_ms`] and [`MAX_LATENCY_MS`]. Configuration files,
+/// controllers and the app all go through it, so that none of them can set
+/// a latency the device would then refuse to start with.
+pub fn check_latency_ms(what: &str, ms: f64, tx_guard_us: u32) -> Result<()> {
+    let min = min_latency_ms(tx_guard_us);
+    if (min..=MAX_LATENCY_MS).contains(&ms) {
+        return Ok(());
+    }
+    Err(Error::Config(format!(
+        "{what} must be between {min} and {MAX_LATENCY_MS} ms (at least tx_guard_us + \
+         {LATENCY_HEADROOM_US} µs), not {ms}"
+    )))
 }
 
 pub(crate) fn parse_device_id(s: &str) -> Result<[u8; 8]> {
@@ -251,6 +316,56 @@ mod tests {
         assert!(bad(|c| c.rx_channels = Channels::Names(vec!["a".into(), "a".into()])));
         assert!(bad(|c| c.device_id = Some("xyz".into())));
         assert!(!bad(|_| {}));
+    }
+
+    #[test]
+    fn latencies_must_clear_the_transmit_guard() {
+        let check = |latency_ms: f64, tx_latency_ms: Option<f64>, tx_guard_us: u32| {
+            DeviceConfig { latency_ms, tx_latency_ms, tx_guard_us, ..Default::default() }
+                .validate()
+                .map_err(|e| e.to_string())
+        };
+        // With the default 500 µs guard, 1 ms is the least either may be: a
+        // packet leaves 0.5 ms after its timestamp, so 0.5 ms would be late
+        // at every receiver.
+        assert_eq!(check(1.0, Some(1.0), 500), Ok(()));
+        for bad in [0.25, 0.5, 0.75, 0.99] {
+            let e = check(bad, None, 500).unwrap_err();
+            assert!(e.contains("latency_ms must be between 1 and 40 ms"), "{e}");
+            let e = check(4.0, Some(bad), 500).unwrap_err();
+            assert!(e.contains("tx_latency_ms must be between 1 and 40 ms"), "{e}");
+        }
+        for bad in [40.5, f64::NAN, f64::INFINITY] {
+            assert!(check(bad, None, 500).is_err(), "{bad}");
+            assert!(check(4.0, Some(bad), 500).is_err(), "{bad}");
+        }
+        // A longer guard raises the floor; a shorter one keeps 1 ms.
+        assert!(check(1.0, None, 800).is_err());
+        assert!(check(4.0, Some(1.2), 800).is_err());
+        assert_eq!(check(1.3, Some(1.3), 800), Ok(()));
+        assert!(check(0.75, None, 0).is_err());
+        assert_eq!(min_latency_ms(0), 1.0);
+        assert_eq!(min_latency_ms(500), 1.0);
+        assert_eq!(min_latency_ms(2000), 2.5);
+        // A guard that leaves no latency at all.
+        assert_eq!(check(40.0, None, 39_500), Ok(()));
+        let e = check(40.0, None, 39_501).unwrap_err();
+        assert_eq!(e, "configuration: tx_guard_us must be at most 39500");
+    }
+
+    #[test]
+    fn the_transmit_latency_defaults_to_the_receive_latency() {
+        let c = DeviceConfig { latency_ms: 4.0, ..Default::default() };
+        assert_eq!((c.tx_latency_ns(), c.tx_latency_samples()), (4_000_000, 192));
+        let c = DeviceConfig { tx_latency_ms: Some(1.0), ..c };
+        assert_eq!((c.tx_latency_ns(), c.tx_latency_samples()), (1_000_000, 48));
+        assert_eq!((c.latency_ns(), c.latency_samples()), (4_000_000, 192));
+        let c: DeviceConfig = toml::from_str("latency_ms = 2.0\ntx_latency_ms = 1.5").unwrap();
+        c.validate().unwrap();
+        assert_eq!((c.latency_ns(), c.tx_latency_ns()), (2_000_000, 1_500_000));
+        let c: DeviceConfig = toml::from_str("latency_ms = 2.0").unwrap();
+        assert_eq!(c.tx_latency_ms, None);
+        assert_eq!(c.tx_latency_ns(), 2_000_000);
     }
 
     #[test]
