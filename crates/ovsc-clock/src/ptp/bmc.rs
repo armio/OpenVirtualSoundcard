@@ -13,8 +13,9 @@
 //! network elects another one, which is usually not better than the old
 //! leader's last data set. Waiting for the old leader's timeout would leave
 //! the clock unsupervised for seconds, so once the current master has been
-//! silent for [`TAKEOVER_AFTER_SILENCE`], the best of the masters still
-//! sending takes over after [`SWITCH_AFTER_SYNCS`] Syncs. If the old leader
+//! silent for [`TAKEOVER_AFTER_SILENCE`] (or for four of the Sync intervals
+//! it advertises, if that is longer), the best of the masters still sending
+//! takes over after [`SWITCH_AFTER_SYNCS`] Syncs. If the old leader
 //! comes back and is better, it takes over again the same way; a leader
 //! change keeps the clock continuous (see the servo), so the cost of that is
 //! small.
@@ -30,8 +31,12 @@ use super::wire::{Header, PortIdentity, SyncBody};
 pub const SWITCH_AFTER_SYNCS: u32 = 2;
 
 /// How long the current master must have been silent before another one
-/// may take over without being better: four Sync intervals of a Dante
-/// leader (250 ms), so that a lost Sync or two never moves the selection.
+/// may take over without being better: four Sync intervals of a master
+/// sending every 250 ms (as the development master does), so that a lost
+/// Sync or two never moves the selection. A master that advertises a longer
+/// Sync interval gets four of its own intervals, so that its normal gaps are
+/// never mistaken for silence (docs/PROTOCOL.md §9 lists Dante's interval
+/// as unconfirmed). It is never longer than the master timeout.
 pub const TAKEOVER_AFTER_SILENCE: Duration = Duration::from_secs(1);
 
 /// Rank of a PTPv1 clock identifier; lower is better.
@@ -63,6 +68,10 @@ pub struct MasterDataset {
     pub identifier: [u8; 4],
     pub variance: i16,
     pub steps_removed: u16,
+    /// log2 of the Sync interval the master advertises, in seconds. Not
+    /// compared: it only sets how long the master may be silent before
+    /// another one takes over (see [`TAKEOVER_AFTER_SILENCE`]).
+    pub sync_interval: i8,
 }
 
 impl MasterDataset {
@@ -76,6 +85,7 @@ impl MasterDataset {
             identifier: body.grandmaster_clock_identifier,
             variance: body.grandmaster_clock_variance,
             steps_removed: body.local_steps_removed,
+            sync_interval: body.sync_interval,
         }
     }
 
@@ -135,7 +145,6 @@ pub struct MasterChange {
 #[derive(Clone, Debug)]
 pub struct MasterSelector {
     timeout_ns: u64,
-    takeover_ns: u64,
     masters: Vec<ForeignMaster>,
     current: Option<PortIdentity>,
 }
@@ -143,10 +152,8 @@ pub struct MasterSelector {
 impl MasterSelector {
     /// A selector that forgets masters after `timeout` without a Sync.
     pub fn new(timeout: Duration) -> MasterSelector {
-        let timeout_ns = timeout.as_nanos().min(u64::MAX as u128) as u64;
         MasterSelector {
-            timeout_ns,
-            takeover_ns: (TAKEOVER_AFTER_SILENCE.as_nanos() as u64).min(timeout_ns),
+            timeout_ns: timeout.as_nanos().min(u64::MAX as u128) as u64,
             masters: Vec::new(),
             current: None,
         }
@@ -197,9 +204,10 @@ impl MasterSelector {
         if current.dataset.source == id {
             return None;
         }
-        let current_silent = now_ns.saturating_sub(current.last_sync_ns) > self.takeover_ns;
+        let takeover_ns = self.takeover_after(&current.dataset);
+        let current_silent = now_ns.saturating_sub(current.last_sync_ns) > takeover_ns;
         let takes_over =
-            m_is_best_live(&self.masters, idx, current.dataset.source, now_ns, self.takeover_ns);
+            m_is_best_live(&self.masters, idx, current.dataset.source, now_ns, takeover_ns);
         let m = &mut self.masters[idx];
         if m.dataset.is_better_than(&current.dataset) || (current_silent && takes_over) {
             m.better_syncs += 1;
@@ -234,6 +242,16 @@ impl MasterSelector {
     pub fn clear(&mut self) {
         self.masters.clear();
         self.current = None;
+    }
+
+    /// How long `master` must have been silent before a master that is not
+    /// better may take over (see [`TAKEOVER_AFTER_SILENCE`]).
+    fn takeover_after(&self, master: &MasterDataset) -> u64 {
+        // The field is log2 seconds; anything outside ±7 is not a real
+        // interval, and the clamp keeps the arithmetic finite.
+        let interval_s = 2f64.powi(i32::from(master.sync_interval.clamp(-7, 7)));
+        let four_intervals = (4.0 * interval_s * 1e9) as u64;
+        four_intervals.max(TAKEOVER_AFTER_SILENCE.as_nanos() as u64).min(self.timeout_ns)
     }
 
     fn switch_to(&mut self, new: Option<PortIdentity>) -> MasterChange {
@@ -276,6 +294,7 @@ mod tests {
             identifier: *b"DFLT",
             variance: 0,
             steps_removed: 0,
+            sync_interval: -2,
         }
     }
 
@@ -418,5 +437,46 @@ mod tests {
             changes,
             [MasterChange { previous: Some(ds(1).source), current: Some(ds(5).source) }]
         );
+    }
+
+    #[test]
+    fn a_master_with_slow_syncs_is_not_taken_over_between_them() {
+        let ms = SEC / 1000;
+        // Takes `slow` (sending every 2^interval s) silent at `t`, with the
+        // worse ds(9) sending every 250 ms; returns how long after `t` ds(9)
+        // took over.
+        let takeover = |sel: &mut MasterSelector, t: u64| {
+            let mut at = t;
+            loop {
+                at += 250 * ms;
+                if let Some(change) = sel.on_sync(ds(9), ADDR, at) {
+                    assert_eq!(change.current, Some(ds(9).source));
+                    return at - t;
+                }
+            }
+        };
+
+        // ds(1) advertises a Sync every 2 s (IEEE 1588-2002's default); the
+        // gaps between its Syncs are not silence.
+        let slow = MasterDataset { sync_interval: 1, ..ds(1) };
+        let mut sel = MasterSelector::new(Duration::from_secs(5));
+        sel.on_sync(slow, ADDR, SEC);
+        let mut t = SEC;
+        for _ in 0..10 {
+            for k in 1..=7 {
+                assert_eq!(sel.on_sync(ds(9), ADDR, t + k * 250 * ms), None);
+            }
+            t += 2 * SEC;
+            assert_eq!(sel.on_sync(slow, ADDR, t), None);
+        }
+        // Four of its intervals are longer than the timeout, so ds(9) only
+        // takes over after that, as it always did.
+        assert_eq!(takeover(&mut sel, t), 5_500 * ms);
+
+        // One Sync a second: ds(9) takes over after four seconds of silence.
+        let slow = MasterDataset { sync_interval: 0, ..ds(1) };
+        let mut sel = MasterSelector::new(Duration::from_secs(5));
+        sel.on_sync(slow, ADDR, SEC);
+        assert_eq!(takeover(&mut sel, SEC), 4_500 * ms);
     }
 }

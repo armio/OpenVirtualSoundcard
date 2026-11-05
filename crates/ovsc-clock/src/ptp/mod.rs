@@ -19,7 +19,8 @@
 //! stayed below 50 µs for a few Syncs the state becomes `Locked`. From then
 //! on the clock is only ever slewed, never stepped, unless the error exceeds
 //! 2 ms (the master's clock jumped). If the master goes silent, another
-//! master still sending takes over after a second
+//! master still sending takes over after a second, or four of the silent
+//! master's Sync intervals if those are longer
 //! ([`bmc::TAKEOVER_AFTER_SILENCE`]); with none, after
 //! [`PtpConfig::master_timeout`] the state drops back to `Unlocked` but the
 //! clock keeps running on its frequency estimate for [`HOLDOVER`] before it
