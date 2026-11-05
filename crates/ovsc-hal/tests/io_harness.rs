@@ -22,15 +22,19 @@
 //! * zero time stamps are consecutive, strictly increasing and never in the
 //!   future, with one seed throughout;
 //! * the gate zero-fills input and drops output before the clock is usable,
-//!   while the heartbeat is stale and while the daemon runs at another rate.
+//!   while the heartbeat is stale and while the daemon runs at another rate;
+//! * at the gate's edges both directions ramp, exactly as [`Ramp`] models:
+//!   a fade-in once it opens, a fade-out at the last open position once it
+//!   closes.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 
 use ovsc_hal::abi::*;
-use ovsc_hal::io::IoEngine;
+use ovsc_hal::io::{IoEngine, edge_gain, edge_ramp_frames};
 use ovsc_hal::model::DriverConfig;
 use ovsc_hal::platform::Timebase;
 use ovsc_hal::platform::stub::StubPlatform;
@@ -215,6 +219,40 @@ impl HalClock {
     }
 }
 
+/// The engine's gain ramp at the gate's edges for one direction, as the
+/// test expects it: per operation, the gain of every frame, or `None` where
+/// nothing moves (input silent, output not written).
+struct Ramp {
+    /// Frames into the ramp: 0 is silence, `len` is unity.
+    level: u32,
+    len: u32,
+    /// The ring offset of the last operation through the open gate.
+    off: i64,
+}
+
+impl Ramp {
+    fn new() -> Self {
+        Ramp { level: 0, len: edge_ramp_frames(FS), off: 0 }
+    }
+
+    /// An operation of `n` frames with the gate `open` at offset `off`:
+    /// the frames' gains and the offset the engine uses.
+    fn op(&mut self, open: bool, off: i64, n: usize) -> (Vec<Option<f32>>, i64) {
+        let level = self.level;
+        let gains = if open {
+            // A fade-in from where the level is, then unity.
+            self.off = off;
+            self.level = (level + n as u32).min(self.len);
+            (0..n as u32).map(|i| Some(edge_gain(level + i + 1, self.len))).collect()
+        } else {
+            // A fade-out at the last open position, then nothing.
+            self.level = level.saturating_sub(n as u32);
+            (0..n as u32).map(|i| (i < level).then(|| edge_gain(level - i - 1, self.len))).collect()
+        };
+        (gains, self.off)
+    }
+}
+
 /// Whether the gate must be open (Some(true)) or closed (Some(false)) at
 /// `since` ns after the start, or None near a transition.
 fn expected_gate(since: u64) -> Option<bool> {
@@ -296,9 +334,13 @@ fn run(n: u32) {
         let nf = n as usize;
         let mut input = vec![0f32; nf * CHANNELS];
         let mut output = vec![0f32; nf * CHANNELS];
-        // Device frames written while the gate was open: [from, to).
+        // Device frames written at unity gain: [from, to).
         let mut written: Vec<(i64, i64)> = Vec::new();
+        // Device frames written at another gain, on the gate's edges.
+        let mut ramped: HashMap<i64, f32> = HashMap::new();
+        let (mut in_ramp, mut out_ramp) = (Ramp::new(), Ramp::new());
         let (mut checked_rx, mut checked_loop, mut opened) = (0u64, 0u64, 0u64);
+        let (mut faded_in, mut faded_out) = (0u64, 0u64);
         let mut cycle = IOCycleInfo { mNominalIOBufferFrameSize: n, ..Default::default() };
         let mut c = 1i64;
         loop {
@@ -327,20 +369,31 @@ fn run(n: u32) {
             let read = kAudioServerPlugInIOOperationReadInput;
             let main = input.as_mut_ptr().cast::<c_void>();
             assert_eq!(unsafe { io.do_io(3, read, n, &cycle, main) }, 0);
+            let (gains, in_off) = in_ramp.op(snap.gate, off, nf);
             for (i, frame) in input.chunks_exact(CHANNELS).enumerate() {
                 let td = t_in + i as i64;
-                let m = (td + off) as u64;
+                let m = (td + in_off) as u64;
+                match gains[i] {
+                    Some(g) if g < 1.0 && snap.gate => faded_in += 1,
+                    Some(_) if !snap.gate => faded_out += 1,
+                    _ => {}
+                }
                 for (ch, &x) in frame.iter().enumerate() {
-                    let expected = if !snap.gate {
-                        0.0
-                    } else if ch < LOOP {
-                        checked_rx += 1;
-                        to_f32(rx_pattern(ch, m))
-                    } else if written.iter().any(|&(a, b)| (a..b).contains(&td)) {
-                        checked_loop += 1;
-                        out_pattern(ch, td)
-                    } else {
-                        0.0
+                    let expected = match gains[i] {
+                        None => 0.0,
+                        Some(g) if ch < LOOP => {
+                            checked_rx += 1;
+                            to_f32(rx_pattern(ch, m)) * g
+                        }
+                        Some(g) if written.iter().any(|&(a, b)| (a..b).contains(&td)) => {
+                            checked_loop += 1;
+                            out_pattern(ch, td) * g
+                        }
+                        // What the TX thread sent from the output's ramps.
+                        Some(g) => match ramped.get(&td) {
+                            Some(&sent) => to_f32(from_f32(out_pattern(ch, td) * sent)) * g,
+                            None => 0.0,
+                        },
                     };
                     assert_eq!(x.to_bits(), expected.to_bits(), "input {ch} at {td} ({since} ns)");
                 }
@@ -355,20 +408,28 @@ fn run(n: u32) {
             let mix = kAudioServerPlugInIOOperationWriteMix;
             let main = output.as_mut_ptr().cast::<c_void>();
             assert_eq!(unsafe { io.do_io(4, mix, n, &cycle, main) }, 0);
+            let (gains, out_off) = out_ramp.op(snap.gate, off, nf);
             for (i, frame) in output.chunks_exact(CHANNELS).enumerate() {
-                let m = (t_out + i as i64 + off) as u64;
+                let td = t_out + i as i64;
+                let m = (td + out_off) as u64;
                 for (ch, &x) in frame.iter().enumerate() {
                     let got = view.tx(ch).unwrap().read_one(m);
-                    let expected = snap.gate.then(|| from_f32(x));
-                    assert_eq!(got, expected, "output {ch} at {} ({since} ns)", t_out + i as i64);
+                    let expected = gains[i].map(|g| from_f32(x * g));
+                    assert_eq!(got, expected, "output {ch} at {td} ({since} ns)");
+                }
+                match gains[i] {
+                    Some(1.0) => match written.last_mut() {
+                        Some(last) if last.1 == td => last.1 = td + 1,
+                        _ => written.push((td, td + 1)),
+                    },
+                    Some(g) => {
+                        ramped.insert(td, g);
+                    }
+                    None => {}
                 }
             }
             if snap.gate {
                 opened += 1;
-                match written.last_mut() {
-                    Some(last) if last.1 == t_out => last.1 = t_out + n64,
-                    _ => written.push((t_out, t_out + n64)),
-                }
             }
             c += 1;
         }
@@ -400,6 +461,13 @@ fn run(n: u32) {
         let cycles = c as u64;
         assert!(opened * 10 > cycles * 8, "open {opened} of {cycles}");
         assert!(checked_rx > 20 * u64::from(FS) && checked_loop > 20 * u64::from(FS));
+        // The gate opened three times (the clock usable, the heartbeat back,
+        // the rate right again) and closed twice in between, and every edge
+        // ramped, both ways.
+        let len = u64::from(edge_ramp_frames(FS));
+        assert!(faded_in >= 3 * (len - 1), "{faded_in} frames faded in");
+        assert!(faded_out >= 2 * len, "{faded_out} frames faded out");
+        assert!(ramped.len() as u64 >= 3 * (len - 1) + 2 * len, "{} output frames", ramped.len());
     });
     io.stop_io();
     drop(io.attach(None));
