@@ -974,7 +974,13 @@ backend = "coreaudio"
         cfg.clock.source = ClockSource::Free;
         let r = engine_reading(&cfg, &device, &clock, Duration::from_secs(3));
         assert!(!r.ptp && r.stopped_part.is_none() && r.name_conflict.is_none());
-        assert_eq!((r.interface.as_str(), r.latency_ms, r.clock_age.as_secs()), ("lo", 2.0, 3));
+        // The loopback interface: `lo` on Linux, `lo0` on macOS.
+        let lo = device.info().iface.name.clone();
+        assert!(lo.starts_with("lo"), "{lo}");
+        assert_eq!(
+            (r.interface.as_str(), r.latency_ms, r.clock_age.as_secs()),
+            (lo.as_str(), 2.0, 3)
+        );
         assert_eq!(r.rx.len(), 2);
         assert_eq!(r.rx[1].subscription, Some(("lead".into(), "stagebox".into())));
         assert_eq!(r.clock.state, ClockState::FreeRunning);
