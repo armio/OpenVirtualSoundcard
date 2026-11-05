@@ -578,7 +578,7 @@ const LAYOUT_WORDS: &[u64] = &[
     offset_of!(PluginStatus, io_heartbeat_ns) as u64,
     offset_of!(PluginStatus, faulted) as u64,
     offset_of!(PluginStatus, frames_capped) as u64,
-    offset_of!(PluginStatus, _reserved0) as u64,
+    offset_of!(PluginStatus, non_finite_out) as u64,
     offset_of!(PluginStatus, zts_calls) as u64,
     offset_of!(PluginStatus, seed) as u64,
     offset_of!(PluginStatus, media_offset) as u64,

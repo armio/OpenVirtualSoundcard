@@ -317,6 +317,16 @@ fn non_finite_output_is_sent_as_silence() {
         .collect();
     let expected = [0, 0, 0, 0, i32::MAX, i32::MIN, 1 << 29];
     assert_eq!(got, expected.map(Some));
+    // Counted, for the status, as is what fades out of a closed gate.
+    assert_eq!(rig.io.snapshot().non_finite_out, 4);
+    assert_eq!(rig.view.plugin().non_finite_out.load(Ordering::Relaxed), 4);
+    rig.set_engine_running(false);
+    rig.cycle(|_, _| f32::NAN);
+    assert_eq!(rig.io.snapshot().non_finite_out, 4 + 8 * N as u64);
+    // Not what the gate drops.
+    rig.run(CYCLES_PER_SEC / 10);
+    rig.cycle(|_, _| f32::INFINITY);
+    assert_eq!(rig.io.snapshot().non_finite_out, 4 + 8 * N as u64);
     // The other channels are untouched.
     let other = rig.view.tx(1).unwrap().read_one((t_out + off) as u64);
     assert_eq!(other, Some(from_f32(tone(t_out))));

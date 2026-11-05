@@ -352,6 +352,7 @@ struct IoCounters {
     last_frames: AtomicU64,
     io_heartbeat_ns: AtomicU64,
     frames_capped: AtomicU64,
+    non_finite_out: AtomicU64,
 }
 
 impl IoCounters {
@@ -375,6 +376,7 @@ impl IoCounters {
             last_frames: AtomicU64::new(0),
             io_heartbeat_ns: AtomicU64::new(0),
             frames_capped: AtomicU64::new(0),
+            non_finite_out: AtomicU64::new(0),
         }
     }
 
@@ -407,6 +409,7 @@ impl IoCounters {
         copy(&self.io_heartbeat_ns, &p.io_heartbeat_ns);
         p.faulted.store(u64::from(faulted), Ordering::Relaxed);
         copy(&self.frames_capped, &p.frames_capped);
+        copy(&self.non_finite_out, &p.non_finite_out);
     }
 }
 
@@ -452,6 +455,9 @@ pub struct IoSnapshot {
     pub far_input_cycles: u64,
     /// IO operations longer than `IO_FRAMES_CAP`.
     pub frames_capped: u64,
+    /// Channel-frames of host output that were NaN or infinite, sent as
+    /// silence.
+    pub non_finite_out: u64,
     /// Reads of the clock block that found it contended.
     pub clock_read_failures: u64,
     /// The daemon's TX underruns, 0 when detached.
@@ -975,17 +981,27 @@ impl IoEngine {
         let ramped =
             if src.open { n.min(ramp_len.saturating_sub(level) as usize) } else { n_write };
         let m0 = (t.floor() as i64).wrapping_add(src.off) as u64;
+        let mut non_finite = 0u64;
         for ch in 0..channels {
             let Some(ring) = src.a.view.tx(ch) else {
                 continue;
             };
             let mut m = m0;
             for (i, &x) in buf.iter().skip(ch).step_by(channels).take(n_write).enumerate() {
+                // from_f32 sends it as silence; count it, so that a plug-in
+                // that blew up shows in the status rather than as a mystery
+                // dropout.
+                if !x.is_finite() {
+                    non_finite = non_finite.wrapping_add(1);
+                }
                 let x =
                     if i < ramped { x * EdgeRamp::gain(level, i, !src.open, ramp_len) } else { x };
                 ring.write_one(m, from_f32(x));
                 m = m.wrapping_add(1);
             }
+        }
+        if non_finite > 0 {
+            self.counters.non_finite_out.fetch_add(non_finite, Ordering::Relaxed);
         }
         ramp.advance(level, n, src.open.then_some((src.a.generation, src.off)), ramp_len);
         src.open
@@ -1081,6 +1097,7 @@ impl IoEngine {
             far_output_cycles: c.far_output_cycles.load(r),
             far_input_cycles: c.far_input_cycles.load(r),
             frames_capped: c.frames_capped.load(r),
+            non_finite_out: c.non_finite_out.load(r),
             clock_read_failures: s.clock_read_failures.load(r),
             tx_underruns: a.map_or(0, |a| a.view.daemon().tx_underruns.load(r)),
             faulted: self.faulted.load(Ordering::Acquire),

@@ -157,7 +157,10 @@ pub struct PluginStatus {
     pub faulted: AtomicU64,
     /// IO operations longer than `IO_FRAMES_CAP`.
     pub frames_capped: AtomicU64,
-    pub(crate) _reserved0: AtomicU64,
+    /// Channel-frames of host output that were NaN or infinite, sent as
+    /// silence (a plug-in in the host blowing up). Was reserved, at the
+    /// same offset.
+    pub non_finite_out: AtomicU64,
     // Line 1: GetZeroTimeStamp.
     pub zts_calls: AtomicU64,
     pub seed: AtomicU64,
@@ -205,7 +208,7 @@ impl PluginStatus {
             io_heartbeat_ns: zero(),
             faulted: zero(),
             frames_capped: zero(),
-            _reserved0: zero(),
+            non_finite_out: zero(),
             zts_calls: zero(),
             seed: zero(),
             media_offset: zero(),
