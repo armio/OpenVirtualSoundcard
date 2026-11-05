@@ -356,15 +356,44 @@ an administrator of the Mac, and does not need to stay open: the daemon runs
 without it.
 
 * The header shows the device name and three lights: **Clock** (green when
-  locked to the Dante network, amber while locking, red when unlocked),
-  **Driver** (whether Core Audio has loaded the OpenVirtualSoundcard driver) and
-  **Audio** (whether an application is playing or recording through it).
+  locked to the Dante network, amber while locking or in holdover, red when
+  unlocked), **Driver** (green when Core Audio has loaded the
+  OpenVirtualSoundcard driver, red when it has not or when the driver has
+  failed) and **Audio**:
+  * green **Flowing**: audio can flow, and nothing audible went wrong in the
+    last 30 s;
+  * amber **Dropouts**: audio flows, but something audible happened in the
+    last 30 s (lost or late packets, late output or early input cycles,
+    slips, packets sent without the application's audio): the warnings say
+    what;
+  * amber **Stopped**: the driver holds the audio back (its gate is
+    closed), so inputs and returns are silent, usually for seconds while the
+    clock settles or the engine restarts;
+  * red **Silent**: the driver caught an internal error and is silent until
+    Core Audio restarts. The app shows the command, `sudo killall
+    coreaudiod`, with a button to copy it.
+
+  Hovering over a light says more.
 * **Status** lists the device (interface, address, sample rate, bit depth,
   latency, whether settings from the network are locked), the clock (its
   leader, offset, network delay and rate), the receive channels with what
   each one is subscribed to, the transmit flows and the packet counters.
-  Warnings from the daemon come first: a clock that does not lock, and
-  the changes controllers made or tried to make, newest first. The header
+  Warnings from the daemon come first: in red those that mean audio is down
+  now (a failed driver, Core Audio no longer calling it, a gate closed
+  while an application plays, a stopped transmit engine, a clock that has
+  not locked or lost its leader), then in amber the rest. A warning about a
+  counter (lost, late or early packets, datagrams from a stray sender, send
+  errors, late sends, skipped packets, expired flows, late output or early
+  input cycles, slips, invalid samples from the application, packets sent
+  without its audio while it plays) appears when the counter rises and
+  stays for 30 s after it last rose, saying how many in the last 30 s and
+  what to do; the first 10 s after the engine (re)starts and the first 3 s
+  after an application starts IO do not count. Holdover (with the seconds
+  left), a clock relocking, a jump of the clock, a new clock leader,
+  subscribed channels without audio for 10 s, a transmit thread without
+  real-time priority and another device using this one's name also warn.
+  The changes controllers made or tried to make come last, newest first,
+  for 10 minutes; older ones move to **Earlier**, at the bottom. The header
   says `settings locked` while the show lock is on.
 * **Settings** changes the device name, the network interface, the sample
   rate, the bit depth, the receive and transmit channel counts, the
@@ -408,7 +437,7 @@ echo '{"op":"apply","change":{"latency_ms":2}}' | nc -U /var/run/ovsc/control.so
 
 | Request | Answer |
 |---|---|
-| `{"op":"status"}` | `"result":"status"`: the device, the clock, the driver and warnings. |
+| `{"op":"status"}` | `"result":"status"`: the device, the clock, the driver (`audio_flowing`; `faulted`, a driver silent until Core Audio restarts; `audio_trouble`, audible problems in the last 30 s) and `warnings`, of which the first `urgent_warnings` mean audio is down now; `earlier` holds controllers' changes older than 10 minutes. |
 | `{"op":"settings"}` | `"result":"settings"`: `name`, `interface`, `sample_rate`, `bits_per_sample`, `rx_channels`, `tx_channels`, `latency_ms`, `lock_remote_settings`. |
 | `{"op":"interfaces"}` | `"result":"interfaces"`: the interfaces that are up and have an IPv4 address. |
 | `{"op":"apply","change":{...}}` | `"result":"applied"` with `"restart"`: `"none"`, `"device"` (the network engine restarts) or `"daemon"` (the daemon exits for launchd to start it again); or `"result":"error"` with a `message`, and nothing changed. `change` holds any of the settings' fields. |
@@ -692,11 +721,20 @@ Lines worth knowing:
   gone](#the-saved-subscriptions-are-gone));
 * every `status_log_interval_s`: `clock <state>; receiving <n>/<m>
   subscribed channels; <k> transmit flows; packets: tx <n> (<u> underruns),
-  rx <n> (<l> late)[; <interface problem>]; hal: peers=... io=... gate=... regime=... absorbs=...
-  seed=... late_out=... early_in=... silenced=... in_missing=...
-  tx_underruns=... min_out_margin=... min_in_margin=...`, the margins being
-  the smallest seen since IO started, in frames. A late packet arrived after
-  its timestamp plus the latency: its audio may have been read already;
+  rx <n> (<l> late)[; <interface problem>]; healthy|warnings: <...>; hal:
+  peers=... io=... gate=... regime=... absorbs=... seed=... late_out=...
+  early_in=... silenced=... in_missing=... tx_underruns=...
+  min_out_margin=... min_in_margin=...[ non_finite_out=...]`, the margins
+  being the smallest seen since IO started, in frames. `healthy`, or
+  `warnings:` and the app's warnings in a few words (`3 late output cycles,
+  clock in holdover, 21 s left`). A late packet arrived after its timestamp
+  plus the latency: its audio may have been read already. `in_missing` counts
+  every input channel without a sample, subscribed or not, and
+  `tx_underruns` every packet sent while no application plays, so neither
+  is an alarm on its own;
+* `health: <warning>` (WARN) when one of the app's warnings appears, and
+  `health: cleared: <what>` (INFO) once it has been gone for 10 s: a warning
+  that comes and goes within that time is logged once;
 * once per IO session, `hal: io_trace <session> <i>: ...`: the first 64 IO
   operations, with the sample times Core Audio passed
   ([Measured IO timing](#measured-io-timing)).
