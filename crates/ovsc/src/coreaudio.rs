@@ -563,17 +563,23 @@ struct Engine {
 
 /// What a device hands on to the one that replaces it, so that a restart
 /// keeps the names, subscriptions, latency and show lock set since the
-/// start even without a state file, and still lists the controllers'
-/// changes that explain the restart.
+/// start even without a state file, still lists the controllers' changes
+/// that explain the restart, and keeps the name it announced without
+/// probing for it again (see [`StartOptions::announced`]).
 #[derive(Clone)]
 struct Carry {
     state: SavedState,
     remote_changes: RemoteChanges,
+    announced: Option<String>,
 }
 
 impl From<&Device> for Carry {
     fn from(device: &Device) -> Self {
-        Carry { state: device.saved_state(), remote_changes: device.remote_changes() }
+        Carry {
+            state: device.saved_state(),
+            remote_changes: device.remote_changes(),
+            announced: device.announced_name(),
+        }
     }
 }
 
@@ -659,15 +665,16 @@ impl Engine {
         // Controllers may change the sample rate and the bit depth: the
         // daemon applies them (run_engine), unless the show lock
         // (`[device] lock_remote_settings`, or the app) refuses them.
-        let (state, remote_changes) = match carry {
-            Some(c) => (Some(c.state), Some(c.remote_changes)),
-            None => (None, None),
+        let (state, remote_changes, announced) = match carry {
+            Some(c) => (Some(c.state), Some(c.remote_changes), c.announced),
+            None => (None, None, None),
         };
         let options = StartOptions {
             rings: Some(rings),
             format_configurable: true,
             remote_changes,
             state,
+            announced,
             ..Default::default()
         };
         Ok(Device::start_with_options(d.clone(), clock.clone(), options).await?)
@@ -1417,6 +1424,62 @@ mod tests {
         SavedState::update(&state, |s| s.latency_ns = Some(40_000_000)).unwrap();
         assert_eq!(initial_engine(&cfg, &opts).unwrap().latency_samples, 768);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Another device that announces `name` and answers for it, without
+    /// having probed for it: as two Macs given one name that started
+    /// together would.
+    async fn name_holder(name: &str, base: u16) -> Device {
+        let cfg = DeviceConfig {
+            name: name.into(),
+            interface: "127.0.0.1".into(),
+            ports: Ports { arc: base, cmc: base + 1, flow_control: base + 2, settings: base + 3 },
+            process_id: 99,
+            ..Default::default()
+        };
+        let options = StartOptions { announced: Some(name.into()), ..Default::default() };
+        Device::start_with_options(cfg, ovsc_clock::system_clock(), options).await.unwrap()
+    }
+
+    /// A restart for a new latency, and one of the whole engine, keep the
+    /// name the device announced while another device announces it too:
+    /// it is handed on, not probed for again, so the device never renames
+    /// itself mid-show. The conflict is reported.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restarts_keep_the_announced_name_through_a_live_conflict() {
+        let name = format!("ca-keep{}", std::process::id());
+        let mut cfg = app_config("127.0.0.1", 24976);
+        cfg.device.name = name.clone();
+        cfg.device.discovery = true;
+        let region = HalRegion::create(VERSION).unwrap();
+        let engine = Engine::start(&cfg, &region, None).await.unwrap();
+        wait_for("the name", || engine.device.announced_name().is_some()).await;
+        let holder = name_holder(&name, 24986).await;
+        wait_for("the conflict", || engine_conflict(&engine)).await;
+
+        engine.device.request_latency(2_000_000).unwrap();
+        let engine = engine.restart_device(&cfg, &region).await.unwrap();
+        wait_for("the conflict after the restart", || engine_conflict(&engine)).await;
+        // Longer than a probe takes.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(engine.device.name(), name);
+        assert!(engine_conflict(&engine));
+
+        let carry = Carry::from(&engine.device);
+        engine.shutdown().await;
+        let engine = Engine::start(&cfg, &region, Some(carry)).await.unwrap();
+        wait_for("the conflict after the engine restart", || engine_conflict(&engine)).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(engine.device.name(), name);
+        assert_eq!(engine.device.saved_state().name.as_deref(), Some(name.as_str()));
+        engine.shutdown().await;
+        holder.shutdown().await;
+    }
+
+    /// Whether `engine`'s device reports another device announcing its
+    /// name, without having renamed itself.
+    fn engine_conflict(engine: &Engine) -> bool {
+        engine.device.name_conflict().is_some_and(|c| c.renamed_to.is_none())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
