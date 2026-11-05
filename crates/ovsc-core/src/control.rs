@@ -148,12 +148,14 @@ fn write_properties(shared: &Shared, frame: &Frame<'_>, from: SocketAddr) -> Vec
         changed_by(shared, from, what());
         // The restart that applies it closes the transmit flows too, though
         // only the receive side changes (docs/MACOS.md, "Setting the
-        // latency from Dante Controller or the app").
+        // latency from Dante Controller or the app"). Only the macOS daemon
+        // restarts at once; other backends apply it at their next start.
         let flows = shared.state().tx_flows.len();
         if flows > 0 {
             warn!(
-                "applying the new latency restarts the device: the {flows} flows other devices \
-                 receive from it stop until each receiver requests its flow again"
+                "the new latency applies when the device restarts (at once in the macOS daemon), \
+                 which stops the {flows} flows other devices receive from it until each \
+                 receiver requests its flow again"
             );
         }
     }
