@@ -554,13 +554,20 @@ fn choose_fpp(
 }
 
 /// The TXT record we advertise for our transmit channel `id`.
+///
+/// Its `latency_ns` is the least receive latency we ask of receivers, who
+/// play our audio at the larger of it and their own latency
+/// (docs/PROTOCOL.md 2.2 and 8.4). That is our transmit latency, not our
+/// receive latency: what our transmitter needs is set by its guard
+/// (`DeviceConfig::tx_latency_ms`), and a long receive latency here would
+/// only delay our audio at every receiver.
 pub fn own_channel_txt(info: &crate::info::DeviceInfo, id: u16) -> ChannelTxt {
     ChannelTxt {
         id,
         sample_rate: info.sample_rate,
         bits_per_sample: info.format.bits(),
         pcm_type: PCM_TYPE,
-        latency_ns: info.latency_ns,
+        latency_ns: info.tx_latency_ns,
         fpp_max: FPP_MAX,
         fpp_min: FPP_MIN,
         nchan: MAX_CHANNELS_PER_TX_FLOW.min(info.tx_channels.len() as u16).max(1),

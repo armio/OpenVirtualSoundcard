@@ -171,14 +171,9 @@ impl Shared {
     /// saves it with the other state, and tells [`Shared::latency_requests`]
     /// listeners, who restart the device to apply it.
     pub fn request_latency(&self, ns: u32) -> crate::Result<()> {
-        let ms = ns as f64 / 1e6;
-        if !(crate::config::MIN_LATENCY_MS..=crate::config::MAX_LATENCY_MS).contains(&ms) {
-            return Err(crate::Error::Config(format!(
-                "latency {ms} ms is outside {} to {} ms",
-                crate::config::MIN_LATENCY_MS,
-                crate::config::MAX_LATENCY_MS
-            )));
-        }
+        // The rule the device checks when it restarts with this latency.
+        let guard_us = (self.info.tx_guard_ns / 1000) as u32;
+        crate::config::check_latency_ms("the latency", ns as f64 / 1e6, guard_us)?;
         self.modify(|s| s.latency_override_ns = Some(ns));
         self.latency_request.send_replace(Some(ns));
         Ok(())
