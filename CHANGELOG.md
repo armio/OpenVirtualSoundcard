@@ -55,7 +55,7 @@ The first public version, not released yet.
   something did, and red **Silent** when the driver has failed (with the
   command that recovers it). Warnings in plain words cover what rose in the
   last 30 s, with the urgent ones first; they are logged as `health:`
-  lines, and the status line ends with `healthy` or a short list.
+  lines, and the status line says `healthy` or lists them.
   Controllers' changes move to an **Earlier** list after 10 minutes.
 
 ### Changed

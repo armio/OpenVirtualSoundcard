@@ -97,9 +97,12 @@ packets arrive after their time; that is a dropout on that channel.
 * A flow from a transmitter that asks for more latency than OVSC's setting
   (Dante Virtual Soundcard, Dante Via, or a console set higher) plays at the
   transmitter's latency, as Dante receivers do. Its channels then arrive
-  later than the others, and the log says so for each flow. `ovsc discover
-  --channels` lists the latency each transmit channel asks for. Keep
-  software transmitters off the vocal path.
+  later than the others, and the log says so for each flow. The host is not
+  told: its input figures still assume `latency_ms`, so it under-reports
+  those channels by the difference. `ovsc discover --channels` lists the
+  latency each transmit channel asks for. **Set `latency_ms` to at least the
+  latency the console's channels ask for**: lower gains nothing for them.
+  Keep software transmitters off the vocal path.
 
 ### Margins and buffer size
 
@@ -113,7 +116,10 @@ packets arrive after their time; that is a dropout on that channel.
 
 ## Configuration
 
-`/Library/Application Support/OpenVirtualSoundcard/ovsc.toml`, then
+Set these keys in the installed
+`/Library/Application Support/OpenVirtualSoundcard/ovsc.toml`, keeping the
+rest of the file (in particular `[device.ports]`, which moves two ports out of
+the way of Audinate's ConMon service), then
 `sudo launchctl kickstart -k system/org.openvirtualsoundcard.daemon`:
 
 ```toml
@@ -127,6 +133,10 @@ tx_channels = 8           # processed returns
 latency_ms = 2.0          # 1.0 once a long test run is clean
 tx_latency_ms = 1.0       # returns as early as the console allows
 state_file = "/Library/Application Support/OpenVirtualSoundcard/state.toml"
+
+[device.ports]
+cmc = 38800               # as installed: next to Dante Controller's ConMon
+settings = 38700
 
 [clock]
 source = "ptp"
@@ -142,9 +152,14 @@ backend = "coreaudio"
 # prevent_idle_sleep = true
 ```
 
-Every value is checked at start. A latency below 1 ms (or below the
-transmit guard plus 0.5 ms) is refused with a message saying why, and the
-daemon does not start.
+Every value is checked at start.
+
+**The app and controllers win over this file.** A receive latency, device
+name or show lock set from the app or from Dante Controller, and the
+automatic `-2` rename, are saved in `state.toml` and override `ovsc.toml` at
+every start. Change those in the app; to go back to the file's values, stop
+the daemon and delete `latency_ns`, `name` or `lock_remote_settings` from
+`state.toml`.
 
 ### The show lock
 
@@ -173,6 +188,9 @@ network can make them without anyone at the Mac knowing.
   Dante Controller. OVSC only follows the clock; it never leads.
 * Give the Mac a fixed address or a DHCP reservation. An address change
   restarts the network engine (a few seconds of silence, see below).
+* A computer that transmits to OVSC (another Mac, Dante Virtual Soundcard)
+  must have only one interface on the Dante subnet: OVSC accepts a flow's
+  audio only from the address it requested the flow from.
 * Run no other Dante software on the show Mac. OVSC moves its ports out of
   the way of Audinate's ConMon service, but Dante Virtual Soundcard and OVSC
   must not both carry the show.
@@ -218,11 +236,13 @@ With the show session running at the show's buffer size:
    the same leader. No other leader is reported.
 3. **Status.** The app's Audio light is green **Flowing**, the Status tab
    shows no warnings, and every subscribed receive channel reads
-   **receiving**. The log's status line ends with `healthy`.
+   **receiving**. The log's status line reads `healthy` (before its
+   `hal:` part).
 4. **Returns.** Each return arrives at the console: check its meters, and that
    the console shows OVSC's flows without late packets.
-5. **Real-time.** The log has no line saying a thread runs "at normal
-   priority" or "not real-time".
+5. **Real-time.** The log has no line saying a thread "is not real-time"
+   (`grep -i 'real-time' /Library/Logs/OpenVirtualSoundcard/ovsc.log`), and
+   the app shows no warning about it.
 6. **A long run.** Run the session for at least as long as the show (a dress
    rehearsal is ideal). Afterwards the log must have no `health:` warning
    from the run (`grep health: /Library/Logs/OpenVirtualSoundcard/ovsc.log*`). In the last status line, the receive `late` count and the
@@ -264,13 +284,13 @@ any of them.
 | The leader's time jumps by 0.25 to 2 ms, same leader | Possibly dropouts on the returns, for up to about 15 s | The clock slews back at 0.1 ms per second instead of stepping, so audio keeps flowing, but the console may find returns late until the error is below its latency slack. Rare: it needs the leader's own time to jump (for example a leader re-syncing to an external reference). |
 | Sync packets delayed by congestion | Nothing | The clock may unlock; it keeps its frequency and slews back gently. Repeated unlocks mean the network needs PTP priority. |
 | Cable pulled and put back (same address) | Silence while unplugged, then audio returns | Receive flows that deliver nothing for 3 s are requested again; audio usually returns well under 2 s after the link does. The console requests its flows from OVSC again on its own timing. |
-| The Mac's address changes | A few seconds of silence | About 2 s after the change the network engine restarts on the new address; audio returns when the clock locks. With `interface = ""` it could pick Wi-Fi: name the interface. |
-| The console reboots | Silence until the console is back | OVSC stops the dead flows and requests them again; a refused or silent console is retried within 1 s. |
+| The Mac's address changes | A few seconds of silence; the returns may take longer | About 2 s after the change the network engine restarts on the new address; inputs return when the clock locks. The returns come back once the console requests OVSC's flows again, on its own timing (often several seconds, more while it finds the new address): test this with your console. With `interface = ""` it could pick Wi-Fi: name the interface. |
+| The console reboots | Silence until the console is back, and a few seconds more | OVSC stops the dead flows and requests them again. An unanswered request (after a 2 s wait) is retried within 1 s; a console that refuses while it boots is retried after 1 s, backing off to 5 s; one whose records are gone is looked up again every 2 to 4 s. Inputs can return several seconds after the console is ready. |
 | A packet is lost | A gap of one packet (under 1 ms at 48 kHz) on that flow's channels | Counted per flow; the flow is marked degraded for 5 s. |
 | The plug-in host overloads (misses its deadline) | A click | Counted by the driver as late output cycles. |
 | A plug-in outputs NaN or infinity | Silence on that channel | Counted as non-finite output. It is a plug-in fault. |
-| The transmit thread stalls briefly (up to 40 ms) | Nothing, or a click | Overdue packets are sent at once, oldest first; beyond 40 ms the flow resyncs and the skipped packets are counted. |
-| The daemon crashes (a panic anywhere) | 5 to 10 s of silence plus the clock relock | It logs the panic, says goodbye to the driver and exits; launchd starts a new daemon. Core Audio sees no change. |
+| The transmit thread stalls (rare: the Mac is overloaded) | A gap on the returns about as long as the stall beyond the console's slack (about 0.5 ms at a 1 ms console latency) | Packets up to 40 ms overdue are sent at once, oldest first, for receivers with longer latencies; beyond 40 ms the flow resyncs and the skipped packets are counted. Late sends and skips are warnings in the app. |
+| The daemon crashes (a panic anywhere) | 5 to 10 s of silence plus the clock relock; the returns may take longer | It logs the panic, says goodbye to the driver and exits; launchd starts a new daemon. Core Audio sees no change. The returns come back once the console requests OVSC's flows again, on its own timing. |
 | The Core Audio driver faults (a caught panic) | Silence on every channel until Core Audio restarts | Run `sudo killall coreaudiod`; the host will likely need to reopen the device. |
 | Another device uses OVSC's name mid-show | Nothing at once; new subscriptions may reach the wrong device | OVSC never renames itself mid-show; it logs an error and reports the conflict. Rename one device after the show. |
 | A controller changes a setting | See [Changes that interrupt audio](#changes-that-interrupt-audio) | With the show lock on, refused and listed in the app; without it, applied and listed. |
@@ -314,8 +334,8 @@ the holdover. Amber warnings follow:
 The same warnings reach the log at
 `/Library/Logs/OpenVirtualSoundcard/ovsc.log`: `health: <warning>` (WARN)
 when one appears and `health: cleared: <what>` (INFO) once it has been gone
-10 s. The status line every 30 s ends with `healthy` or `warnings:` and a
-short list. A script on the stage computer can poll the control socket
+10 s. The status line every 30 s reads `healthy`, or `warnings:` and a
+short list, before its `hal:` part. A script on the stage computer can poll the control socket
 (`{"op":"status"}` on `/var/run/ovsc/control.sock`) and alarm when
 `urgent_warnings` is above 0 or `driver.faulted` is true.
 
