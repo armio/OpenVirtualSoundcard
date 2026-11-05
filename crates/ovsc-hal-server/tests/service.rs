@@ -279,7 +279,7 @@ async fn drivers_attach_and_follow_the_device() {
     let io = device.audio();
     let rx0 = region.view().rx(0).unwrap();
     wait_for("peer audio in the region's rx ring 0", || {
-        let end = io.now().unwrap() - io.latency_samples;
+        let end = io.now().unwrap() - io.latency_samples();
         let start = end - 4800;
         let mut present = 0;
         for ts in start..end {
@@ -354,6 +354,90 @@ async fn drivers_attach_and_follow_the_device() {
     let gone = events.iter().position(|e| matches!(e, Event::Interrupted));
     assert!(bye.unwrap() < gone.unwrap(), "{events:?}");
     peer.shutdown().await;
+    device.shutdown().await;
+}
+
+/// A new receive latency, applied to the running device's receive side
+/// (`Device::restart_rx`), reaches the driver as a configuration with the
+/// new input safety offset while the engine keeps running: ENGINE_RUNNING
+/// never drops and the audio word stays valid, so the driver's gate stays
+/// open, and the output side of the configuration does not change. A
+/// rename afterwards keeps the new offsets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_latency_moves_the_input_offsets_while_the_engine_runs() {
+    let region = HalRegion::create("ovsc latency test").unwrap();
+    let registry = MemRegistry::new();
+    let mut cfg = device_config("hal-lat", 25160, 34);
+    cfg.tx_latency_ms = Some(1.0);
+    let server = HalServer::start(
+        options(&[202]),
+        region.clone(),
+        Box::new(registry.bind(SERVICE)),
+        EngineInfo::from_config(&cfg).unwrap(),
+    )
+    .unwrap();
+    let (client, log) = driver(&registry, 202);
+    let w = welcome(&client).await;
+    // 4 ms in (192 + the 24-frame margin), 1 ms out.
+    assert_eq!((w.config.input_safety_offset, w.config.output_latency), (216, 48));
+    let start =
+        StartOptions { rings: Some(region.external_rings(8, 8).unwrap()), ..Default::default() };
+    let device =
+        Device::start_with_options(cfg, free_running_clock_with_rate(1.0), start).await.unwrap();
+    server.engine_started(&device);
+    assert!(log.configs().is_empty(), "{:?}", log.configs());
+
+    // What the driver sees of the engine, read as fast as it can be while
+    // the latency changes.
+    let watching = Arc::new(AtomicBool::new(true));
+    let watcher = {
+        let (region, watching) = (region.clone(), watching.clone());
+        std::thread::spawn(move || {
+            let mut dropped = 0u64;
+            while watching.load(Ordering::Relaxed) {
+                let d = region.view().daemon();
+                let running = d.flags.load(Ordering::Acquire) & DAEMON_ENGINE_RUNNING != 0;
+                if !running || d.audio_word.load(Ordering::Acquire) == 0 {
+                    dropped += 1;
+                }
+            }
+            dropped
+        })
+    };
+    device.request_latency(2_000_000).unwrap();
+    assert!(device.restart_rx());
+    server.engine_changed(&device);
+    let pushed = wait_for("the new offsets", || log.configs().pop()).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    watching.store(false, Ordering::Relaxed);
+    assert_eq!(watcher.join().unwrap(), 0, "the driver saw the engine stop");
+
+    // 2 ms in: 96 + 24. Structural, so Core Audio reconfigures the device
+    // once; the output side is as it was.
+    assert_eq!(pushed.config_gen, 2);
+    assert_eq!((pushed.input_safety_offset, pushed.input_latency), (120, 0));
+    assert!(!pushed.structural_eq(&w.config));
+    let outputs = |c: &DriverConfig| (c.output_safety_offset, c.output_latency, c.output_channels);
+    assert_eq!(outputs(&pushed), outputs(&w.config));
+    let d = daemon(&region);
+    assert_eq!(flags(&region), DAEMON_ENGINE_RUNNING);
+    let audio = AudioWord::unpack(d.audio_word.load(Ordering::Acquire));
+    assert_eq!(audio, AudioWord { sample_rate: 48_000, config_gen: 2 });
+    let channels = ChannelsWord::unpack(d.channels_word.load(Ordering::Acquire));
+    assert_eq!(channels.latency_samples, 96);
+    assert!(server.status().engine_running);
+
+    // Nothing new: nothing pushed.
+    server.engine_changed(&device);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(log.configs().len(), 1);
+    // The names follow as before, on top of the new offsets.
+    device.rename("hal-lat-2").unwrap();
+    let renamed = wait_for("the new name", || log.configs().get(1).cloned()).await;
+    assert_eq!((renamed.config_gen, renamed.device_name.as_str()), (3, "hal-lat-2"));
+    assert!(renamed.structural_eq(&pushed));
+    assert!(!log.events().iter().any(|e| matches!(e, Event::Message(ToPlugin::Bye { .. }))));
+    server.shutdown().await;
     device.shutdown().await;
 }
 

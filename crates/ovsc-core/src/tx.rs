@@ -233,10 +233,10 @@ fn supervise(counters: &Counters, events: &mpsc::UnboundedSender<TxEvent>, body:
 /// receiver at a high latency could still have played are skipped with
 /// them. A tighter window, such as our own latency, would also skip
 /// packets after short stalls that a receiver set to a higher latency than
-/// ours still plays.
-fn catch_up_window(latency_samples: u64, rate: u32) -> u64 {
-    let max_latency_ns = (MAX_LATENCY_MS * 1e6) as u64;
-    ns_to_samples(max_latency_ns, rate).max(latency_samples)
+/// ours still plays. The receive latency has nothing to do with it, so it
+/// may change while the thread runs (`Device::restart_rx`).
+fn catch_up_window(rate: u32) -> u64 {
+    ns_to_samples((MAX_LATENCY_MS * 1e6) as u64, rate)
 }
 
 /// What one flow sends when the transmit thread wakes.
@@ -296,7 +296,7 @@ fn engine(
     counters.tx_not_realtime.store(!realtime, Ordering::Relaxed);
     let rate = shared.info.sample_rate;
     let guard = ns_to_samples(shared.info.tx_guard_ns, rate);
-    let window = catch_up_window(shared.info.latency_samples, rate);
+    let window = catch_up_window(rate);
     let backward = ns_to_samples(BACKWARD_STEP_NS, rate);
     // Room for every flow from the start: growing would allocate.
     let mut flows: Vec<TxFlow> = Vec::with_capacity(MAX_TX_FLOWS);
@@ -1440,9 +1440,8 @@ mod tests {
     #[test]
     fn the_catch_up_window_covers_every_receiver_latency() {
         // 40 ms, whatever latency we run at ourselves.
-        assert_eq!(catch_up_window(48, 48_000), 1920);
-        assert_eq!(catch_up_window(192, 48_000), 1920);
-        assert_eq!(catch_up_window(0, 96_000), 3840);
+        assert_eq!(catch_up_window(48_000), 1920);
+        assert_eq!(catch_up_window(96_000), 3840);
     }
 
     #[test]

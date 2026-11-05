@@ -131,7 +131,7 @@ fn start_feeder(io: AudioIo, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<(
 /// Checks that `rx_ch` of `io` carries `tx_ch`'s signal for the last 100 ms.
 fn verify(io: &AudioIo, rx_ch: usize, tx_ch: usize) -> Result<(), String> {
     let now = io.now().unwrap();
-    let end = now - io.latency_samples;
+    let end = now - io.latency_samples();
     let start = end - io.sample_rate as u64 / 10;
     let mut buf = vec![0i32; (end - start) as usize];
     let present = io.read_rx(rx_ch, start, &mut buf);
@@ -215,7 +215,7 @@ async fn audio_flows_through_rings_in_a_region() {
     // view, as the driver would.
     let view = region.view();
     let (rx0, tx2) = (view.rx(0).unwrap(), view.tx(2).unwrap());
-    let end = ext_io.now().unwrap() - ext_io.latency_samples;
+    let end = ext_io.now().unwrap() - ext_io.latency_samples();
     let mut present = 0;
     for ts in end - 4800..end {
         if let Some(s) = rx0.read_one(ts) {

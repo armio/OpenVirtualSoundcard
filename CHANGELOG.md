@@ -33,8 +33,9 @@ The first public version, not released yet.
   settings, the network, a pre-show check, and what happens when something
   fails.
 - `[device] tx_latency_ms`: the latency the transmit channels ask receivers
-  for, separate from the receive latency. Unset, it follows `latency_ms` as
-  before. The device reports it to Core Audio as its output latency.
+  for, separate from the receive latency. Unset, it is the configured
+  `latency_ms`, as before. The device reports it to Core Audio as its output
+  latency.
 - The show lock (`[device] lock_remote_settings`, or the app): controllers
   cannot change the latency, sample rate, encoding or names while it is on.
   The app lists the changes controllers made or tried.
@@ -60,6 +61,16 @@ The first public version, not released yet.
 
 ### Changed
 
+- A new receive latency, from the app or Dante Controller (ARC 0x1101),
+  restarts only the receive side instead of the whole network engine: the
+  receive flows are requested again at the new latency, the backends read
+  the inputs at it, and the Core Audio driver gets its new input safety
+  offset while the engine runs on (one configuration change in Core Audio).
+  The transmit flows, such as the returns to a console, keep their handles
+  and keep sending, and the mDNS records and the clock carry on. The control
+  socket answers `"restart":"receive"` for it, and the app says what it
+  does. The transmit latency no longer follows a receive latency set from
+  the app or a controller: unset, it stays the configured `latency_ms`.
 - A Dante leader change, a lost leader (30 s of holdover) and a clock that
   unlocks under congestion no longer interrupt audio when the new leader
   agrees with the running clock. A leader whose time differs by more than
@@ -76,13 +87,13 @@ The first public version, not released yet.
 - Latencies below 1 ms are refused from the app and controllers, and raised
   to the minimum, with a warning, in the configuration: packets leave 0.5 ms
   after their time.
-- A device restarted in-process (a latency change, an address change), or
-  by a new daemon on the same Mac (after a crash, at a reboot), keeps the
-  name it announced instead of probing it again, so a name conflict can no
-  longer rename it mid-show. The state file keeps the name with the
-  interface's MAC address; a copy on another Mac (a cloned disk) probes as
-  before. The daemon offers Core Audio the saved latency and names at
-  start, so its restart does not reconfigure the device twice.
+- A device restarted in-process (an address change), or by a new daemon on
+  the same Mac (after a crash, at a reboot), keeps the name it announced
+  instead of probing it again, so a name conflict can no longer rename it
+  mid-show. The state file keeps the name with the interface's MAC address;
+  a copy on another Mac (a cloned disk) probes as before. The daemon offers
+  Core Audio the saved latency and names at start, so its restart does not
+  reconfigure the device twice.
 - While the show lock is on, controllers see the sample rate and encoding as
   fixed.
 - Transmit flows accept 2 to 32 frames per packet and 1 to 8 channels, as

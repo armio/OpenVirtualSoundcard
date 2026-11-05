@@ -23,7 +23,7 @@ use crate::mdns::{self, Advertisement, Mdns, NameConflict};
 use crate::net::{Interface, bind_udp, into_tokio};
 use crate::persist::{self, SavedState};
 use crate::rx::{RxManager, own_channel_txt};
-use crate::state::{FormatRequest, RemoteChanges, Shared, State, Subscription};
+use crate::state::{FormatRequest, RemoteChanges, RxLatency, Shared, State, Subscription};
 use crate::tx::{self, FlowControl, TxCommand};
 use crate::{Error, Result};
 
@@ -307,7 +307,7 @@ impl Device {
             shared.info.rx_channels.len(),
             shared.info.sample_rate,
             shared.info.format.bits(),
-            shared.info.latency_ns as f64 / 1e6,
+            shared.info.latency.ns() as f64 / 1e6,
         );
         Ok(Self {
             shared,
@@ -374,15 +374,59 @@ impl Device {
     }
 
     /// Sets the receive latency to `ns`, saved for the next start of the
-    /// device; [`Device::latency_requests`] listeners restart it to apply it.
+    /// device; [`Device::latency_requests`] listeners apply it with
+    /// [`Device::restart_rx`].
     pub fn request_latency(&self, ns: u32) -> Result<()> {
         self.shared.request_latency(ns)
     }
 
-    /// The receive latency from the next start of the device on, in ns:
-    /// the running one unless a controller or the app set another.
+    /// The receive latency asked for last, in ns: the running one unless a
+    /// controller or the app set another that [`Device::restart_rx`] has
+    /// not applied yet. The device starts with it next time.
     pub fn configured_latency_ns(&self) -> u32 {
         self.shared.configured_latency_ns()
+    }
+
+    /// The receive latency the device runs at, in ns.
+    pub fn latency_ns(&self) -> u32 {
+        self.shared.info.latency.ns()
+    }
+
+    /// The receive latency the device runs at, in samples.
+    pub fn latency_samples(&self) -> u64 {
+        self.shared.info.latency.samples()
+    }
+
+    /// Restarts the receive side at the receive latency asked for last
+    /// ([`Device::request_latency`]), if the device does not run at it yet.
+    /// Returns whether it changed.
+    ///
+    /// Only what the receive latency is about follows it, at once:
+    ///
+    /// * every receive flow is stopped and requested again with frames per
+    ///   packet and a latency of its own that suit the new latency; the
+    ///   transmitter is told to stop the old flow before it is asked for
+    ///   the new one, which comes back about as fast as the transmitter
+    ///   answers (and the subscriptions show `InProgress` meanwhile);
+    /// * [`AudioIo::latency_samples`], how far behind the media clock audio
+    ///   backends read the receive rings, and the latency reported to
+    ///   controllers (ARC) and in [`DeviceInfo::latency`].
+    ///
+    /// Nothing else stops or changes: the transmit flows, which other
+    /// devices receive from this one, keep their handles and keep sending;
+    /// the flow-control server keeps answering; the mDNS records stay
+    /// announced as they are, the transmit latency they advertise
+    /// included.
+    pub fn restart_rx(&self) -> bool {
+        let changed = self.shared.restart_rx();
+        if changed {
+            info!(
+                "receive latency {} ms: requesting the receive flows again; the transmit flows \
+                 go on",
+                self.latency_ns() as f64 / 1e6
+            );
+        }
+        changed
     }
 
     /// Wakes up whenever a controller or the app asks for a new latency.
@@ -457,7 +501,7 @@ impl Device {
             clock: self.shared.clock.clone(),
             sample_rate: self.shared.info.sample_rate,
             format: self.shared.info.format,
-            latency_samples: self.shared.info.latency_samples,
+            latency: self.shared.info.latency.clone(),
             rx: self.shared.rx_rings.clone(),
             tx: self.shared.tx_rings.clone(),
             rx_names: self.shared.info.rx_channels.clone(),
@@ -716,7 +760,7 @@ fn initial_state(
         tx_flows: Vec::new(),
         rx_flows: Vec::new(),
         rx_flow_stats: Vec::new(),
-        latency_override_ns: saved.latency_ns.filter(|&ns| ns == info.latency_ns),
+        latency_override_ns: saved.latency_ns.filter(|&ns| ns == info.latency.ns()),
         remote_settings_locked: saved.lock_remote_settings.unwrap_or(config.lock_remote_settings),
         remote_settings_lock_set: saved.lock_remote_settings,
     }
@@ -873,7 +917,9 @@ fn advertisement(shared: &Shared) -> (String, Vec<Record>) {
 /// What an audio backend needs: the media clock and the channel rings.
 ///
 /// * Receive: read ring `rx[ch]` at `now - latency` (never later: newer
-///   samples may not have arrived yet).
+///   samples may not have arrived yet). The latency changes while the
+///   device runs ([`Device::restart_rx`]): read [`AudioIo::latency_samples`]
+///   anew for each period, as it costs one atomic load.
 /// * Transmit: write ring `tx[ch]` ahead of `now` (at least your callback
 ///   period plus the transmit guard), so samples are there when the network
 ///   thread picks them up.
@@ -882,7 +928,8 @@ pub struct AudioIo {
     pub clock: MediaClock,
     pub sample_rate: u32,
     pub format: SampleFormat,
-    pub latency_samples: u64,
+    /// The device's receive latency, shared with it.
+    pub latency: RxLatency,
     pub rx: Vec<Arc<TimedRing>>,
     pub tx: Vec<Arc<TimedRing>>,
     pub rx_names: Vec<String>,
@@ -893,6 +940,12 @@ impl AudioIo {
     /// Current media time in samples, if the clock is available.
     pub fn now(&self) -> Option<u64> {
         self.clock.now_samples(self.sample_rate)
+    }
+
+    /// The receive latency now, in samples: read the receive rings this far
+    /// behind the media clock. Neither locks nor allocates.
+    pub fn latency_samples(&self) -> u64 {
+        self.latency.samples()
     }
 
     /// Reads receive channel `ch` for timestamps `ts..ts + out.len()`.

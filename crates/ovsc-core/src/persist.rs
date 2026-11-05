@@ -151,11 +151,10 @@ fn save_lock() -> MutexGuard<'static, ()> {
 }
 
 /// The problems [`SavedState::recover`] found in this process, by state
-/// file. A device started again later (a new latency, a new network
-/// address) reads the file its predecessor saved, intact by then; the
-/// warning must outlive that restart, which can follow within seconds of
-/// the start (a power cut also brings the network up late), or nobody
-/// sees it.
+/// file. A device started again later (on a new network address) reads the
+/// file its predecessor saved, intact by then; the warning must outlive
+/// that restart, which can follow within seconds of the start (a power cut
+/// also brings the network up late), or nobody sees it.
 static PROBLEMS: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
 
 /// What [`SavedState::recover`] last found wrong with the state file at

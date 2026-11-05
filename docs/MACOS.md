@@ -190,12 +190,13 @@ needs a name of its own.
   `<name>` reach the device that kept it: re-patch the ones meant for this
   one before the show.
 * Once the device has its name, it keeps it without asking again when the
-  daemon restarts its network engine (for a new latency, or when the
-  network interface changes), and when a new daemon starts on the same Mac
-  (launchd starting one after a crash, a reboot). `state.toml` saves the
-  name the device holds under `[claim]`, with the MAC address of the Dante
-  interface; a new daemon announces the name at once if it is still the
-  device's name and the interface's MAC address is the same.
+  daemon restarts its network engine (when the network interface changes;
+  a new latency restarts nothing that announces it), and when a new daemon
+  starts on the same Mac (launchd starting one after a crash, a reboot).
+  `state.toml` saves the name the device holds under `[claim]`, with the
+  MAC address of the Dante interface; a new daemon announces the name at
+  once if it is still the device's name and the interface's MAC address is
+  the same.
 * If another device starts announcing the name while this one runs (one
   that does not probe, or two devices started at the same instant), this
   device keeps its name, since renaming it mid-show would break every
@@ -244,7 +245,7 @@ already in use`. Add the section and restart the daemon.
 | `[device] sample_rate` | 44100, 48000, 88200, 96000, 176400 or 192000. |
 | `[device] bits_per_sample` | 16, 24 or 32, for the transmitted audio. |
 | `[device] latency_ms` | The receive latency, 1 to 40 ms: the device's inputs are read this long after their timestamps. |
-| `[device] tx_latency_ms` | The transmit latency, 1 to 40 ms: the least latency the device asks of receivers of its outputs (the console); see [Latency and safety offsets](#latency-and-safety-offsets). Unset: `latency_ms`. |
+| `[device] tx_latency_ms` | The transmit latency, 1 to 40 ms: the least latency the device asks of receivers of its outputs (the console); see [Latency and safety offsets](#latency-and-safety-offsets). Unset: `latency_ms` as configured here; a receive latency set from the app or Dante Controller does not change it. |
 | `[clock] source` | `"ptp"` follows the network's PTP master; `"free"` runs on this Mac's own clock, for a network without a master. `"system"` is refused. |
 | `[device] lock_remote_settings` | `false` (default) or `true`: the [show lock](#locking-the-settings-for-a-show). The app's choice replaces it. |
 
@@ -319,32 +320,38 @@ against that setting. Like a rename, the new latency is saved in the device's st
 (`state.toml`, as `latency_ns`) and from then on replaces
 `latency_ms`, also after a reboot. Deleting `latency_ns` from the state file
 (then restarting the daemon) goes back to `latency_ms`. Only the receive
-latency is set this way; while `tx_latency_ms` is unset, the transmit
-latency follows it. A saved latency below the least the device allows is
-ignored at start.
+latency is set this way: the transmit latency stays the configured one
+(`tx_latency_ms`, or else the `latency_ms` of `ovsc.toml`), also at the next
+start. A saved latency below the least the device allows is ignored at
+start.
 
-To apply it, the daemon restarts its network engine while the clock keeps
-running and the driver stays attached. Although only the receive side
-changes, the restart stops audio in both directions:
+The daemon applies it at once, to the receive side only. The network
+engine, the clock and the driver's connection keep running:
 
-1. Each receive flow is stopped, then the device withdraws all its mDNS
-   records (goodbyes for the device and every transmit channel).
-2. Every transmit flow closes, so the feeds other devices receive from
-   OpenVirtualSoundcard (the processed returns to a console, say) stop.
-3. The engine starts again with the new latency, announces itself, and
-   requests its receive flows again: its inputs come back after about a
-   second.
-4. Each device that received from it must notice and request its flow
-   again. When that happens depends on that device, not on
-   OpenVirtualSoundcard; expect several seconds, and test it with your
-   console before relying on it.
+1. Each receive flow is stopped (its transmitter is told so first) and
+   requested again with packets and a latency of its own that suit the new
+   latency: the inputs come back as soon as the transmitter answers,
+   usually within a second. Meanwhile their subscriptions show as in
+   progress.
+2. Nothing on the transmit side changes: the flows other devices receive
+   from OpenVirtualSoundcard (the processed returns to a console, say) keep
+   their handles and keep sending, so those devices never have to request
+   them again, and the device's mDNS records stay announced as they are,
+   the latency they ask of receivers included.
+3. The driver is offered a configuration with the new input safety offset
+   (in latency mode, the new input latency and read delay); the output side
+   stays as it was. The engine never stops as the driver sees it, so its
+   gate stays open. The new offset is a structural change for Core Audio,
+   so the driver asks for a configuration change: Core Audio stops IO for a
+   moment, applies it and starts IO again, and some applications restart
+   their audio engine on it. The returns stay open meanwhile but carry
+   silence until the application's output comes back.
 
-Core Audio also sees a configuration change with the new latency and safety
-offsets, and some applications restart their audio engine on it. The log
-says `restarting the network engine for a receive latency of ... ms`, and
-warns when transmit flows were open. Change the latency before the show, or
-[lock the settings](#locking-the-settings-for-a-show) so that nobody does it
-from Dante Controller during one.
+The log says `receive latency ... ms: requesting the receive flows again;
+the transmit flows go on`, then `hal: driver configuration ...` with the
+new offsets. Prefer changing the latency between songs or before the show,
+and [lock the settings](#locking-the-settings-for-a-show) so that nobody
+does it from Dante Controller during one.
 
 The `[coreaudio]` section tunes the device:
 
@@ -416,9 +423,11 @@ without it.
   latency and the [show lock](#locking-the-settings-for-a-show). **Apply**
   sends only what changed, and asks first for anything that interrupts
   audio or other devices' subscriptions, saying what it does:
-  * A new latency restarts the network engine: audio stops for a second or
-    two in both directions, and devices receiving from OpenVirtualSoundcard,
-    such as a console taking its returns, must request their flows again
+  * A new latency restarts the device's inputs: they stop for about a
+    second while it requests its receive flows again. The feeds other
+    devices receive from OpenVirtualSoundcard, such as a console's returns,
+    stay open; Core Audio reconfigures the device for its new input safety
+    offset, which some applications answer by restarting their audio engine
     (see [above](#setting-the-latency-from-dante-controller-or-the-app)).
   * A new interface, rate, bit depth or channel count is written into
     `ovsc.toml`, keeping its comments, and restarts the whole daemon:
@@ -456,7 +465,7 @@ echo '{"op":"apply","change":{"latency_ms":2}}' | nc -U /var/run/ovsc/control.so
 | `{"op":"status"}` | `"result":"status"`: the device, the clock, the driver (`audio_flowing`; `faulted`, a driver silent until Core Audio restarts; `audio_trouble`, audible problems in the last 30 s) and `warnings`, of which the first `urgent_warnings` mean audio is down now; `earlier` holds controllers' changes older than 10 minutes. |
 | `{"op":"settings"}` | `"result":"settings"`: `name`, `interface`, `sample_rate`, `bits_per_sample`, `rx_channels`, `tx_channels`, `latency_ms`, `lock_remote_settings`. |
 | `{"op":"interfaces"}` | `"result":"interfaces"`: the interfaces that are up and have an IPv4 address. |
-| `{"op":"apply","change":{...}}` | `"result":"applied"` with `"restart"`: `"none"`, `"device"` (the network engine restarts) or `"daemon"` (the daemon exits for launchd to start it again); or `"result":"error"` with a `message`, and nothing changed. `change` holds any of the settings' fields. |
+| `{"op":"apply","change":{...}}` | `"result":"applied"` with `"restart"`: `"none"`, `"receive"` (a new latency: the receive flows restart, the rest runs on) or `"daemon"` (the daemon exits for launchd to start it again); or `"result":"error"` with a `message`, and nothing changed. `change` holds any of the settings' fields. Daemons before `"receive"` answered `"device"` for a new latency (the whole network engine restarted). |
 
 ## What applications see
 
@@ -487,9 +496,12 @@ computes both (`compute_offsets` in
 [`crates/ovsc-ipc/src/protocol.rs`](../crates/ovsc-ipc/src/protocol.rs)),
 with:
 
-* `L = round(latency_ms × fs / 1000)`, the receive latency;
-* `T = round(tx_latency_ms × fs / 1000)`, the transmit latency (`T = L`
-  while `tx_latency_ms` is unset);
+* `L = round(latency_ms × fs / 1000)`, the receive latency, as the device
+  runs it (set from the app or Dante Controller, it changes while the
+  device runs);
+* `T = round(tx_latency_ms × fs / 1000)`, the transmit latency (while
+  `tx_latency_ms` is unset, the configured `latency_ms`, which a receive
+  latency set from the app or Dante Controller does not change);
 * `guard = floor(tx_guard_us × fs / 1e6)`: a packet is sent this long after
   its timestamp (`tx_guard_us` is 500 µs by default);
 * `FPP_MAX = 32`, the most frames per transmitted packet;
@@ -523,11 +535,11 @@ sections 2.2 and 8.4). So the console plays the device's outputs
 its output latency. That is right while the console's latency is at most
 `T`; if it is longer, set `output_latency_ms` to it, or hosts under-report
 the output path by the difference. While `tx_latency_ms` is unset, `T` is
-the receive latency: raising `latency_ms` (here, from the app or from Dante
-Controller) then delays the console's playout of the outputs as well as the
-inputs. For live use, set `tx_latency_ms = 1.0`: the console then plays the
-returns at its own latency (at least 1 ms), and `latency_ms` sets only the
-input side.
+the receive latency configured in `ovsc.toml`: raising `latency_ms` there
+delays the console's playout of the outputs as well as the inputs, while a
+latency set from the app or Dante Controller changes the inputs only. For
+live use, set `tx_latency_ms = 1.0`: the console then plays the returns at
+its own latency (at least 1 ms), and `latency_ms` sets only the input side.
 
 With the default margins, 4 ms latency (`tx_latency_ms` unset) and the
 default guard:
@@ -1018,7 +1030,9 @@ region and retires the old one.
 **Configuration changes.** The configuration travels in every welcome, and
 the daemon pushes a new one to attached drivers when it changes, for example
 when a controller renames a channel. A new rate or channel count comes with a
-daemon restart, in the new daemon's welcome. Names alone are published at once,
+daemon restart, in the new daemon's welcome. A new receive latency is pushed
+to the attached drivers while the engine runs on (ENGINE_RUNNING stays set),
+with the new input offsets. Names alone are published at once,
 with a property-changed notification on the element names. Anything else
 (rate, channel counts, offsets, latencies, clock algorithm) is structural:
 the driver asks Core Audio for a configuration change

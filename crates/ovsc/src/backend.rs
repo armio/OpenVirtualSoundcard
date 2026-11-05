@@ -107,18 +107,19 @@ pub fn tone(io: AudioIo, base_hz: u32, level_db: f64) -> Running {
 }
 
 /// Sends receive channel `n` back out on transmit channel `n`, delayed by the
-/// receive latency plus a small lead.
+/// receive latency plus a small lead. A new receive latency moves the delay
+/// with it.
 pub fn loopback(io: AudioIo) -> Running {
     Running::spawn("ovsc-loopback", move |stop| {
         let Some(now) = wait_for_clock(&io, &stop) else { return };
-        let latency = io.latency_samples;
         let lead = io.sample_rate as u64 / 100; // 10 ms
-        let mut pos = now.saturating_sub(latency);
+        let mut pos = now.saturating_sub(io.latency_samples());
         let channels = io.rx.len().min(io.tx.len());
         let mut buf = vec![0i32; io.sample_rate as usize];
         info!("loopback: rx 1..{channels} -> tx 1..{channels}");
         while !stop.load(Ordering::Relaxed) {
             if let Some(now) = io.now() {
+                let latency = io.latency_samples();
                 let ready = now.saturating_sub(latency);
                 if pos + io.sample_rate as u64 <= ready || pos > ready + lead {
                     pos = ready;
@@ -137,15 +138,16 @@ pub fn loopback(io: AudioIo) -> Running {
     })
 }
 
-/// Records every receive channel into a WAV file (24-bit PCM).
+/// Records every receive channel into a WAV file (24-bit PCM). The
+/// recording follows the media timeline without a break when the receive
+/// latency changes: only how far behind the clock it reads moves.
 pub fn record(io: AudioIo, path: &Path) -> anyhow::Result<Running> {
     let mut wav = WavWriter::create(path, io.rx.len() as u16, io.sample_rate, 24)
         .with_context(|| format!("creating {}", path.display()))?;
     let path = path.to_owned();
     Ok(Running::spawn("ovsc-record", move |stop| {
         let Some(now) = wait_for_clock(&io, &stop) else { return };
-        let latency = io.latency_samples;
-        let mut pos = now.saturating_sub(latency);
+        let mut pos = now.saturating_sub(io.latency_samples());
         let channels = io.rx.len();
         let mut planes = vec![vec![0i32; io.sample_rate as usize]; channels];
         let mut frame_bytes = Vec::with_capacity(io.sample_rate as usize * channels * 3);
@@ -153,7 +155,7 @@ pub fn record(io: AudioIo, path: &Path) -> anyhow::Result<Running> {
         info!("recording {channels} channels to {}", path.display());
         while !stop.load(Ordering::Relaxed) {
             if let Some(now) = io.now() {
-                let ready = now.saturating_sub(latency);
+                let ready = now.saturating_sub(io.latency_samples());
                 if ready > pos + 10 * io.sample_rate as u64 {
                     warn!("recorder fell behind, skipping {} samples", ready - pos);
                     pos = ready;
@@ -193,9 +195,9 @@ pub fn record(io: AudioIo, path: &Path) -> anyhow::Result<Running> {
 }
 
 /// The file of the `n`th recording to `path`, 0 being the first: a device
-/// restarted mid-recording (a new latency, a new network address) records
-/// on into a new file rather than over the old one. `take.wav`, then
-/// `take-2.wav`, `take-3.wav`, …
+/// restarted mid-recording (on a new network address) records on into a
+/// new file rather than over the old one. `take.wav`, then `take-2.wav`,
+/// `take-3.wav`, …
 pub fn numbered(path: &Path, n: u32) -> PathBuf {
     if n == 0 {
         return path.to_owned();

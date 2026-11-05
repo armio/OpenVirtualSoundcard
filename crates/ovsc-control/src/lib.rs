@@ -11,7 +11,7 @@
 //! → {"op":"status"}
 //! ← {"result":"status","protocol":1,"version":"0.1.0",...}
 //! → {"op":"apply","change":{"latency_ms":2.0}}
-//! ← {"result":"applied","restart":"device"}
+//! ← {"result":"applied","restart":"receive"}
 //! ```
 
 use serde::{Deserialize, Serialize};
@@ -76,18 +76,27 @@ pub enum Response {
     },
 }
 
-/// What restarts to apply a change. Either restart stops audio both ways:
-/// the device's inputs, and every flow other devices receive from it (such
-/// as returns to a console), which they must request again.
+/// What restarts to apply a change. [`Restart::Device`] and
+/// [`Restart::Daemon`] stop audio both ways: the device's inputs, and every
+/// flow other devices receive from it (such as returns to a console), which
+/// they must request again. [`Restart::Receive`] stops the inputs only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Restart {
     /// Nothing: applied at once (a new name, the show lock). A new name
     /// still leaves other devices' subscriptions to this one unresolved.
     None,
+    /// The device's receive side restarts, the network engine and the clock
+    /// keep running (a new receive latency): the inputs stop for about a
+    /// second while the device requests its receive flows again, and the
+    /// flows other devices receive from it go on. A Core Audio host sees a
+    /// configuration change (new input safety offsets), on which some hosts
+    /// restart their audio engine.
+    Receive,
     /// The network engine restarts, the clock keeps running: audio stops
     /// for a second or two, and devices receiving from this one may take
-    /// several more seconds to subscribe again (a new latency).
+    /// several more seconds to subscribe again. What daemons before
+    /// [`Restart::Receive`] answered for a new latency; this one never does.
     Device,
     /// The whole daemon restarts and the clock locks again: audio stops for
     /// ten to twenty seconds (a new interface, sample rate, bit depth or
@@ -375,6 +384,7 @@ mod tests {
     #[test]
     fn responses_round_trip() {
         let responses = [
+            Response::Applied { restart: Restart::Receive },
             Response::Applied { restart: Restart::Device },
             Response::Error { message: "no".into() },
             Response::Interfaces {
@@ -402,6 +412,15 @@ mod tests {
         assert_eq!(
             encode_line(&Response::Applied { restart: Restart::None }),
             "{\"result\":\"applied\",\"restart\":\"none\"}\n"
+        );
+        assert_eq!(
+            encode_line(&Response::Applied { restart: Restart::Receive }),
+            "{\"result\":\"applied\",\"restart\":\"receive\"}\n"
+        );
+        // An older daemon's answer to a new latency still reads.
+        assert_eq!(
+            decode_line::<Response>("{\"result\":\"applied\",\"restart\":\"device\"}").unwrap(),
+            Response::Applied { restart: Restart::Device }
         );
     }
 

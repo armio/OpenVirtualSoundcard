@@ -239,7 +239,7 @@ fn engine_reading(
         ptp: cfg.clock.source == ClockSource::Ptp,
         clock_age,
         local_ns: local_now_ns(),
-        latency_ms: d.info().latency_ns as f64 / 1e6,
+        latency_ms: d.latency_ns() as f64 / 1e6,
         interface: d.info().iface.name.clone(),
         rx: d.rx_channels(),
         stopped_part: d.stopped_part(),
@@ -457,7 +457,7 @@ fn device_status(d: &Device) -> DeviceStatus {
         ip: info.iface.ip.to_string(),
         sample_rate: info.sample_rate,
         bits_per_sample: info.format.bits(),
-        latency_ms: info.latency_ns as f64 / 1e6,
+        latency_ms: d.latency_ns() as f64 / 1e6,
         rx_channels: d
             .rx_channels()
             .into_iter()
@@ -623,16 +623,11 @@ pub fn apply(view: &View<'_>, change: &SettingsChange) -> anyhow::Result<Restart
                 d.rename(name)?;
             }
             if let Some(ns) = latency_ns {
-                if ns != d.info().latency_ns && restart != Restart::Daemon {
-                    if !d.tx_flows().is_empty() {
-                        warn!(
-                            "the new latency restarts the network engine: the flows {} receive \
-                             from this device stop until each of them requests its flow again",
-                            receivers(d)
-                        );
-                    }
+                if ns != d.latency_ns() && restart != Restart::Daemon {
+                    // The daemon restarts the receive side with it at once
+                    // (`Device::restart_rx`); the transmit flows go on.
                     d.request_latency(ns)?;
-                    restart = Restart::Device;
+                    restart = Restart::Receive;
                 } else if ns != d.configured_latency_ns() {
                     d.request_latency(ns)?;
                 }
@@ -661,8 +656,8 @@ pub fn apply(view: &View<'_>, change: &SettingsChange) -> anyhow::Result<Restart
 /// A receive latency of `ms` from the app, in ns, if the device allows it
 /// with a transmit guard of `tx_guard_us`: the rule of
 /// `ovsc_core::config::check_latency_ms`, which also holds controllers'
-/// writes and the configuration, so that the device never refuses a
-/// latency it restarts to apply.
+/// writes and the configuration, so that the app cannot set a latency the
+/// device would then refuse to start with.
 fn check_latency(ms: f64, tx_guard_us: u32) -> anyhow::Result<u32> {
     let min = ctl::LATENCY_MIN_MS.max(min_latency_ms(tx_guard_us));
     if !(min..=ctl::LATENCY_MAX_MS).contains(&ms) {

@@ -2,9 +2,9 @@
 //! (ARC, flow control, media packets, keepalives) with each other.
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use ovsc_clock::system_clock;
 use ovsc_core::client;
@@ -64,7 +64,7 @@ fn start_feeder(io: AudioIo, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<(
 /// Checks that `rx_ch` of `io` carries `tx_ch`'s signal for the last 100 ms.
 fn verify(io: &AudioIo, rx_ch: usize, tx_ch: usize) -> Result<(), String> {
     let now = io.now().unwrap();
-    let end = now - io.latency_samples;
+    let end = now - io.latency_samples();
     let start = end - io.sample_rate as u64 / 10;
     let mut buf = vec![0i32; (end - start) as usize];
     let present = io.read_rx(rx_ch, start, &mut buf);
@@ -212,8 +212,9 @@ async fn a_controller_sets_the_latency() {
     );
     tokio::time::timeout(Duration::from_secs(2), requests.changed()).await.unwrap().unwrap();
     assert_eq!(*requests.borrow(), Some(2_000_000));
-    // Still running at 4 ms until restarted; the configured value is 2 ms.
-    assert_eq!(dev.info().latency_ns, 4_000_000);
+    // Still running at 4 ms until applied (`restart_rx`, which the daemons
+    // call); the configured value is 2 ms.
+    assert_eq!(dev.latency_ns(), 4_000_000);
 
     // Out of range: refused.
     let resp = ask(arc::encode_set_latency_request(client::next_seq(), 100_000, 4)).await.unwrap();
@@ -226,7 +227,7 @@ async fn a_controller_sets_the_latency() {
     .await;
     dev.shutdown().await;
     let dev = Device::start(cfg, system_clock()).await.unwrap();
-    assert_eq!(dev.info().latency_ns, 2_000_000);
+    assert_eq!(dev.latency_ns(), 2_000_000);
     dev.shutdown().await;
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -551,4 +552,246 @@ async fn a_re_requested_flow_sends_the_packets_asked_for() {
     assert!(!stats.tx_engine_failed);
     assert_eq!(stats.tx_send_errors, 0, "{stats:?}");
     tx.shutdown().await;
+}
+
+/// What a receiver standing in for a console got of a flow of transmit
+/// channels 1 and 2.
+#[derive(Debug, Default)]
+struct Returns {
+    packets: u64,
+    /// Packets whose timestamp is not where the previous one ended: lost or
+    /// restarted audio.
+    gaps: u64,
+    /// Samples received, and those that carry their channel's signal.
+    samples: u64,
+    matching: u64,
+    /// The longest wait between two packets.
+    longest_wait: Duration,
+}
+
+/// Receives the flow of transmit channels 1 and 2 on `socket` into
+/// `returns` until `stop`, answering with keepalives as a receiver does.
+async fn receive_returns(
+    socket: tokio::net::UdpSocket,
+    returns: Arc<Mutex<Returns>>,
+    stop: Arc<AtomicBool>,
+) {
+    use ovsc_proto::audio::{AudioPacket, KEEPALIVE, SampleFormat};
+
+    let mut buf = [0u8; 2048];
+    let mut samples = [0i32; 64];
+    let mut expected = None;
+    let mut last: Option<Instant> = None;
+    let mut keepalive = Instant::now();
+    while !stop.load(Ordering::Relaxed) {
+        let wait = Duration::from_millis(100);
+        let Ok(Ok((n, from))) = tokio::time::timeout(wait, socket.recv_from(&mut buf)).await else {
+            continue;
+        };
+        let now = Instant::now();
+        if now >= keepalive {
+            let _ = socket.send_to(&KEEPALIVE, from).await;
+            keepalive = now + Duration::from_millis(250);
+        }
+        let Ok(packet) = AudioPacket::parse(&buf[..n], 2, SampleFormat::S24) else { continue };
+        let ts = packet.timestamp(48_000);
+        let mut r = returns.lock().unwrap();
+        r.packets += 1;
+        if expected.is_some_and(|e| e != ts) {
+            r.gaps += 1;
+        }
+        expected = Some(ts + packet.frames() as u64);
+        if let Some(last) = last {
+            r.longest_wait = r.longest_wait.max(now - last);
+        }
+        last = Some(now);
+        for ch in 0..2 {
+            let k = packet.read_channel(ch, &mut samples);
+            r.samples += k as u64;
+            let matching = (0..k).filter(|&i| samples[i] == signal(ts + i as u64, ch)).count();
+            r.matching += matching as u64;
+        }
+    }
+}
+
+/// The receive flows of the device whose ARC server is on `port`, as
+/// Dante Controller lists them.
+async fn rx_flows(port: u16) -> Vec<arc::RxFlowInfo> {
+    client::arc_paged(
+        Ipv4Addr::LOCALHOST,
+        SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        arc::opcode::RX_FLOWS,
+        arc::decode_rx_flows_response,
+    )
+    .await
+    .unwrap()
+}
+
+/// A new receive latency restarts the receive side only
+/// (`Device::restart_rx`). The flows other devices receive from the device
+/// (its processed returns to a console) keep their handles and keep
+/// sending without a break in their timestamps, while the device's own
+/// receive flows (the console's channels) are requested again and come back
+/// at the new latency, which its inputs are then read at.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_receive_latency_leaves_the_transmit_flows_alone() {
+    use ovsc_proto::dbcp::FlowRequest;
+
+    const OVSC: u16 = 25170;
+    const CONSOLE: u16 = 25180;
+    let clock = system_clock();
+    // The console asks its receivers for 1 ms only, so that flows from it
+    // play at the device's latency.
+    let console_config =
+        DeviceConfig { tx_latency_ms: Some(1.0), ..config("console", CONSOLE, 13) };
+    let (console_dir, ovsc_dir) = (StaticDirectory::new(), StaticDirectory::new());
+    let console = Device::start_with_directory(console_config, clock.clone(), console_dir.clone())
+        .await
+        .unwrap();
+    let ovsc =
+        Device::start_with_directory(config("lat-ovsc", OVSC, 12), clock.clone(), ovsc_dir.clone())
+            .await
+            .unwrap();
+    for entry in console.directory_entries() {
+        ovsc_dir.insert(entry);
+    }
+    for entry in ovsc.directory_entries() {
+        console_dir.insert(entry);
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let feeders =
+        [start_feeder(console.audio(), stop.clone()), start_feeder(ovsc.audio(), stop.clone())];
+
+    // The device's inputs: two of the console's channels, at 10 ms. And a
+    // return the console subscribes to itself: the device's channel 3.
+    let io = ovsc.audio();
+    let console_io = console.audio();
+    ovsc.subscribe(1, "01", "console").unwrap();
+    ovsc.subscribe(2, "02", "console").unwrap();
+    console.subscribe(1, "03", "lat-ovsc").unwrap();
+    eventually("the console's channels at 10 ms, and the return", || {
+        verify(&io, 0, 0)?;
+        verify(&io, 1, 1)?;
+        verify(&console_io, 0, 2)
+    })
+    .await;
+    let flows = rx_flows(OVSC).await;
+    assert_eq!(flows.len(), 1, "{flows:?}");
+    assert_eq!(flows[0].latency_ns, 10_000_000);
+    let console_flows = console.tx_flows();
+    assert_eq!(console_flows.len(), 1, "{console_flows:?}");
+    // A flow by its id, its port and its latency: requested again, it would
+    // have a new port.
+    let identity = |flows: Vec<arc::RxFlowInfo>| -> Vec<(u16, u16, u32)> {
+        flows.iter().map(|f| (f.id, f.port, f.latency_ns)).collect()
+    };
+    let console_rx = identity(rx_flows(CONSOLE).await);
+    assert_eq!(console_rx.len(), 1, "{console_rx:?}");
+
+    // The returns: a flow of the device's channels 1 and 2 to the console.
+    let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let request = FlowRequest {
+        rx_device: "console".into(),
+        flow_name: "returns".into(),
+        sample_rate: 48_000,
+        bits_per_sample: 24,
+        fpp: 32,
+        channels: vec![1, 2],
+        rx_addr: Ipv4Addr::LOCALHOST,
+        rx_port: socket.local_addr().unwrap().port(),
+    };
+    let flow_control = SocketAddr::from((Ipv4Addr::LOCALHOST, OVSC + 2));
+    let handle = client::request_flow(Ipv4Addr::LOCALHOST, flow_control, &request).await.unwrap();
+    let returns = Arc::new(Mutex::new(Returns::default()));
+    let stop_returns = Arc::new(AtomicBool::new(false));
+    let receiver = tokio::spawn(receive_returns(socket, returns.clone(), stop_returns.clone()));
+    eventually("the returns", || match returns.lock().unwrap().packets {
+        n if n >= 200 => Ok(()),
+        n => Err(format!("{n} packets")),
+    })
+    .await;
+    let tx_flows = ovsc.tx_flows();
+    assert_eq!(tx_flows.len(), 2, "{tx_flows:?}");
+    let console_lost = console.stats().rx_lost_packets;
+
+    // 20 ms, as a controller or the app would set it, applied as the
+    // daemons apply it.
+    ovsc.request_latency(20_000_000).unwrap();
+    let before = returns.lock().unwrap().packets;
+    let changed = Instant::now();
+    assert!(ovsc.restart_rx());
+    assert_eq!((ovsc.latency_ns(), io.latency_samples()), (20_000_000, 960));
+
+    // The receive flows come back at 20 ms: requested again (a flow's
+    // latency is fixed when it is requested), the old one stopped on the
+    // console rather than left to expire, and the inputs read 20 ms behind.
+    let mut flows = Vec::new();
+    for _ in 0..100 {
+        flows = rx_flows(OVSC).await;
+        if flows.len() == 1 && flows[0].latency_ns == 20_000_000 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(flows.len(), 1, "{flows:?}");
+    assert_eq!(flows[0].latency_ns, 20_000_000);
+    eventually("the console's channels at 20 ms", || {
+        verify(&io, 0, 0)?;
+        verify(&io, 1, 1)?;
+        match console.tx_flows().len() {
+            1 => Ok(()),
+            n => Err(format!("the console has {n} flows")),
+        }
+    })
+    .await;
+    eventually("receiving statuses", || match ovsc.rx_channels()[..2] {
+        [ref a, ref b] if [a.status, b.status] == [SubscriptionStatus::ReceivingUnicast; 2] => {
+            Ok(())
+        }
+        ref other => Err(format!("{other:?}")),
+    })
+    .await;
+    let back = changed.elapsed();
+
+    // The returns went on throughout, under the same handle.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stop_returns.store(true, Ordering::Relaxed);
+    receiver.await.unwrap();
+    let r = std::mem::take(&mut *returns.lock().unwrap());
+    // 1500 packets a second.
+    let expected = (changed.elapsed().as_secs_f64() * 1500.0 * 0.8) as u64;
+    assert!(r.packets - before >= expected, "{r:?}, {back:?} to come back, {expected} expected");
+    // No break in the timestamps, but for the transmit thread restarting a
+    // flow's timeline after a stall (a busy test machine).
+    let stats = ovsc.stats();
+    assert!(r.gaps <= stats.tx_resyncs, "{r:?}, {stats:?}");
+    assert!(r.matching >= r.samples * 99 / 100, "{r:?}");
+    assert!(r.longest_wait < Duration::from_secs(1), "{r:?}");
+    // The same flows, the one to the receiver still known by its handle.
+    assert_eq!(ovsc.tx_flows(), tx_flows);
+    client::stop_flow(Ipv4Addr::LOCALHOST, flow_control, handle).await.unwrap();
+    eventually("the returns to stop", || match ovsc.tx_flows().len() {
+        1 => Ok(()),
+        n => Err(format!("{n} flows")),
+    })
+    .await;
+    assert_eq!(stats.tx_send_errors, 0, "{stats:?}");
+    assert!(!stats.tx_engine_failed);
+    // The console never asked for its return again, and lost nothing of it
+    // (but for a stall of the transmit thread, as above).
+    assert_eq!(identity(rx_flows(CONSOLE).await), console_rx);
+    let lost = console.stats().rx_lost_packets - console_lost;
+    assert!(lost == 0 || stats.tx_resyncs > 0, "{lost} lost, {stats:?}");
+    // The device stopped its old receive flow on the console, rather than
+    // leave it to expire.
+    assert_eq!(console.stats().tx_expired_flows, 0);
+    verify(&console_io, 0, 2).unwrap();
+    assert_eq!(console.rx_channels()[0].status, SubscriptionStatus::ReceivingUnicast);
+
+    stop.store(true, Ordering::Relaxed);
+    for f in feeders {
+        f.join().unwrap();
+    }
+    ovsc.shutdown().await;
+    console.shutdown().await;
 }

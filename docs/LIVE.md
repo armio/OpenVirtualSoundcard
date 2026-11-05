@@ -54,7 +54,7 @@ converters and processing in the stagebox and console. Here:
 | `margin_in` | `input_margin_us` | 500 µs (24 frames) |
 | `7` | The transmit thread's packet lead: 32 frames per packet, sent 0.5 ms (24 frames) after their time | fixed |
 | `margin_out` | `output_margin_us` | 1000 µs (48 frames) |
-| `T` | OVSC's transmit latency, `tx_latency_ms` | `latency_ms` |
+| `T` | OVSC's transmit latency, `tx_latency_ms` | `latency_ms` as configured |
 | console latency | The receive latency the console uses for OVSC's returns | (console setting) |
 
 At 48 kHz with the default margins and a console at 1 ms:
@@ -71,9 +71,11 @@ millisecond of `T` above the console's latency, and each 100 µs of margin
 adds 100 µs.
 
 **Set `tx_latency_ms = 1.0` for live use.** Without it, OVSC asks the
-console to play its returns at `latency_ms`, and with the default of 4 ms the
-returns wait 3 ms longer than they need to. The packaged configuration
-leaves it unset to keep the behaviour of earlier versions.
+console to play its returns at the `latency_ms` of `ovsc.toml`, and with the
+default of 4 ms the returns wait 3 ms longer than they need to. A receive
+latency set later from the app or Dante Controller does not change `T`. The
+packaged configuration leaves it unset to keep the behaviour of earlier
+versions.
 
 ### What the host is told
 
@@ -160,7 +162,9 @@ name or show lock set from the app or from Dante Controller, and the
 automatic `-2` rename, are saved in `state.toml` and override `ovsc.toml` at
 every start. Change those in the app; to go back to the file's values, stop
 the daemon and delete `latency_ns`, `name` or `lock_remote_settings` from
-`state.toml`.
+`state.toml`. A receive latency set this way changes the receive side only:
+the transmit latency stays the file's (`tx_latency_ms`, or else its
+`latency_ms`).
 
 ### The show lock
 
@@ -172,9 +176,13 @@ name or channel names; routing stays open, and changes made in the app still
 apply. Each refused attempt is logged and shown in the app with the
 controller's address. The lock is saved and survives restarts.
 
-The lock matters because some of these changes interrupt audio
-([below](#changes-that-interrupt-audio)), and a controller elsewhere on the
-network can make them without anyone at the Mac knowing.
+The lock matters because these changes interrupt audio or other devices'
+subscriptions ([below](#changes-that-interrupt-audio)), and a controller
+elsewhere on the network can make them without anyone at the Mac knowing. A
+new latency no longer closes the returns, but it still pauses OVSC's inputs
+and makes Core Audio reconfigure the device, which the host's audio, and so
+the returns, feel for a moment: nobody should do that from another
+computer during a show.
 
 ## The network
 
@@ -266,7 +274,8 @@ With the show session running at the show's buffer size:
 
 Do not change, on OVSC or in Dante Controller:
 
-* the receive latency;
+* the receive latency (a pause on the inputs and a reconfiguration of the
+  Core Audio device; the returns stay open);
 * the sample rate, encoding or channel counts;
 * the device name or interface.
 
@@ -277,7 +286,7 @@ any of them.
 
 | Change | What happens |
 |---|---|
-| Receive latency (app or a controller) | The network engine restarts. Inputs return after about 1 to 2 s. Every return flow to the console closes, and each receiver requests it again on its own timing, often several seconds. Core Audio sees a configuration change, and some hosts restart their audio engine. |
+| Receive latency (app or a controller) | Only the receive side restarts. OVSC requests its receive flows again at the new latency: the inputs return in about a second, as soon as the console answers. The flows the console receives from OVSC stay open and keep sending, so it never has to request the returns again, and OVSC stays announced as it was. Core Audio reconfigures the device once, for its new input safety offset: the host's audio stops for that moment, so expect a short gap on the returns too, longer in hosts that restart their audio engine on it. |
 | Sample rate, encoding, channel counts, interface | The daemon restarts: 10 to 20 s of silence both ways. |
 | Device rename | Every subscription to OVSC's outputs breaks until it is patched again. |
 | Clock leader change | Nothing audible when the new leader was synchronised to the old one, the normal case (see below). |
@@ -301,7 +310,7 @@ any of them.
 | The transmit thread stalls (rare: the Mac is overloaded) | A gap on the returns about as long as the stall beyond the console's slack (about 0.5 ms at a 1 ms console latency) | Packets up to 40 ms overdue are sent at once, oldest first, for receivers with longer latencies; beyond 40 ms the flow resyncs and the skipped packets are counted. Late sends and skips are warnings in the app. |
 | The daemon crashes (a panic anywhere) | 5 to 10 s of silence plus the clock relock; the returns may take longer | It logs the panic, says goodbye to the driver and exits; launchd starts a new daemon. Core Audio sees no change. The returns come back once the console requests OVSC's flows again, on its own timing. |
 | The Core Audio driver faults (a caught panic) | Silence on every channel until Core Audio restarts | Run `sudo killall coreaudiod`; the host will likely need to reopen the device. |
-| Another device uses OVSC's name mid-show | Nothing at once; new subscriptions may reach the wrong device | OVSC keeps its name, through engine restarts (latency, address change) and restarts of the daemon itself (a crash, a reboot): `state.toml` keeps the name with the Dante interface's MAC address, and a new daemon on the same Mac announces it again without asking the network. It logs an error and the app warns. Rename one device after the show. Only another Mac (a cloned disk) or another Dante interface, whose MAC address differs, asks the network again and, while the other device has the name, takes `<name>-2`: clear any name warning before the show. |
+| Another device uses OVSC's name mid-show | Nothing at once; new subscriptions may reach the wrong device | OVSC keeps its name, through engine restarts (an address change; a new latency restarts nothing that announces it) and restarts of the daemon itself (a crash, a reboot): `state.toml` keeps the name with the Dante interface's MAC address, and a new daemon on the same Mac announces it again without asking the network. It logs an error and the app warns. Rename one device after the show. Only another Mac (a cloned disk) or another Dante interface, whose MAC address differs, asks the network again and, while the other device has the name, takes `<name>-2`: clear any name warning before the show. |
 | A controller changes a setting | See [Changes that interrupt audio](#changes-that-interrupt-audio) | With the show lock on, refused and listed in the app; without it, applied and listed. |
 | The audio engine starts or the gate opens or closes | A 5 ms fade, not a click | The driver ramps in and out at its gate. |
 
@@ -351,7 +360,9 @@ short list, before its `hal:` part. A script on the stage computer can poll the 
 What the common warnings point at:
 
 * **Late received packets**: `latency_ms` is too short for the network.
-  Raise it after the show (the change interrupts audio).
+  Raise it at the next break, not mid-song: the inputs pause for about a
+  second and Core Audio reconfigures the device, though the returns stay
+  open.
 * **Lost received packets**: the network: cabling, a switch port, or QoS.
 * **Early packets**: a transmitter's clock disagrees with OVSC's: check that
   both follow the same leader.
@@ -369,6 +380,11 @@ What the common warnings point at:
 
 * Returns have their own latency (`tx_latency_ms`), and the device reports it
   to Core Audio as its output latency.
+* A new receive latency, from the app or Dante Controller, restarts only the
+  receive flows and the driver's input timing: the returns, the device's
+  announcements and the clock carry on. Unset, `tx_latency_ms` is the
+  configured `latency_ms`, which a latency set from the app or a controller
+  no longer changes.
 * Latencies below 1 ms are refused from the app and controllers, and raised
   to 1 ms in `ovsc.toml` (packets leave 0.5 ms after their time).
 * Leader changes, holdover and unlocks no longer interrupt audio in the
@@ -413,6 +429,11 @@ These rest on code reading, Linux tests and simulation, not on hardware:
 * The interface watcher on macOS (a USB adapter re-attached, DHCP renewing
   a 169.254 address), the log rotation, and `F_FULLFSYNC` on the state file.
 * The driver's gate fades in Core Audio on a Mac.
+* A new receive latency on a Mac with your host running: how long Core
+  Audio's reconfiguration for the new input safety offset interrupts the
+  host, and whether the host restarts its audio engine on it. The flows
+  themselves are tested on Linux, the driver's configuration with a
+  simulated host.
 * The macOS end-to-end test (`ci/macos/e2e-local.sh`, every scenario against
   the real Core Audio device and a test PTP master on the same Mac) passed on
   an M1 Mac with macOS 26.6. That covers the driver, the daemon and Core

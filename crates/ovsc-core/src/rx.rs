@@ -9,7 +9,9 @@
 //!    subscription that only changed its spelling, but still names the same
 //!    transmit channel, keeps its route);
 //! 2. flows that stopped delivering packets are stopped, and so are flows
-//!    that have carried nothing for a few seconds;
+//!    that have carried nothing for a few seconds, and flows requested for
+//!    another receive latency than the device runs at now
+//!    (`Device::restart_rx`), whose channels are requested again at once;
 //! 3. subscribed channels already carried by a flow are routed to it;
 //! 4. the remaining ones are resolved (mDNS), grouped per transmitter (a
 //!    computer on Wi-Fi and Ethernet is one, at either address) and
@@ -254,6 +256,14 @@ struct RxFlow {
     /// The latency the flow plays at, in ns: ours or more (see
     /// [`flow_latency`]).
     latency_ns: u32,
+    /// The device's receive latency, in samples, that the flow was
+    /// requested for: its frames per packet, its latency and its offset
+    /// follow from it. A flow requested for another latency than the one
+    /// the device runs at is stopped and requested again.
+    own: u64,
+    /// What the transmitter advertised for the flow's first channel, to
+    /// request the flow's channels again without looking them up.
+    txt: ChannelTxt,
     /// Local time of the last packet, 0 if none yet.
     last_packet_ns: Arc<AtomicU64>,
     /// What its packets look like.
@@ -294,6 +304,31 @@ impl RxFlow {
         let routes = Arc::new(routes);
         self.routing.store(routes.clone());
         retired.push((Instant::now(), std::mem::replace(&mut self.routes, routes)));
+    }
+
+    /// What each routed channel is subscribed as and what that resolved
+    /// to, as a lookup would find it: to request the channels again
+    /// without one.
+    fn resolved(&self) -> Vec<(Key, ResolvedChannel)> {
+        let mut out = Vec::new();
+        for (slot, targets) in self.routes.slots.iter().enumerate() {
+            for ch in targets {
+                let Some(k) = self.spelled.get(ch) else { continue };
+                let txt = ChannelTxt { id: self.tx_ids[slot], ..self.txt.clone() };
+                out.push((
+                    k.clone(),
+                    ResolvedChannel {
+                        device: self.tx_device.clone(),
+                        channel: self.slot_names[slot].clone(),
+                        addr: *self.control.ip(),
+                        addrs: self.worker.params.tx.as_slice().to_vec(),
+                        flow_control_port: self.control.port(),
+                        txt,
+                    },
+                ));
+            }
+        }
+        out
     }
 
     /// Routes local channel `ch`, subscribed as `key`, to `slot`.
@@ -485,6 +520,8 @@ struct Create {
     format: SampleFormat,
     /// The latency it will play at, in samples.
     latency: u64,
+    /// The device's receive latency it was planned for, in samples.
+    own: u64,
 }
 
 /// What a background job was about, to clean up after it.
@@ -567,6 +604,7 @@ impl RxManager {
 
     pub async fn run(mut self, mut shutdown: oneshot::Receiver<oneshot::Sender<()>>) {
         let mut watch = self.shared.watch();
+        let mut restarts = self.shared.rx_restarts();
         let mut tick = tokio::time::interval(TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -577,6 +615,9 @@ impl RxManager {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                     watch.borrow_and_update();
                 }
+                // A new receive latency: the pass requests the flows again
+                // (`stop_flows`), at once.
+                Ok(()) = restarts.changed() => {}
                 _ = tick.tick() => {}
                 Some(joined) = self.jobs.join_next_with_id() => self.finished(joined),
                 done = &mut shutdown => {
@@ -643,7 +684,8 @@ impl RxManager {
 
         // 1. Remove stale routes.
         self.unroute_stale(&desired, &keys).await;
-        // 2. Stop flows that died or have carried nothing for a while.
+        // 2. Stop flows that died, have carried nothing for a while, or were
+        //    requested for another receive latency.
         self.stop_flows(now);
         // 3. Route channels to existing flows where possible.
         let wanted = self.route_existing(&desired, &keys).await;
@@ -710,10 +752,18 @@ impl RxManager {
         }
     }
 
-    /// Step 2.
+    /// Step 2. A flow requested for another receive latency than the one
+    /// the device runs at (`Device::restart_rx`) has the wrong frames per
+    /// packet and latency for it, and a transmitter cannot change those of
+    /// a flow: it is stopped and requested again. Its channels are not
+    /// looked up again (the flow knows what they resolved to), so the new
+    /// request goes out in this same pass, where the old flow is stopped
+    /// and after its stop ([`RxManager::control_for`], [`request_job`]).
     fn stop_flows(&mut self, now: Instant) {
         let now_ns = local_now_ns();
-        let Self { flows, retired, stops, .. } = self;
+        let own = self.shared.info.latency.samples();
+        let rate = self.shared.info.sample_rate;
+        let Self { flows, retired, stops, resolved, .. } = self;
         flows.retain_mut(|flow| {
             let empty = flow.routes.is_empty() && flow.changing.is_empty();
             let since = if empty { *flow.empty_since.get_or_insert(now) } else { now };
@@ -721,7 +771,8 @@ impl RxManager {
                 flow.empty_since = None;
             }
             let dead = flow.is_dead(now_ns);
-            if !dead && now.duration_since(since) < EMPTY_LINGER {
+            let other_latency = flow.own != own;
+            if !dead && !other_latency && now.duration_since(since) < EMPTY_LINGER {
                 return true;
             }
             if dead {
@@ -731,6 +782,16 @@ impl RxManager {
                     flow.tx_device,
                     FLOW_TIMEOUT_NS / 1_000_000_000
                 );
+            } else if other_latency {
+                info!(
+                    "rx flow {} from {}: requesting it again for the receive latency of {:.2} ms",
+                    flow.id,
+                    flow.tx_device,
+                    own as f64 * 1000.0 / rate.max(1) as f64
+                );
+                for (k, r) in flow.resolved() {
+                    resolved.insert(k, (r, now));
+                }
             } else {
                 info!("rx flow {} from {} no longer needed", flow.id, flow.tx_device);
             }
@@ -883,24 +944,33 @@ impl RxManager {
 
     /// Where to ask the transmitter of `r` for flows: where a request to it
     /// is in flight, else where a flow we have from it was requested, else
-    /// where `planned` requests (this pass's) to it go, else the address
-    /// `r` was found at. A transmitter with several addresses is thus asked
-    /// at one of them, whichever a lookup gives first, so that its channels
-    /// go in free slots of the flows we have from it rather than in new
-    /// ones, and its requests go one at a time.
+    /// where flows of it are to be stopped (at the address `r` was found
+    /// at first), else where `planned` requests (this pass's) to it go,
+    /// else the address `r` was found at. A transmitter with several
+    /// addresses is thus asked at one of them, whichever a lookup gives
+    /// first, so that its channels go in free slots of the flows we have
+    /// from it rather than in new ones, and its requests go one at a time.
+    /// Asked where its flows are to be stopped, it gets the stops first, in
+    /// the same job ([`request_job`]): a flow stopped for a new latency is
+    /// gone before the one replacing it is asked for.
     fn control_for(
         &self,
         r: &ResolvedChannel,
         planned: impl IntoIterator<Item = SocketAddrV4>,
     ) -> SocketAddrV4 {
+        let found = SocketAddrV4::new(r.addr, r.flow_control_port);
         let flows = self.flows.iter().map(|f| f.control);
+        let stopping = std::iter::once(found)
+            .filter(|c| self.stops.contains_key(c))
+            .chain(self.stops.keys().copied());
         self.busy
             .iter()
             .copied()
             .chain(flows)
+            .chain(stopping)
             .chain(planned)
             .find(|&c| is_control_of(c, r))
-            .unwrap_or(SocketAddrV4::new(r.addr, r.flow_control_port))
+            .unwrap_or(found)
     }
 
     /// Whether another device may use our name: a static directory may list
@@ -1060,8 +1130,9 @@ impl RxManager {
             return None;
         };
         // Sized for every slot it may hold, so packets always fit.
-        let fpp = choose_fpp(info.latency_samples, &txt, max_slots, format);
-        let latency = flow_latency(info.latency_samples, &txt, fpp, info.sample_rate);
+        let own = info.latency.samples();
+        let fpp = choose_fpp(own, &txt, max_slots, format);
+        let latency = flow_latency(own, &txt, fpp, info.sample_rate);
         let most = max_latency_samples(info.sample_rate);
         if latency > most {
             if self.fail_chunk(&chunk, status::CHANNEL_LATENCY, Retry::REFUSED) {
@@ -1108,7 +1179,7 @@ impl RxManager {
             rx_addr: info.iface.ip,
             rx_port: port,
         };
-        Some(Create { id, socket, request, placed: chunk, format, latency })
+        Some(Create { id, socket, request, placed: chunk, format, latency, own })
     }
 
     fn fail_chunk(&mut self, chunk: &[Placed], status: SubscriptionStatus, retry: Retry) -> bool {
@@ -1290,8 +1361,21 @@ impl RxManager {
     }
 
     fn created(&mut self, control: SocketAddrV4, creates: Vec<(Create, Result<FlowHandle>)>) {
+        let own = self.shared.info.latency.samples();
         for (c, result) in creates {
             match result {
+                // Asked for before the receive latency changed: the wrong
+                // packets for the new one. Stopped before the next request
+                // to the transmitter, and its channels requested again at
+                // the new latency, without a lookup.
+                Ok(handle) if c.own != own => {
+                    debug!("rx flow {} from {control} came for an older receive latency", c.id);
+                    self.stops.entry(control).or_default().push(handle);
+                    let now = Instant::now();
+                    for p in c.placed {
+                        self.resolved.insert(p.key, (p.resolved, now));
+                    }
+                }
                 Ok(handle) => {
                     if let Err((placed, e)) = self.start_flow(control, c, handle) {
                         warn!("cannot start a receive thread: {e}");
@@ -1327,7 +1411,7 @@ impl RxManager {
     ) -> std::result::Result<(), (Vec<Placed>, std::io::Error)> {
         let shared = self.shared.clone();
         let info = &shared.info;
-        let Create { id, socket, request, placed, format, latency } = c;
+        let Create { id, socket, request, placed, format, latency, own } = c;
         let slots = request.channels.len();
         let mut routes = Routes::new(slots);
         let mut spelled = HashMap::new();
@@ -1353,7 +1437,7 @@ impl RxManager {
             format,
             sample_rate: info.sample_rate,
             latency,
-            offset: latency.saturating_sub(info.latency_samples),
+            offset: latency.saturating_sub(own),
         };
         let routes = Arc::new(routes);
         let routing: Routing = Arc::new(ArcSwap::new(routes.clone()));
@@ -1376,6 +1460,7 @@ impl RxManager {
             };
         let latency_ns = (latency as u128 * 1_000_000_000 / info.sample_rate.max(1) as u128)
             .min(u32::MAX as u128) as u32;
+        let ms = |samples: u64| samples as f64 * 1000.0 / info.sample_rate.max(1) as f64;
         let flow = RxFlow {
             id,
             tx_device: placed[0].resolved.device.clone(),
@@ -1393,6 +1478,8 @@ impl RxManager {
             empty_since: None,
             port: request.rx_port,
             latency_ns,
+            own,
+            txt: placed[0].resolved.txt.clone(),
             last_packet_ns,
             stats,
             health: Health::new(Instant::now()),
@@ -1412,8 +1499,8 @@ impl RxManager {
                 flow.id,
                 flow.tx_device,
                 latency_ns as f64 / 1e6,
-                info.latency_ns as f64 / 1e6,
-                params.offset as f64 * 1000.0 / info.sample_rate as f64
+                ms(own),
+                ms(params.offset)
             );
         }
         self.flows.push(flow);
@@ -1529,7 +1616,11 @@ impl RxManager {
                 // A failure shows until the channel receives, through the
                 // retries.
                 Some(f) => f.status,
-                None if self.requesting.get(&ch) == Some(k) => SubscriptionStatus::InProgress,
+                // Requested, or found and waiting for its transmitter to be
+                // free (as after a new receive latency).
+                None if self.requesting.get(&ch) == Some(k) || self.resolved.contains_key(k) => {
+                    SubscriptionStatus::InProgress
+                }
                 None => SubscriptionStatus::Unresolved,
             };
         }
@@ -2720,6 +2811,112 @@ mod tests {
             tx.shutdown().await;
         }
 
+        /// A new receive latency (`Device::restart_rx`) has the flows
+        /// requested again for it in the next pass, without a lookup: the
+        /// stop of the old flow goes out first, in the same job as the
+        /// request of the new one, which gets the frames per packet and
+        /// latency of the new latency. A flow granted for the old latency
+        /// after the change is stopped and requested again too.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_new_latency_requests_the_flows_again() {
+            // It asks its receivers for 1 ms only, so that flows play at
+            // our latency.
+            let tx_config = DeviceConfig { tx_latency_ms: Some(1.0), ..config("relat-tx", 25140) };
+            let tx = Device::start(tx_config, ovsc_clock::system_clock()).await.unwrap();
+            let directory = StaticDirectory::new();
+            for entry in tx.directory_entries() {
+                directory.insert(entry);
+            }
+            let rx_config = config("relat-rx", 25150);
+            let mut mgr = manager(&rx_config, Interface::find("127.0.0.1").unwrap(), directory);
+            let shared = mgr.shared.clone();
+            let set = |ms: f64| {
+                shared.request_latency((ms * 1e6) as u32).unwrap();
+                assert!(shared.restart_rx());
+            };
+            // At 10 ms, the request for channel 01 goes out; the latency
+            // changes to 5 ms before the grant comes back.
+            subscribe(&mgr, 0, "01", "relat-tx");
+            drive(&mut mgr, |m| !m.busy.is_empty()).await;
+            set(5.0);
+            drive(&mut mgr, |m| m.flows.len() == 1 && m.flows[0].routes.feeds(0)).await;
+            let flow = &mgr.flows[0];
+            assert_eq!((flow.own, flow.latency_ns), (240, 5_000_000));
+            // A quarter of the latency per packet: 60, capped at its 32.
+            assert_eq!(flow.worker.params.fpp, 32);
+            // The grant for 10 ms was stopped: the transmitter keeps one flow.
+            drive(&mut mgr, |_| tx.tx_flows().len() == 1).await;
+
+            // 1.5 ms, with the flow running: one pass stops it and asks for
+            // a new one, without looking the channel up again.
+            let old_handle = mgr.flows[0].handle;
+            set(1.5);
+            mgr.reconcile().await;
+            assert!(mgr.flows.is_empty());
+            assert!(mgr.resolving.is_empty(), "looked up again");
+            assert_eq!(mgr.busy.len(), 1, "no request in flight");
+            assert!(mgr.stops.is_empty(), "the stop is in the job");
+            assert_eq!(status(&mgr, 0), SubscriptionStatus::InProgress);
+            drive(&mut mgr, |m| m.flows.len() == 1 && m.flows[0].routes.feeds(0)).await;
+            let flow = &mgr.flows[0];
+            assert_eq!((flow.own, flow.latency_ns), (72, 1_500_000));
+            assert_eq!(flow.worker.params.fpp, 18);
+            // Another flow (a handle holds a random cookie), the old one
+            // stopped on the transmitter.
+            assert_ne!(flow.handle, old_handle);
+            let new_port = flow.port;
+            drive(&mut mgr, |_| {
+                let flows = tx.tx_flows();
+                flows.len() == 1 && flows[0].destination.port() == new_port
+            })
+            .await;
+            assert_eq!(tx.stats().tx_expired_flows, 0);
+            // Applying the same latency again stops nothing.
+            assert!(!shared.restart_rx());
+            mgr.reconcile().await;
+            assert_eq!(mgr.flows.len(), 1);
+            mgr.stop_all().await;
+            tx.shutdown().await;
+        }
+
+        /// A flow from a transmitter with two addresses (a computer on
+        /// Wi-Fi and Ethernet) is requested again for a new latency with
+        /// both: it still takes audio from either. Requested again with the
+        /// one it was requested from alone, it would drop audio the
+        /// transmitter sends from its other interface.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_new_latency_keeps_every_address_of_the_transmitter() {
+            let tx = Device::start(config("relat-multi-tx", 25190), ovsc_clock::system_clock())
+                .await
+                .unwrap();
+            let directory = StaticDirectory::new();
+            // Its Wi-Fi address (TEST-NET-1), after the one it is reached at.
+            let wifi = Ipv4Addr::new(192, 0, 2, 7);
+            for mut entry in tx.directory_entries() {
+                entry.addrs.push(wifi);
+                directory.insert(entry);
+            }
+            let iface = Interface::find("127.0.0.1").unwrap();
+            let mut mgr = manager(&config("relat-multi-rx", 25200), iface, directory);
+            subscribe(&mgr, 0, "01", "relat-multi-tx");
+            drive(&mut mgr, |m| m.flows.len() == 1 && m.flows[0].routes.feeds(0)).await;
+            let both = [Ipv4Addr::LOCALHOST, wifi];
+            assert_eq!(mgr.flows[0].worker.params.tx.as_slice(), both);
+
+            let old = mgr.flows[0].handle;
+            mgr.shared.request_latency(20_000_000).unwrap();
+            assert!(mgr.shared.restart_rx());
+            drive(&mut mgr, |m| {
+                m.flows.len() == 1 && m.flows[0].handle != old && m.flows[0].routes.feeds(0)
+            })
+            .await;
+            let flow = &mgr.flows[0];
+            assert_eq!(flow.own, 960);
+            assert_eq!(flow.worker.params.tx.as_slice(), both);
+            mgr.stop_all().await;
+            tx.shutdown().await;
+        }
+
         /// A flow takes audio from every address its transmitter has, the
         /// one it was requested from first: a computer on Wi-Fi and Ethernet
         /// may send from either.
@@ -2884,6 +3081,48 @@ mod tests {
             assert_eq!(mgr.flows[0].tx_ids, [1, 0, 0, 0]);
             let theirs: Vec<Vec<u16>> = tx.tx_flows().into_iter().map(|f| f.channels).collect();
             assert_eq!(theirs, [[1, 0, 0, 0]]);
+            mgr.stop_all().await;
+            tx.shutdown().await;
+        }
+
+        /// A transmitter whose flow is stopped for a new latency is asked
+        /// for the new flow where the old one is stopped, in the same job,
+        /// stop first, even when another of its channels was just found at
+        /// its other address. Asked there, the new request could reach the
+        /// transmitter before the stop, and one at its flow limit would
+        /// refuse it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_new_latency_asks_where_the_old_flow_is_stopped() {
+            let (tx, directory, wired) = dual_homed("relat-dual-tx", 25210).await;
+            let iface = Interface::find("127.0.0.1").unwrap();
+            let mut mgr = manager(&config("relat-dual-rx", 25220), iface, directory.clone());
+            // Channel 03, found at the wired address.
+            subscribe(&mgr, 0, "03", "relat-dual-tx");
+            drive(&mut mgr, |m| m.flows.len() == 1 && m.flows[0].routes.feeds(0)).await;
+            assert_eq!(mgr.flows[0].control, wired);
+
+            // 02 is found at the Wi-Fi address first, and the latency
+            // changes, before the next pass.
+            subscribe(&mgr, 1, "02", "relat-dual-tx");
+            let k = key("02", "relat-dual-tx");
+            mgr.looked_up(k, Ok(directory.get("02", "relat-dual-tx").unwrap()));
+            mgr.shared.request_latency(5_000_000).unwrap();
+            assert!(mgr.shared.restart_rx());
+            mgr.reconcile().await;
+            assert_eq!(mgr.busy, HashSet::from([wired]), "one job, where the flow is stopped");
+            assert!(mgr.stops.is_empty(), "the stop is in the job");
+
+            drive(&mut mgr, |m| rx2_settled(m) && m.flows.iter().any(|f| f.routes.feeds(0))).await;
+            assert_eq!(mgr.failures.get(&1).map(|f| f.status), None, "rx 2 failed");
+            let controls: Vec<SocketAddrV4> = mgr.flows.iter().map(|f| f.control).collect();
+            assert_eq!(controls, [wired]);
+            let flow = &mgr.flows[0];
+            assert_eq!(flow.own, 240);
+            assert_eq!(flow.tx_ids, [2, 3, 0, 0]);
+            // The old flow was stopped before the new one was asked for.
+            let theirs: Vec<Vec<u16>> = tx.tx_flows().into_iter().map(|f| f.channels).collect();
+            assert_eq!(theirs, [[2, 3, 0, 0]]);
+            assert_eq!(tx.stats().tx_expired_flows, 0);
             mgr.stop_all().await;
             tx.shutdown().await;
         }

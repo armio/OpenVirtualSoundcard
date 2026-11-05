@@ -121,8 +121,8 @@ impl HalServer {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
         // Taken first thing and held until shutdown, not only while an
         // engine runs: macOS may start an idle sleep as soon as the last
-        // assertion goes, and an engine restart (a new latency, the network
-        // coming back) would otherwise release it for seconds.
+        // assertion goes, and an engine restart (the network coming back, a
+        // new address) would otherwise release it for seconds.
         let power = o.prevent_idle_sleep.then(take_power).flatten();
         let view = region.view();
         let d = view.daemon();
@@ -192,12 +192,40 @@ impl HalServer {
             engine.tx_names.len(),
             engine.latency_samples
         );
-        inner.update_engine(&mut st, engine.clone());
+        inner.update_engine(&mut st, engine);
         if inner.opts.prevent_idle_sleep && st.power.is_none() {
             st.power = take_power();
         }
-        let watcher = watch_device(Arc::downgrade(inner), st.epoch, observer, engine, changes);
+        let watcher = watch_device(Arc::downgrade(inner), st.epoch, observer, changes);
         st.watcher = Some(inner.runtime.spawn(watcher));
+    }
+
+    /// The running engine changed what the driver's configuration depends
+    /// on without stopping: a new receive latency (`Device::restart_rx`),
+    /// which moves the input safety offset (in latency mode, the input
+    /// latency and read delay instead). Offers the configuration of
+    /// `device` as it is now, pushed to the attached drivers if it changed;
+    /// a driver applies a change of the offsets through Core Audio's
+    /// configuration change, as any other change of the device's structure.
+    ///
+    /// Unlike [`HalServer::engine_stopped`] and [`HalServer::engine_started`],
+    /// it leaves ENGINE_RUNNING set and the audio word valid throughout, so
+    /// the driver keeps its gate open: the outputs keep reaching the
+    /// transmit flows. Ignored unless an engine runs.
+    pub fn engine_changed(&self, device: &Device) {
+        let engine = EngineInfo::from_device(device);
+        let inner = &self.inner;
+        let mut st = inner.lock();
+        if st.closing || !st.running {
+            return;
+        }
+        if st.engine.latency_samples != engine.latency_samples {
+            info!(
+                "hal: receive latency now {} samples (was {}), the engine still running",
+                engine.latency_samples, st.engine.latency_samples
+            );
+        }
+        inner.update_engine(&mut st, engine);
     }
 
     /// The engine stopped: clears ENGINE_RUNNING and the audio word and
@@ -326,11 +354,18 @@ impl Inner {
                     st.config = DriverConfig { config_gen, ..cfg };
                     changed = true;
                     if structural {
+                        let c = &st.config;
                         info!(
-                            "hal: driver configuration {config_gen}: {} Hz, {} in, {} out",
-                            st.config.sample_rate,
-                            st.config.input_channels,
-                            st.config.output_channels
+                            "hal: driver configuration {config_gen}: {} Hz, {} in, {} out, \
+                             input safety offset {}, input latency {}, output safety offset {}, \
+                             output latency {}",
+                            c.sample_rate,
+                            c.input_channels,
+                            c.output_channels,
+                            c.input_safety_offset,
+                            c.input_latency,
+                            c.output_safety_offset,
+                            c.output_latency
                         );
                     } else {
                         info!("hal: driver configuration {config_gen}: names changed");
@@ -550,13 +585,14 @@ impl ServerHandler for Inner {
 }
 
 /// Follows `observer`'s device: on every change of its names, rebuilds the
-/// configuration (pushed only if it changed). Ends with the device, the
-/// server, or the next engine start or stop.
+/// configuration (pushed only if it changed) from the engine as last
+/// offered, which [`HalServer::engine_changed`] may have changed since the
+/// start. Ends with the device, the server, or the next engine start or
+/// stop.
 async fn watch_device(
     server: Weak<Inner>,
     epoch: u64,
     observer: DeviceObserver,
-    engine: EngineInfo,
     mut changes: watch::Receiver<u64>,
 ) {
     while changes.changed().await.is_ok() {
@@ -570,7 +606,7 @@ async fn watch_device(
         if st.epoch != epoch {
             return;
         }
-        let e = EngineInfo { rx_names, tx_names, device_name, ..engine.clone() };
+        let e = EngineInfo { rx_names, tx_names, device_name, ..st.engine.clone() };
         inner.update_engine(&mut st, e);
     }
 }

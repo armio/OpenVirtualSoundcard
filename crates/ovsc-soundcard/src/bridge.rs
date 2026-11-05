@@ -248,7 +248,7 @@ fn open_output(
         .map_err(Error::Config)?;
     let sources = map.iter().map(|m| m.map(|i| io.rx[i].clone())).collect();
     let stats = Arc::new(StatsCell::new());
-    let playout = Playout::new(io.sample_rate, io.latency_samples, sources, margin, stats.clone());
+    let playout = Playout::new(io.sample_rate, io.latency.clone(), sources, margin, stats.clone());
     let config = stream_config(io, &choice);
     let clock = io.clock.clone();
     let s = stats.clone();

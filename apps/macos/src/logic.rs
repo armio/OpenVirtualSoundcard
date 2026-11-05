@@ -48,19 +48,28 @@ pub fn expected_restart(change: &SettingsChange) -> Restart {
     {
         Restart::Daemon
     } else if change.latency_ms.is_some() {
-        Restart::Device
+        Restart::Receive
     } else {
         Restart::None
     }
 }
 
 /// What applying a change that restarts `restart` does to the audio, if
-/// anything. Either restart closes the flows other devices receive from
-/// this one too, so the returns to a console drop with the inputs, and
-/// each receiver must ask for its flow again.
+/// anything. A new latency restarts the inputs only. A restart of the
+/// network engine (by daemons before that) or of the daemon closes the
+/// flows other devices receive from this one too, so the returns to a
+/// console drop with the inputs, and each receiver must ask for its flow
+/// again.
 pub fn interruption(restart: Restart) -> Option<&'static str> {
     match restart {
         Restart::None => None,
+        Restart::Receive => Some(
+            "This device's inputs stop for about a second while it requests them again at the \
+             new latency. The feeds other devices receive from it, such as returns to the \
+             console, carry on. Core Audio sees the device change its input timing, and some \
+             applications restart their audio engine on that, which interrupts their audio for \
+             a moment.",
+        ),
         Restart::Device => Some(
             "Audio stops for a second or two in both directions while the network engine \
              restarts: this device's inputs, and the feeds other devices receive from it, such as \
@@ -137,6 +146,7 @@ pub fn confirmation(
     let (title, button) = match restart {
         Restart::Daemon => ("Restart OpenVirtualSoundcard?", "Restart"),
         Restart::Device => ("Restart the network engine?", "Restart"),
+        Restart::Receive => ("Restart the inputs?", "Restart"),
         Restart::None => ("Rename the device?", "Rename"),
     };
     Some(Confirmation { title, text: text.join("\n\n"), button })
@@ -155,6 +165,10 @@ pub fn lock_label(locked: bool) -> &'static str {
 /// `restart`.
 pub fn applied_message(change: &SettingsChange, restart: Restart) -> &'static str {
     match restart {
+        Restart::Receive => {
+            "Saved. The inputs return at the new latency in about a second; the feeds other \
+             devices receive from this one carried on."
+        }
         Restart::Device => {
             "Saved. The network engine restarts; audio returns in a second or two, and devices \
              receiving from this one subscribe again on their own."
@@ -604,7 +618,7 @@ mod tests {
             expected_restart(&c)
         };
         assert_eq!(only(|c| c.name = Some("x".into())), Restart::None);
-        assert_eq!(only(|c| c.latency_ms = Some(1.0)), Restart::Device);
+        assert_eq!(only(|c| c.latency_ms = Some(1.0)), Restart::Receive);
         assert_eq!(only(|c| c.interface = Some("en0".into())), Restart::Daemon);
         assert_eq!(only(|c| c.sample_rate = Some(44_100)), Restart::Daemon);
         assert_eq!(only(|c| c.bits_per_sample = Some(16)), Restart::Daemon);
@@ -632,6 +646,11 @@ mod tests {
             assert!(words.contains("returns to the console"), "{words}");
         }
         assert!(interruption(Restart::Device).unwrap().contains("several more seconds"));
+        // A new latency restarts the inputs only, and says so.
+        let words = interruption(Restart::Receive).unwrap();
+        assert!(words.contains("inputs stop for about a second"), "{words}");
+        assert!(words.contains("returns to the console, carry on"), "{words}");
+        assert!(!words.contains("both directions"), "{words}");
     }
 
     fn device_with_flows(receivers: &[Option<&str>]) -> DeviceStatus {
@@ -683,8 +702,8 @@ mod tests {
         let s = settings();
         let latency = change(&s, &Settings { latency_ms: 2.0, ..settings() });
         let c = confirmation(&latency, "studio-mac", &[]).unwrap();
-        assert_eq!((c.title, c.button), ("Restart the network engine?", "Restart"));
-        assert_eq!(c.text, interruption(Restart::Device).unwrap());
+        assert_eq!((c.title, c.button), ("Restart the inputs?", "Restart"));
+        assert_eq!(c.text, interruption(Restart::Receive).unwrap());
         let both = change(&s, &Settings { name: "x".into(), sample_rate: 96_000, ..settings() });
         let c = confirmation(&both, "studio-mac", &[]).unwrap();
         assert_eq!(c.title, "Restart OpenVirtualSoundcard?");
@@ -699,6 +718,7 @@ mod tests {
     fn applied_messages() {
         let none = SettingsChange::default();
         assert_eq!(applied_message(&none, Restart::None), "Saved.");
+        assert!(applied_message(&none, Restart::Receive).contains("carried on"));
         assert!(applied_message(&none, Restart::Device).contains("a second or two"));
         assert!(applied_message(&none, Restart::Daemon).contains("10–20 seconds"));
         let lock = |on| SettingsChange { lock_remote_settings: Some(on), ..Default::default() };
