@@ -7,18 +7,19 @@ use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use ovsc_clock::MediaClock;
 use ovsc_proto::arc::SubscriptionStatus;
 use ovsc_proto::audio::{Sample, SampleFormat};
+use ovsc_proto::dns::Record;
 
 use crate::buffer::TimedRing;
 use crate::config::DeviceConfig;
 use crate::control;
 use crate::directory::{Directory, ResolvedChannel, StaticDirectory};
 use crate::info::{BOARD_NAME, DeviceInfo, MANUFACTURER, MODEL_ID};
-use crate::mdns::{self, Advertisement, Mdns};
+use crate::mdns::{self, Advertisement, Mdns, NameConflict};
 use crate::net::{Interface, bind_udp, into_tokio};
 use crate::persist::{self, SavedState};
 use crate::rx::{RxManager, own_channel_txt};
@@ -230,6 +231,12 @@ impl Device {
     /// Current device name.
     pub fn name(&self) -> String {
         self.shared.name()
+    }
+
+    /// Another device on the network that uses this device's name, or did
+    /// when this device took another one; see [`NameConflict`].
+    pub fn name_conflict(&self) -> Option<NameConflict> {
+        self.shared.state().name_conflict.clone()
     }
 
     /// Sets the receive latency to `ns`, saved for the next start of the
@@ -467,6 +474,12 @@ impl DeviceObserver {
         self.shared.upgrade().map(|s| s.name())
     }
 
+    /// Another device that uses this device's name, as
+    /// [`Device::name_conflict`]: `Some(None)` when there is none.
+    pub fn name_conflict(&self) -> Option<Option<NameConflict>> {
+        self.shared.upgrade().map(|s| s.state().name_conflict.clone())
+    }
+
     /// Current receive and transmit channel names, as `(rx, tx)`.
     pub fn channel_names(&self) -> Option<(Vec<String>, Vec<String>)> {
         self.shared.upgrade().map(|s| channel_names(&s))
@@ -540,6 +553,7 @@ fn initial_state(config: &DeviceConfig, info: &DeviceInfo, saved: SavedState) ->
     }
     State {
         name,
+        name_conflict: None,
         tx_names: pick(&saved.tx_names, &info.tx_channels),
         rx_names: pick(&saved.rx_names, &info.rx_channels),
         subscriptions,
@@ -550,44 +564,138 @@ fn initial_state(config: &DeviceConfig, info: &DeviceInfo, saved: SavedState) ->
     }
 }
 
-/// Keeps the mDNS records in line with the device name and channel names.
+/// How many other names [`advertise`] tries when probing finds the device's
+/// name taken, before it announces one anyway and reports the conflict.
+/// RFC 6762 §8.1 slows probing down after 15 conflicts.
+const MAX_RENAMES: u32 = 15;
+
+/// A device name that probing found taken.
+struct Renaming {
+    /// The name asked for (by the configuration, a controller or the app),
+    /// which the alternatives are numbered after.
+    wanted: String,
+    /// The device that holds it.
+    peer: Ipv4Addr,
+    /// The alternative taken last, and how many were tried.
+    picked: String,
+    tries: u32,
+}
+
+/// Keeps the mDNS records in line with the device name and channel names,
+/// and [`State::name_conflict`] up to date.
+///
+/// Each new device name is probed for before it is announced (RFC 6762
+/// §8.1). When another device answers for it, this device takes the first
+/// free name of `<name>-2`, `<name>-3`, ... and keeps it: it is saved like a
+/// rename from a controller, so the device that held the name first keeps
+/// it, and neither changes name at its next start. A conflict that only
+/// shows once a name is announced renames nothing (see [`crate::mdns`]).
 async fn advertise(shared: Arc<Shared>, mdns: Mdns) {
     let mut watch = shared.watch();
+    let mut conflicts = mdns.conflicts();
+    // The device name whose records we announce.
+    let mut claimed: Option<String> = None;
+    let mut renaming: Option<Renaming> = None;
     let mut last = None;
     loop {
-        let records = {
-            let s = shared.state();
-            let info = &shared.info;
-            mdns::device_records(&Advertisement {
-                name: &s.name,
-                ip: info.iface.ip,
-                arc_port: info.ports.arc,
-                cmc_port: info.ports.cmc,
-                flow_control_port: info.ports.flow_control,
-                device_id: &info.device_id,
-                process_id: info.process_id,
-                manufacturer: MANUFACTURER,
-                board_name: BOARD_NAME,
-                model: MODEL_ID,
-                tx_channels: info
-                    .tx_channels
-                    .iter()
-                    .zip(&s.tx_names)
-                    .enumerate()
-                    .map(|(i, (f, c))| {
-                        (f.as_str(), c.as_str(), own_channel_txt(info, i as u16 + 1))
-                    })
-                    .collect(),
-            })
-        };
+        let (name, records) = advertisement(&shared);
+        if !claimed.as_ref().is_some_and(|c| c.eq_ignore_ascii_case(&name)) {
+            let taken = mdns.probe(&records).await;
+            if !shared.name().eq_ignore_ascii_case(&name) {
+                // Renamed meanwhile: probe for the new name instead.
+                continue;
+            }
+            if let Some(conflict) = taken {
+                let mut r = match renaming.take() {
+                    Some(r) if r.picked.eq_ignore_ascii_case(&name) => r,
+                    _ => Renaming {
+                        wanted: name.clone(),
+                        peer: conflict.peer,
+                        picked: name.clone(),
+                        tries: 0,
+                    },
+                };
+                r.tries += 1;
+                if r.tries <= MAX_RENAMES {
+                    let new = mdns::alternative_name(&r.wanted, r.tries + 1);
+                    error!(
+                        "the device at {} already uses the name {name}: this device takes the \
+                         name {new}. Rename one of them to choose their names.",
+                        conflict.peer
+                    );
+                    shared.modify(|s| {
+                        if s.name.eq_ignore_ascii_case(&name) {
+                            s.name = new.clone();
+                        }
+                    });
+                    r.picked = new;
+                    renaming = Some(r);
+                    continue;
+                }
+                error!(
+                    "{MAX_RENAMES} names after {} are taken; announcing {name} although the \
+                     device at {} uses it",
+                    r.wanted, conflict.peer
+                );
+            }
+            claimed = Some(name);
+        }
         if last.as_ref() != Some(&records) {
             mdns.set_records(records.clone()).await;
             last = Some(records);
         }
-        if watch.changed().await.is_err() {
-            return;
+        report_name_conflict(&shared, renaming.as_ref(), &conflicts.borrow_and_update());
+        tokio::select! {
+            changed = watch.changed() => if changed.is_err() {
+                return;
+            },
+            changed = conflicts.changed() => if changed.is_err() {
+                return;
+            },
         }
     }
+}
+
+/// Sets [`State::name_conflict`]: a device announcing our name right now,
+/// or else the name that probing found taken, while the device keeps the
+/// one it took instead. Status only: it doesn't wake [`Shared::watch`].
+fn report_name_conflict(shared: &Shared, renaming: Option<&Renaming>, live: &[mdns::Conflict]) {
+    let mut s = shared.state();
+    s.name_conflict = match live.first() {
+        Some(c) => Some(NameConflict { name: s.name.clone(), peer: c.peer, renamed_to: None }),
+        None => renaming.filter(|r| r.picked.eq_ignore_ascii_case(&s.name)).map(|r| NameConflict {
+            name: r.wanted.clone(),
+            peer: r.peer,
+            renamed_to: Some(r.picked.clone()),
+        }),
+    };
+}
+
+/// The device name and the mDNS records of the device as it is now.
+fn advertisement(shared: &Shared) -> (String, Vec<Record>) {
+    let s = shared.state();
+    let info = &shared.info;
+    let records = mdns::device_records(&Advertisement {
+        name: &s.name,
+        host: &info.factory_name,
+        ip: info.iface.ip,
+        arc_port: info.ports.arc,
+        cmc_port: info.ports.cmc,
+        flow_control_port: info.ports.flow_control,
+        device_id: &info.device_id,
+        process_id: info.process_id,
+        manufacturer: MANUFACTURER,
+        board_name: BOARD_NAME,
+        model: MODEL_ID,
+        tx_channels: info
+            .tx_channels
+            .iter()
+            .zip(&s.tx_names)
+            .enumerate()
+            .map(|(i, (f, c))| (f.as_str(), c.as_str(), own_channel_txt(info, i as u16 + 1)))
+            .collect(),
+    });
+    (s.name.clone(), records)
 }
 
 /// What an audio backend needs: the media clock and the channel rings.

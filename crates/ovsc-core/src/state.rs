@@ -26,6 +26,9 @@ pub struct Subscription {
 pub struct State {
     /// Current device name (user-assigned or factory).
     pub name: String,
+    /// Another device using the device name, as mDNS shows it. Status only:
+    /// setting it doesn't go through [`Shared::modify`].
+    pub name_conflict: Option<crate::mdns::NameConflict>,
     /// Current transmit channel names (user-assigned or factory).
     pub tx_names: Vec<String>,
     /// Current receive channel names.

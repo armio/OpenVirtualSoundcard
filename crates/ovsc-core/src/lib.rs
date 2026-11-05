@@ -34,6 +34,7 @@ pub use device::{
     TxFlowStatus,
 };
 pub use info::DeviceInfo;
+pub use mdns::NameConflict;
 pub use persist::SavedState;
 pub use state::FormatRequest;
 
