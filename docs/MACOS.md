@@ -191,8 +191,14 @@ already in use`. Add the section and restart the daemon.
 | `[device] tx_channels` | 1 to 128: the device's outputs. |
 | `[device] sample_rate` | 44100, 48000, 88200, 96000, 176400 or 192000. |
 | `[device] bits_per_sample` | 16, 24 or 32, for the transmitted audio. |
-| `[device] latency_ms` | The receive latency, 0.25 to 40 ms. |
+| `[device] latency_ms` | The receive latency, 1 to 40 ms: the device's inputs are read this long after their timestamps. |
+| `[device] tx_latency_ms` | The transmit latency, 1 to 40 ms: the least latency the device asks of receivers of its outputs (the console); see [Latency and safety offsets](#latency-and-safety-offsets). Unset: `latency_ms`. |
 | `[clock] source` | `"ptp"` follows the network's PTP master; `"free"` runs on this Mac's own clock, for a network without a master. `"system"` is refused. |
+
+Both latencies must also be at least `tx_guard_us` (500 µs by default) plus
+0.5 ms: the device sends a packet `tx_guard_us` after its first frame's
+timestamp, so a shorter latency would make every packet late. With the
+default guard, 1 ms is the least.
 
 A new rate, channel count or latency reaches Core Audio as a device
 configuration change: applications that use the device see it reconfigure.
@@ -217,7 +223,10 @@ too. Its Latency tab shows how late the packets of each receive flow arrive,
 against that setting. Like a rename, the new latency is saved in the device's state file
 (`state.toml`, as `latency_ns`) and from then on replaces
 `latency_ms`, also after a reboot. Deleting `latency_ns` from the state file
-(then restarting the daemon) goes back to `latency_ms`.
+(then restarting the daemon) goes back to `latency_ms`. Only the receive
+latency is set this way; while `tx_latency_ms` is unset, the transmit
+latency follows it. A saved latency below the least the device allows is
+ignored at start.
 
 To apply it, the daemon restarts its network engine while the clock keeps
 running and the driver stays attached: subscriptions drop for about a second
@@ -231,9 +240,9 @@ The `[coreaudio]` section tunes the device:
 |---|---|---|
 | `control_socket` | `"/var/run/ovsc/control.sock"` | The [control socket](#the-control-socket) for the app; empty for none. |
 | `allowed_uids` | `[202]` | Effective user IDs allowed to connect; 202 is `_coreaudiod`, Core Audio's driver helper. |
-| `input_margin_us` | `500` | Added to the input safety offset. |
-| `output_margin_us` | `1000` | Added to the output safety offset. |
-| `output_latency_ms` | unset | Output latency reported to applications; unset means `latency_ms`. |
+| `input_margin_us` | `500` | Added to the input safety offset; see [Choosing the margins](#choosing-the-margins). |
+| `output_margin_us` | `1000` | Added to the output safety offset; see [Choosing the margins](#choosing-the-margins). |
+| `output_latency_ms` | unset | Output latency reported to applications; unset means the transmit latency (`tx_latency_ms`, else `latency_ms`). Set it to the console's latency when that is longer. |
 | `input_latency_mode` | `"safety"` | `"safety"` or `"latency"`: see [Latency and safety offsets](#latency-and-safety-offsets). |
 | `clock_algorithm` | `"raw"` | Core Audio's time stamp smoothing: `"raw"` (none) or `"iir"`. |
 | `prevent_idle_sleep` | `true` | Keep the Mac from idle-sleeping while the engine runs. |
@@ -327,6 +336,8 @@ computes both (`compute_offsets` in
 with:
 
 * `L = round(latency_ms × fs / 1000)`, the receive latency;
+* `T = round(tx_latency_ms × fs / 1000)`, the transmit latency (`T = L`
+  while `tx_latency_ms` is unset);
 * `guard = floor(tx_guard_us × fs / 1e6)`: a packet is sent this long after
   its timestamp (`tx_guard_us` is 500 µs by default);
 * `FPP_MAX = 32`, the most frames per transmitted packet;
@@ -337,7 +348,7 @@ with:
 | Input safety offset | `L + margin(input_margin_us)` | `margin(input_margin_us)` |
 | Input latency | 0 | `L` |
 | Output safety offset | `max(FPP_MAX − 1 − guard, 0) + margin(output_margin_us)` | same |
-| Output latency | `L`, or `output_latency_ms` | same |
+| Output latency | `T`, or `output_latency_ms` | same |
 
 In safety mode the network latency is part of the input safety offset, so
 the input time stamps an application gets are the senders' capture times:
@@ -349,11 +360,25 @@ values sees the same input total in either mode.
 The output safety offset covers the transmit thread: a packet carries up to
 `FPP_MAX` frames and leaves `guard` after its first frame's timestamp, so a
 frame must be in the ring up to `FPP_MAX − 1 − guard` frames before its own
-time. Dante receivers play a frame at its timestamp plus their own receive
-latency; the device reports `latency_ms` as its output latency unless
-`output_latency_ms` says otherwise.
+time. The output margin adds room for the driver writing late ([Choosing
+the margins](#choosing-the-margins)).
 
-With the default margins, 4 ms latency and the default guard:
+A receiver plays an output frame at its timestamp plus the larger of its own
+receive latency and the latency the device asks for in its transmit
+channels' advertisement, `T` (TXT `latency_ns`, [PROTOCOL.md](PROTOCOL.md)
+sections 2.2 and 8.4). So the console plays the device's outputs
+`max(console latency, T)` after their time, and the device reports `T` as
+its output latency. That is right while the console's latency is at most
+`T`; if it is longer, set `output_latency_ms` to it, or hosts under-report
+the output path by the difference. While `tx_latency_ms` is unset, `T` is
+the receive latency: raising `latency_ms` (here, from the app or from Dante
+Controller) then delays the console's playout of the outputs as well as the
+inputs. For live use, set `tx_latency_ms = 1.0`: the console then plays the
+returns at its own latency (at least 1 ms), and `latency_ms` sets only the
+input side.
+
+With the default margins, 4 ms latency (`tx_latency_ms` unset) and the
+default guard:
 
 | Rate | `L` | Input safety | Output safety | Output latency |
 |---|---|---|---|---|
@@ -368,6 +393,58 @@ The test `offsets_match_the_design_table` in
 [`crates/ovsc-ipc/tests/protocol.rs`](../crates/ovsc-ipc/tests/protocol.rs)
 checks this table against `compute_offsets`, and the end-to-end test checks
 the 48 kHz row on a real device (scenario S2).
+
+#### Round trip
+
+The HAL reads input one buffer plus the input safety offset behind its IO
+cycle and writes output one buffer plus the output safety offset ahead of
+it ([Measured IO timing](#measured-io-timing)). With a buffer of `B` frames,
+a frame captured at a stagebox is therefore played by the console
+
+```text
+2·B + input safety + output safety + max(console latency, T)
+  = 2·B + L + margin(input_margin_us)
+        + max(FPP_MAX − 1 − guard, 0) + margin(output_margin_us)
+        + max(console latency, T)
+```
+
+after its capture, plus the plug-ins' own latency and the stagebox's and
+console's converters and processing. A host that adds both buffers and the
+device's latencies and safety offsets reports the same figure while the
+output latency is right (see above). At 48 kHz with the default margins and
+guard, and a console at 1 ms:
+
+| `latency_ms` | `tx_latency_ms` | B = 32 | B = 64 | B = 128 |
+|---|---|---|---|---|
+| 4 | unset | 11.0 ms | 12.3 ms | 15.0 ms |
+| 4 | 1 | 8.0 ms | 9.3 ms | 12.0 ms |
+| 2 | 1 | 6.0 ms | 7.3 ms | 10.0 ms |
+| 1 | 1 | 5.0 ms | 6.3 ms | 9.0 ms |
+
+Each millisecond of `latency_ms` adds a millisecond, and so does each one of
+`T` above the console's latency.
+
+#### Choosing the margins
+
+The input margin covers the driver's timeline and the daemon's clock
+disagreeing (by up to 250 µs while audio flows, see [Clock states and
+silence](#clock-states-and-silence)) and packets a little later than `L`.
+The output margin covers the same disagreement, HAL wake-ups 1 to 3 frames
+late and IO cycles that finish late, so that output reaches the rings
+before the transmit thread reads it; a transmit thread that runs late needs
+none, since it then reads later still. Neither should be below the 250 µs
+clock bound plus a few frames, about 300 µs. The defaults (500 µs in,
+1000 µs out) leave room for a busy Mac; each 100 µs less shortens the round
+trip by 100 µs.
+
+To lower them, run the show's load (the session, its plug-ins and buffer
+size) for at least an hour, then read `out_margin` and `in_margin` in the
+[status](#status) (the log's `min_out_margin` and `min_in_margin`), and
+`late_out`, `early_in` and `tx_underruns`, which must stay 0. The smallest
+margin of each, less 12 frames (250 µs at 48 kHz) and a few more, is how far
+that margin may come down; repeat the test after changing it. On the input
+side, a receive latency `L` that packets keep to (the app's Latency tab, the
+`rx_late` counter) matters more than the margin.
 
 ## Clock states and silence
 
