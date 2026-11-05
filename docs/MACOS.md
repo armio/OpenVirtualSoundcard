@@ -421,8 +421,9 @@ Otherwise the inputs read silence and the outputs are dropped. So:
   change (the leader reboots, Preferred Leader is moved, a better device
   joins), agrees with the running clock to within microseconds: the clock
   stays continuous, `step_gen` does not change, and audio keeps flowing.
-  If the old leader just went silent, the switch comes after the 5 s
-  master timeout, during which the clock runs on;
+  If the old leader just went silent, the new one takes over once the old
+  one has been silent for 1 s and the new one has sent two Syncs, while the
+  clock runs on;
 * when the clock steps (the master's time jumped by more than 2 ms, or a new
   master's time differs from the running clock by more than 250 µs), the
   device is silent until the daemon's clock has locked again, then the

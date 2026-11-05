@@ -8,6 +8,16 @@
 //! To avoid flapping between masters while a Dante network re-elects its
 //! master, the selection only moves away from a live master when another one
 //! has been strictly better for [`SWITCH_AFTER_SYNCS`] consecutive Syncs.
+//!
+//! When the leader just goes silent (it rebooted, its link went down), the
+//! network elects another one, which is usually not better than the old
+//! leader's last data set. Waiting for the old leader's timeout would leave
+//! the clock unsupervised for seconds, so once the current master has been
+//! silent for [`TAKEOVER_AFTER_SILENCE`], the best of the masters still
+//! sending takes over after [`SWITCH_AFTER_SYNCS`] Syncs. If the old leader
+//! comes back and is better, it takes over again the same way; a leader
+//! change keeps the clock continuous (see the servo), so the cost of that is
+//! small.
 
 use std::cmp::Ordering;
 use std::net::Ipv4Addr;
@@ -18,6 +28,11 @@ use super::wire::{Header, PortIdentity, SyncBody};
 /// How many consecutive Syncs a strictly better master must send before we
 /// switch to it.
 pub const SWITCH_AFTER_SYNCS: u32 = 2;
+
+/// How long the current master must have been silent before another one
+/// may take over without being better: four Sync intervals of a Dante
+/// leader (250 ms), so that a lost Sync or two never moves the selection.
+pub const TAKEOVER_AFTER_SILENCE: Duration = Duration::from_secs(1);
 
 /// Rank of a PTPv1 clock identifier; lower is better.
 ///
@@ -120,6 +135,7 @@ pub struct MasterChange {
 #[derive(Clone, Debug)]
 pub struct MasterSelector {
     timeout_ns: u64,
+    takeover_ns: u64,
     masters: Vec<ForeignMaster>,
     current: Option<PortIdentity>,
 }
@@ -127,8 +143,10 @@ pub struct MasterSelector {
 impl MasterSelector {
     /// A selector that forgets masters after `timeout` without a Sync.
     pub fn new(timeout: Duration) -> MasterSelector {
+        let timeout_ns = timeout.as_nanos().min(u64::MAX as u128) as u64;
         MasterSelector {
-            timeout_ns: timeout.as_nanos().min(u64::MAX as u128) as u64,
+            timeout_ns,
+            takeover_ns: (TAKEOVER_AFTER_SILENCE.as_nanos() as u64).min(timeout_ns),
             masters: Vec::new(),
             current: None,
         }
@@ -179,8 +197,11 @@ impl MasterSelector {
         if current.dataset.source == id {
             return None;
         }
+        let current_silent = now_ns.saturating_sub(current.last_sync_ns) > self.takeover_ns;
+        let takes_over =
+            m_is_best_live(&self.masters, idx, current.dataset.source, now_ns, self.takeover_ns);
         let m = &mut self.masters[idx];
-        if m.dataset.is_better_than(&current.dataset) {
+        if m.dataset.is_better_than(&current.dataset) || (current_silent && takes_over) {
             m.better_syncs += 1;
             if m.better_syncs >= SWITCH_AFTER_SYNCS {
                 return Some(self.switch_to(Some(id)));
@@ -222,6 +243,24 @@ impl MasterSelector {
         let previous = std::mem::replace(&mut self.current, new);
         MasterChange { previous, current: new }
     }
+}
+
+/// Whether `masters[idx]` is the best of the masters other than `current`
+/// heard within `live_ns` of `now_ns`.
+fn m_is_best_live(
+    masters: &[ForeignMaster],
+    idx: usize,
+    current: PortIdentity,
+    now_ns: u64,
+    live_ns: u64,
+) -> bool {
+    let candidate = &masters[idx].dataset;
+    !masters.iter().any(|m| {
+        m.dataset.source != current
+            && m.dataset.source != candidate.source
+            && now_ns.saturating_sub(m.last_sync_ns) <= live_ns
+            && m.dataset.is_better_than(candidate)
+    })
 }
 
 #[cfg(test)]
@@ -314,7 +353,9 @@ mod tests {
         sel.on_sync(ds(5), ADDR, SEC);
         assert_eq!(sel.on_sync(ds(1), ADDR, 2 * SEC), None);
         let degraded = MasterDataset { stratum: 200, ..ds(1) };
+        sel.on_sync(ds(5), ADDR, 3 * SEC);
         assert_eq!(sel.on_sync(degraded, ADDR, 3 * SEC), None);
+        sel.on_sync(ds(5), ADDR, 4 * SEC);
         assert_eq!(sel.on_sync(ds(1), ADDR, 4 * SEC), None);
         assert!(sel.on_sync(ds(1), ADDR, 5 * SEC).is_some());
     }
@@ -325,17 +366,57 @@ mod tests {
         sel.on_sync(ds(1), ADDR, SEC);
         sel.on_sync(ds(9), ADDR, SEC);
         assert_eq!(sel.current().unwrap().dataset.source, ds(1).source);
-        // ds(1) goes quiet; ds(9) keeps sending.
-        for t in 2..=7 {
-            sel.on_sync(ds(9), ADDR, t * SEC);
-        }
+        // ds(1) goes quiet, and so does everyone else.
         assert_eq!(sel.expire(6 * SEC), None);
         let change = sel.expire(7 * SEC).unwrap();
-        assert_eq!(change.current, Some(ds(9).source));
-        // Then ds(9) goes quiet too.
-        let change = sel.expire(13 * SEC).unwrap();
-        assert_eq!(change, MasterChange { previous: Some(ds(9).source), current: None });
+        assert_eq!(change, MasterChange { previous: Some(ds(1).source), current: None });
         assert!(sel.current().is_none());
         assert!(sel.masters().is_empty());
+    }
+
+    #[test]
+    fn a_live_master_takes_over_from_a_silent_one() {
+        let ms = SEC / 1000;
+        let mut sel = MasterSelector::new(Duration::from_secs(5));
+        sel.on_sync(ds(1), ADDR, SEC);
+        // ds(9) is worse, so while ds(1) sends it never takes over, and a
+        // gap of up to a second in ds(1)'s Syncs changes nothing.
+        let mut t = SEC;
+        for _ in 0..8 {
+            t += 250 * ms;
+            assert_eq!(sel.on_sync(ds(1), ADDR, t), None);
+            assert_eq!(sel.on_sync(ds(9), ADDR, t + ms), None);
+        }
+        assert_eq!(sel.on_sync(ds(9), ADDR, t + 600 * ms), None);
+        assert_eq!(sel.on_sync(ds(9), ADDR, t + 900 * ms), None);
+        // Silent for more than a second: two Syncs of ds(9) take over,
+        // long before the 5 s timeout.
+        assert_eq!(sel.on_sync(ds(9), ADDR, t + 1_100 * ms), None);
+        let change = sel.on_sync(ds(9), ADDR, t + 1_350 * ms).unwrap();
+        assert_eq!(
+            change,
+            MasterChange { previous: Some(ds(1).source), current: Some(ds(9).source) }
+        );
+        // ds(1) back, and better: it takes over again after two Syncs.
+        assert_eq!(sel.on_sync(ds(1), ADDR, t + 1_500 * ms), None);
+        assert_eq!(sel.on_sync(ds(1), ADDR, t + 1_750 * ms).unwrap().current, Some(ds(1).source));
+    }
+
+    #[test]
+    fn only_the_best_live_master_takes_over() {
+        let ms = SEC / 1000;
+        let mut sel = MasterSelector::new(Duration::from_secs(5));
+        sel.on_sync(ds(1), ADDR, SEC);
+        // ds(1) falls silent; ds(9) and the better ds(5) both send.
+        let mut changes = Vec::new();
+        for i in 1..=12u64 {
+            let t = SEC + i * 250 * ms;
+            changes.extend(sel.on_sync(ds(9), ADDR, t));
+            changes.extend(sel.on_sync(ds(5), ADDR, t + ms));
+        }
+        assert_eq!(
+            changes,
+            [MasterChange { previous: Some(ds(1).source), current: Some(ds(5).source) }]
+        );
     }
 }

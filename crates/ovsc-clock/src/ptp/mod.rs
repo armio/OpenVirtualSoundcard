@@ -18,7 +18,9 @@
 //! messages the clock gets its first time (a step), and once the error has
 //! stayed below 50 µs for a few Syncs the state becomes `Locked`. From then
 //! on the clock is only ever slewed, never stepped, unless the error exceeds
-//! 2 ms (the master's clock jumped). If the master goes silent for
+//! 2 ms (the master's clock jumped). If the master goes silent, another
+//! master still sending takes over after a second
+//! ([`bmc::TAKEOVER_AFTER_SILENCE`]); with none, after
 //! [`PtpConfig::master_timeout`] the state drops back to `Unlocked` but the
 //! clock keeps running on its frequency estimate for [`HOLDOVER`] before it
 //! is invalidated. A new master, or the old one heard again, is checked

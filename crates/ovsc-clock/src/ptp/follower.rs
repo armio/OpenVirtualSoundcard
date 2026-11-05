@@ -928,8 +928,8 @@ mod tests {
         let mut core = core();
         let mut out = Vec::new();
         let t = lock_to_master(&mut core, &mut out, 20_000 * MS);
-        // MASTER goes away; after the timeout another master, 50 ms off,
-        // is the only one left.
+        // MASTER goes away, and another master, 50 ms off, takes over once
+        // MASTER has been silent for a second.
         let other = PortIdentity { uuid: [0, 0x1d, 0xc1, 7, 8, 9], port_id: 1 };
         let addr: SocketAddr = "192.168.1.12:319".parse().unwrap();
         out.clear();
