@@ -1,7 +1,9 @@
 //! Opening device streams and wiring them to the network rings.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::mpsc;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
@@ -13,6 +15,7 @@ use ovsc_core::AudioIo;
 use crate::device::{
     Direction, StreamChoice, choose_config, device_id, find_device, open_host, resolve_map,
 };
+use crate::health::{Level, Watch};
 use crate::kernel::HALF;
 use crate::rt;
 use crate::sample::DeviceSample;
@@ -24,6 +27,10 @@ use crate::{Error, Result};
 pub const DEFAULT_MARGIN_MS: f64 = 1.0;
 /// How long to wait for a backend to open a stream.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often the health monitor looks at the streams.
+const HEALTH_INTERVAL: Duration = Duration::from_millis(250);
+/// A stream that has stalled for this long needs reopening.
+const REOPEN_AFTER_MS: f64 = 1000.0;
 
 /// What to bridge, and how.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -62,23 +69,90 @@ pub struct BridgeConfig {
 
 /// A running bridge. Dropping it stops the streams. It is `Send`, so it
 /// can live on whichever thread manages the device.
+///
+/// A small thread watches both streams and logs what an engineer should
+/// know before it becomes audible: xruns, underruns and jumps (as
+/// rate-limited warnings), a device that is lost, stalls or gets rerouted,
+/// lost lock, refused real-time priority, and the latency each direction
+/// adds.
 pub struct Bridge {
     output: Option<Half>,
     input: Option<Half>,
+    monitor: Option<Monitor>,
 }
 
 /// One open device stream.
 struct Half {
     stream: cpal::Stream,
-    stats: Arc<StatsCell>,
-    device: String,
-    channels: u16,
-    format: SampleFormat,
+    probe: Probe,
 }
 
 impl Half {
     fn stats(&self) -> DirectionStats {
-        self.stats.snapshot(&self.device, self.channels, &self.format.to_string())
+        self.probe.stats()
+    }
+}
+
+/// What it takes to snapshot one direction's health.
+#[derive(Clone)]
+struct Probe {
+    stats: Arc<StatsCell>,
+    device: String,
+    channels: u16,
+    format: String,
+}
+
+impl Probe {
+    fn stats(&self) -> DirectionStats {
+        self.stats.snapshot(&self.device, self.channels, &self.format)
+    }
+}
+
+/// The health-monitor thread; stops when dropped.
+struct Monitor {
+    stop: Option<mpsc::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Monitor {
+    fn spawn(probes: Vec<(&'static str, Probe)>) -> Option<Monitor> {
+        let (stop, stopped) = mpsc::channel::<()>();
+        let spawned =
+            std::thread::Builder::new().name("ovsc-bridge-health".into()).spawn(move || {
+                let start = Instant::now();
+                let mut watches: Vec<_> =
+                    probes.into_iter().map(|(what, probe)| (Watch::new(what), probe)).collect();
+                // Ends when the bridge sends a stop or drops the sender.
+                while let Err(mpsc::RecvTimeoutError::Timeout) =
+                    stopped.recv_timeout(HEALTH_INTERVAL)
+                {
+                    let now = start.elapsed().as_secs_f64();
+                    for (watch, probe) in &mut watches {
+                        for (level, message) in watch.check(now, &probe.stats()) {
+                            match level {
+                                Level::Warn => warn!("{message}"),
+                                Level::Info => info!("{message}"),
+                            }
+                        }
+                    }
+                }
+            });
+        match spawned {
+            Ok(thread) => Some(Monitor { stop: Some(stop), thread: Some(thread) }),
+            Err(e) => {
+                warn!("cannot start the sound-card health monitor: {e}");
+                None
+            }
+        }
+    }
+}
+
+impl Drop for Monitor {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -89,6 +163,18 @@ pub struct BridgeStats {
     pub output: Option<DirectionStats>,
     /// Capture (device → network transmit channels), if open.
     pub input: Option<DirectionStats>,
+}
+
+impl BridgeStats {
+    /// Whether a direction has failed for good: its device is gone, or it
+    /// hasn't called back for a second. Only a new [`Bridge::start`] gets
+    /// audio flowing again then.
+    pub fn needs_reopen(&self) -> bool {
+        [&self.output, &self.input]
+            .into_iter()
+            .flatten()
+            .any(|d| d.device_lost || (d.stalled && d.since_callback_ms >= REOPEN_AFTER_MS))
+    }
 }
 
 impl Bridge {
@@ -115,7 +201,12 @@ impl Bridge {
             Some(query) => Some(open_input(&host, &io, cfg, query, margin)?),
             None => None,
         };
-        Ok(Bridge { output, input })
+        let probes = [("playback", &output), ("capture", &input)]
+            .into_iter()
+            .filter_map(|(what, half)| Some((what, half.as_ref()?.probe.clone())))
+            .collect();
+        let monitor = Monitor::spawn(probes);
+        Ok(Bridge { output, input, monitor })
     }
 
     /// Current health of both directions.
@@ -134,6 +225,7 @@ impl Drop for Bridge {
             // last callbacks end cleanly on backends that drain.
             let _ = half.stream.pause();
         }
+        drop(self.monitor.take());
     }
 }
 
@@ -181,7 +273,9 @@ fn open_output(
         describe_buffer(&choice),
         (HALF as u64 + margin) as f64 * 1000.0 / io.sample_rate as f64,
     );
-    Ok(Half { stream, stats, device: name, channels: choice.channels, format: choice.format })
+    let probe =
+        Probe { stats, device: name, channels: choice.channels, format: choice.format.to_string() };
+    Ok(Half { stream, probe })
 }
 
 fn open_input(
@@ -231,7 +325,9 @@ fn open_input(
         describe_buffer(&choice),
         (HALF as u64 + margin + lead) as f64 * 1000.0 / io.sample_rate as f64,
     );
-    Ok(Half { stream, stats, device: name, channels: choice.channels, format: choice.format })
+    let probe =
+        Probe { stats, device: name, channels: choice.channels, format: choice.format.to_string() };
+    Ok(Half { stream, probe })
 }
 
 /// Whether the bridge raises the priority of `device`'s callbacks itself
@@ -369,4 +465,40 @@ fn describe_map(map: &[Option<usize>], names: &[String], output: bool) -> String
         })
         .collect();
     format!("[{}]", pairs.join(" "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lost_or_long_stalled_streams_need_reopening() {
+        let ok = DirectionStats { running: true, locked: true, ..Default::default() };
+        let mut stats = BridgeStats { output: Some(ok.clone()), input: Some(ok.clone()) };
+        assert!(!stats.needs_reopen());
+        stats.input =
+            Some(DirectionStats { stalled: true, since_callback_ms: 300.0, ..ok.clone() });
+        assert!(!stats.needs_reopen(), "a short stall may recover by itself");
+        stats.input =
+            Some(DirectionStats { stalled: true, since_callback_ms: 1500.0, ..ok.clone() });
+        assert!(stats.needs_reopen());
+        stats.input = None;
+        stats.output = Some(DirectionStats { device_lost: true, ..ok });
+        assert!(stats.needs_reopen());
+    }
+
+    #[test]
+    fn the_monitor_stops_with_its_owner() {
+        let probe = Probe {
+            stats: Arc::new(StatsCell::new()),
+            device: "test".into(),
+            channels: 2,
+            format: "f32".into(),
+        };
+        let monitor = Monitor::spawn(vec![("capture", probe)]).expect("spawn");
+        std::thread::sleep(HEALTH_INTERVAL * 2);
+        let start = Instant::now();
+        drop(monitor);
+        assert!(start.elapsed() < HEALTH_INTERVAL * 2, "took {:?}", start.elapsed());
+    }
 }

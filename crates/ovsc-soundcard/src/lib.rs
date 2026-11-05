@@ -88,16 +88,18 @@
 //!   the stream jump back onto its target within a few callbacks (at once
 //!   for an xrun the backend reports), with a dip of a few milliseconds:
 //!   the audio before the break ramps down over up to 2 ms, the audio after
-//!   it fades in over 5 ms. Only start-up and the loss of the media clock
-//!   mute the stream while it settles (100 ms).
+//!   it fades in over 5 ms. Only start-up, the loss of the media clock and
+//!   a step beyond 50 ms before the loop has locked mute the stream while
+//!   it settles (100 ms).
 //! * The resampler is a 64-tap Kaiser-windowed sinc interpolator with 1024
 //!   tabulated phases, accurate to better than −100 dB up to 20 kHz at
 //!   48 kHz; it reads the rings (or a short capture history) at arbitrary
 //!   fractional positions, so the ratio can change at every sample.
 //!
 //! Audio callbacks don't allocate, lock or log; statistics are atomics read
-//! by [`Bridge::stats`]. Device input is sanitised: NaN and infinities
-//! become silence, subnormal floats zero.
+//! by [`Bridge::stats`], and a small monitor thread logs warnings from them
+//! (xruns, underruns, jumps, stalls, lost devices). Device input is
+//! sanitised: NaN and infinities become silence, subnormal floats zero.
 //!
 //! # Real-time priority
 //!
@@ -106,8 +108,8 @@
 //! bridge raises each callback thread to `SCHED_FIFO` itself from its first
 //! callback, for every ALSA device except those served by a sound server
 //! (`default`, `pulse`, `pipewire`, `jack`); that needs `CAP_SYS_NICE` (or
-//! root), and [`DirectionStats::realtime`] says when it was refused.
-//! Without it a busy machine causes xruns at small buffers.
+//! root), and [`DirectionStats::realtime`] and a warning say when it was
+//! refused. Without it a busy machine causes xruns at small buffers.
 //!
 //! # Latency
 //!
@@ -126,12 +128,18 @@
 //! * Absolute timing is not compensated for the devices' own converter and
 //!   driver latencies, so playback is not sample-aligned with other Dante
 //!   receivers.
-//! * A device disconnect ends its stream ([`DirectionStats::device_lost`]);
-//!   start a new bridge to reconnect.
+//! * A device disconnect ends its stream ([`DirectionStats::device_lost`]),
+//!   and a device can stop calling back without an error
+//!   ([`DirectionStats::stalled`]); [`BridgeStats::needs_reopen`] says when
+//!   to start a new bridge to reconnect.
+//! * A stream opened on `"default"` follows the system default device
+//!   (CoreAudio reroutes it, [`DirectionStats::device_changed`]); name the
+//!   device for live use.
 
 mod bridge;
 pub mod controller;
 mod device;
+mod health;
 mod kernel;
 mod pos;
 mod rt;
