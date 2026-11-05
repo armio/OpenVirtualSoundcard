@@ -1456,10 +1456,14 @@ async fn request_job(
 ) -> Done {
     let control = SocketAddr::V4(tx);
     // Stopped first: a transmitter at its flow limit would refuse a new
-    // flow while the one it replaces still counts.
+    // flow while the one it replaces still counts. All at once: a
+    // transmitter back from a reboot may not answer stops for handles it no
+    // longer knows, and each unanswered stop waits 1 s.
+    let mut stopping = JoinSet::new();
     for handle in stops {
-        let _ = client::stop_flow(ip, control, handle).await;
+        stopping.spawn(client::stop_flow(ip, control, handle));
     }
+    while stopping.join_next().await.is_some() {}
     enum One {
         Grow(Grow, Result<()>),
         Create(Create, Result<FlowHandle>),

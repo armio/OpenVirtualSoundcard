@@ -341,6 +341,84 @@ async fn a_dead_flow_is_stopped_before_it_is_requested_again() {
     server.abort();
 }
 
+/// Several dead flows to one transmitter are stopped together, not one
+/// after another: a console back from a reboot may not answer stops for
+/// handles it no longer knows, and each unanswered stop waits 1 s before
+/// the flows are requested again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dead_flows_to_one_transmitter_are_stopped_together() {
+    use ovsc_proto::dbcp;
+    use ovsc_proto::frame::{self, result};
+
+    // Grants flows but never sends audio, so that every flow dies, and
+    // never answers a stop.
+    let fake = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let port = fake.local_addr().unwrap().port();
+    let log = Arc::new(std::sync::Mutex::new(Vec::<(&str, u8, Instant)>::new()));
+    let seen = log.clone();
+    let server = tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        let mut handle = 0u8;
+        loop {
+            let (n, src) = fake.recv_from(&mut buf).await.unwrap();
+            let Ok(req) = Frame::parse(&buf[..n]) else { continue };
+            let h = req.header;
+            let resp = match h.opcode {
+                dbcp::opcode::REQUEST_FLOW => {
+                    handle += 1;
+                    seen.lock().unwrap().push(("request", handle, Instant::now()));
+                    dbcp::encode_flow_created(&h, [0, 0, 0, 0, 0, handle])
+                }
+                dbcp::opcode::STOP_FLOW => {
+                    let stopped = dbcp::decode_stop_flow(&req).unwrap()[5];
+                    seen.lock().unwrap().push(("stop", stopped, Instant::now()));
+                    continue;
+                }
+                _ => frame::encode(h.protocol, h.seq, h.opcode, result::SUCCESS, &[]),
+            };
+            let _ = fake.send_to(&resp, src).await;
+        }
+    });
+    // One channel per flow, so that three channels take three flows.
+    let directory = StaticDirectory::new();
+    for id in 1..=3u16 {
+        directory.insert(ResolvedChannel {
+            device: "reboot-tx".into(),
+            channel: format!("{id:02}"),
+            addr: Ipv4Addr::LOCALHOST,
+            flow_control_port: port,
+            txt: ChannelTxt { nchan: 1, ..txt(id) },
+        });
+    }
+    let rx =
+        Device::start_with_directory(config("reboot-rx", 24730, 34), system_clock(), directory)
+            .await
+            .unwrap();
+    for id in 1..=3 {
+        rx.subscribe(id, &format!("{id:02}"), "reboot-tx").unwrap();
+    }
+    eventually("the flows to be requested again", || {
+        let l = log.lock().unwrap();
+        if l.iter().any(|&(what, h, _)| what == "request" && h > 3) {
+            Ok(())
+        } else {
+            Err(format!("{:?}", l.iter().map(|&(w, h, _)| (w, h)).collect::<Vec<_>>()))
+        }
+    })
+    .await;
+    let l = log.lock().unwrap().clone();
+    let again = l.iter().position(|&(what, h, _)| what == "request" && h > 3).unwrap();
+    for old in 1..=3 {
+        let stop = l.iter().position(|&(what, h, _)| what == "stop" && h == old);
+        assert!(stop.is_some_and(|s| s < again), "flow {old} not stopped first: {l:?}");
+    }
+    let first_stop = l.iter().find(|&&(what, _, _)| what == "stop").unwrap().2;
+    let waited = l[again].2 - first_stop;
+    assert!(waited < Duration::from_millis(2000), "requested again {waited:?} after the stops");
+    rx.shutdown().await;
+    server.abort();
+}
+
 /// Dante Controller rewrites a subscription when a channel or device is
 /// renamed, or re-clicks one restored under its factory name with the
 /// label. If it still names the transmit channel being received, the flow
