@@ -2649,6 +2649,7 @@ mod tests {
                 remote_settings_locked: false,
                 remote_settings_lock_set: None,
                 name_conflict: None,
+                announced: None,
             };
             let clock = ovsc_clock::system_clock();
             let ring_capacity = crate::buffer::DEFAULT_CAPACITY;

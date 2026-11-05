@@ -301,7 +301,7 @@ any of them.
 | The transmit thread stalls (rare: the Mac is overloaded) | A gap on the returns about as long as the stall beyond the console's slack (about 0.5 ms at a 1 ms console latency) | Packets up to 40 ms overdue are sent at once, oldest first, for receivers with longer latencies; beyond 40 ms the flow resyncs and the skipped packets are counted. Late sends and skips are warnings in the app. |
 | The daemon crashes (a panic anywhere) | 5 to 10 s of silence plus the clock relock; the returns may take longer | It logs the panic, says goodbye to the driver and exits; launchd starts a new daemon. Core Audio sees no change. The returns come back once the console requests OVSC's flows again, on its own timing. |
 | The Core Audio driver faults (a caught panic) | Silence on every channel until Core Audio restarts | Run `sudo killall coreaudiod`; the host will likely need to reopen the device. |
-| Another device uses OVSC's name mid-show | Nothing at once; new subscriptions may reach the wrong device | OVSC keeps its name, through engine restarts too (latency, address change); it logs an error and the app warns. Rename one device after the show. Only a restart of the daemon itself (a crash, a reboot) probes the name again and, while the other device still has it, takes `<name>-2`: clear any name warning before the show. |
+| Another device uses OVSC's name mid-show | Nothing at once; new subscriptions may reach the wrong device | OVSC keeps its name, through engine restarts (latency, address change) and restarts of the daemon itself (a crash, a reboot): `state.toml` keeps the name with the Dante interface's MAC address, and a new daemon on the same Mac announces it again without asking the network. It logs an error and the app warns. Rename one device after the show. Only another Mac (a cloned disk) or another Dante interface, whose MAC address differs, asks the network again and, while the other device has the name, takes `<name>-2`: clear any name warning before the show. |
 | A controller changes a setting | See [Changes that interrupt audio](#changes-that-interrupt-audio) | With the show lock on, refused and listed in the app; without it, applied and listed. |
 | The audio engine starts or the gate opens or closes | A 5 ms fade, not a click | The driver ramps in and out at its gate. |
 
@@ -381,7 +381,8 @@ What the common warnings point at:
 * Recovery from a pulled cable or a rebooted console no longer waits on
   other transmitters, and failures show as Dante statuses
   (`NO_CONNECTION`, `RX_FAIL`, `CHANNEL_FORMAT`, `NO_RX`, `CHANNEL_LATENCY`).
-* The device name is probed at start; a taken name gets `-2`.
+* The device name is probed before OVSC first announces it on a Mac; a taken
+  name gets `-2`. Once held, it is kept through engine and daemon restarts.
 * The show lock, and a list of controllers' changes in the app.
 * The daemon follows its network interface, restarts itself after any panic,
   keeps its state file safe across power cuts, and keeps the Mac awake from
