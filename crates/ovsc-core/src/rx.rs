@@ -83,8 +83,8 @@ const REPORT_INTERVAL: Duration = Duration::from_secs(10);
 /// A flow counts as degraded for this long after it last lost a packet or
 /// received one too late.
 const DEGRADED_HOLD: Duration = Duration::from_secs(5);
-/// A receive thread that follows one source port of its transmitter moves to
-/// another only after the first has been quiet this long.
+/// A receive thread that follows one source of its transmitter (an address
+/// and port) moves to another only after the first has been quiet this long.
 const SOURCE_HOLD_NS: u64 = KEEPALIVE_INTERVAL.as_nanos() as u64;
 /// How long packets the transmitter sent before a slot switched to another
 /// transmit channel may matter. They are stamped at most the flow's latency
@@ -212,8 +212,9 @@ type Routing = Arc<ArcSwap<Routes>>;
 struct RxFlow {
     id: u16,
     tx_device: String,
-    /// The transmitter's flow-control address; also where its audio comes
-    /// from.
+    /// The transmitter's flow-control address, where the flow was
+    /// requested. Its audio may come from any of the transmitter's
+    /// addresses ([`FlowParams::tx`]).
     control: SocketAddrV4,
     handle: FlowHandle,
     /// A spelling of the transmit channel requested for each slot.
@@ -329,7 +330,7 @@ impl RxFlow {
                  from {} and have {} bytes, or another whole number of {}-byte frames)",
                 t.rejected,
                 last & 0xffff,
-                self.control.ip(),
+                self.worker.params.tx,
                 self.worker.params.packet_len(),
                 self.worker.params.stride(),
             ));
@@ -1301,8 +1302,13 @@ impl RxManager {
             routes.slots[p.slot] = chans;
             slot_names[p.slot] = p.resolved.channel.clone();
         }
+        // A computer on Wi-Fi and Ethernet may grant the flow at one address
+        // and send its audio from the other: the flow takes audio from any
+        // of the transmitter's addresses, the one it was requested from
+        // first.
+        let addrs = placed.iter().flat_map(|p| p.resolved.addrs.iter().copied());
         let params = FlowParams {
-            tx_ip: *control.ip(),
+            tx: TxAddrs::new(*control.ip(), addrs),
             slots,
             fpp: request.fpp as usize,
             format,
@@ -1469,6 +1475,7 @@ impl RxManager {
             device: state.name.clone(),
             channel: channel.to_owned(),
             addr: info.iface.ip,
+            addrs: vec![info.iface.ip],
             flow_control_port: info.ports.flow_control,
             txt: own_channel_txt(info, index as u16 + 1),
         })
@@ -1737,11 +1744,60 @@ impl Drop for Worker {
     }
 }
 
+/// The addresses a flow's audio may come from: its transmitter's, the one
+/// the flow was requested from first. A fixed-size array, which the receive
+/// thread checks without allocating.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TxAddrs {
+    addrs: [Ipv4Addr; TxAddrs::MAX],
+    len: usize,
+}
+
+impl TxAddrs {
+    /// Wi-Fi and Ethernet, with room to spare.
+    const MAX: usize = 4;
+
+    /// `first`, then those of `others` not in yet, as many as fit.
+    fn new(first: Ipv4Addr, others: impl IntoIterator<Item = Ipv4Addr>) -> Self {
+        let mut set = Self { addrs: [first; Self::MAX], len: 1 };
+        for addr in others {
+            if set.len == Self::MAX {
+                break;
+            }
+            if !set.contains(addr) {
+                set.addrs[set.len] = addr;
+                set.len += 1;
+            }
+        }
+        set
+    }
+
+    fn contains(&self, addr: Ipv4Addr) -> bool {
+        self.as_slice().contains(&addr)
+    }
+
+    fn as_slice(&self) -> &[Ipv4Addr] {
+        &self.addrs[..self.len]
+    }
+}
+
+impl std::fmt::Display for TxAddrs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, addr) in self.as_slice().iter().enumerate() {
+            if i > 0 {
+                f.write_str(" or ")?;
+            }
+            write!(f, "{addr}")?;
+        }
+        Ok(())
+    }
+}
+
 /// What a receive thread knows about its flow.
 #[derive(Clone, Copy, Debug)]
 struct FlowParams {
-    /// The transmitter's address: datagrams from any other are dropped.
-    tx_ip: Ipv4Addr,
+    /// The transmitter's addresses: datagrams from any other are dropped.
+    tx: TxAddrs,
     /// Slots per packet, fixed when the flow was requested.
     slots: usize,
     fpp: usize,
@@ -1909,12 +1965,13 @@ impl Receiver {
         last_packet_ns.store(now_ns, Ordering::Relaxed);
     }
 
-    /// Whether a datagram is one of the flow's packets: from the
-    /// transmitter's address and the source port its packets have been
-    /// coming from, and whole frames of the flow's slots. Anything else (a
-    /// flow that a previous receiver on this port left behind, a second flow
-    /// created by a retried request) would be mixed into this flow's
-    /// channels, or decoded with the wrong layout.
+    /// Whether a datagram is one of the flow's packets: from one of the
+    /// transmitter's addresses (a computer on Wi-Fi and Ethernet may send
+    /// from either, whichever the flow was requested from), from the source
+    /// its packets have been coming from, and whole frames of the flow's
+    /// slots. Anything else (a flow that a previous receiver on this port
+    /// left behind, a second flow created by a retried request) would be
+    /// mixed into this flow's channels, or decoded with the wrong layout.
     ///
     /// The frame count is not checked against the fpp we asked for, only
     /// against [`RX_FPP_LIMIT`]: receivers derive it from the length
@@ -1925,12 +1982,14 @@ impl Receiver {
         let stride = self.params.stride();
         let frames = payload / stride;
         let whole = payload % stride == 0 && (1..=self.samples.len()).contains(&frames);
-        if from.ip() != IpAddr::V4(self.params.tx_ip) || !whole {
+        let IpAddr::V4(ip) = from.ip() else { return false };
+        if !self.params.tx.contains(ip) || !whole {
             return false;
         }
         match self.source {
             Some(source) if source == from => {}
-            // Another port: only once the one we follow has gone quiet.
+            // Another port, or another of the transmitter's addresses: only
+            // once the one we follow has gone quiet.
             Some(_) if now_ns.saturating_sub(self.source_ns) < SOURCE_HOLD_NS => return false,
             _ => self.source = Some(from),
         }
@@ -2080,8 +2139,13 @@ mod tests {
     }
 
     fn test_rx(slots: usize, fpp: usize, offset: u64) -> TestRx {
+        test_rx_from(TxAddrs::new(TX, []), slots, fpp, offset)
+    }
+
+    /// Like [`test_rx`], for a transmitter with the addresses `tx`.
+    fn test_rx_from(tx: TxAddrs, slots: usize, fpp: usize, offset: u64) -> TestRx {
         let params = FlowParams {
-            tx_ip: TX,
+            tx,
             slots,
             fpp,
             format: SampleFormat::S24,
@@ -2173,6 +2237,61 @@ mod tests {
         t.send(a, 1_000 + SOURCE_HOLD_NS + 2, ts + 48, 500);
         assert_eq!(t.rings[0].read_one(ts + 48), None);
         assert_eq!(get(&t.stats.rejected_packets), 4);
+    }
+
+    /// A computer on Wi-Fi and Ethernet on the Dante subnet may grant a flow
+    /// at one address and send its audio from the other. Audio from any of
+    /// the transmitter's addresses plays; a stale flow from another device
+    /// is still dropped, and the source followed is kept as before.
+    #[test]
+    fn packets_from_the_transmitters_other_address_play() {
+        let wifi = Ipv4Addr::new(127, 0, 0, 5);
+        // Requested from TX, the wired address.
+        let mut t = test_rx_from(TxAddrs::new(TX, [wifi]), 2, 12, 0);
+        let ts = t.now();
+        let a = from(wifi, 5000);
+        t.send(a, 1_000, ts, 100);
+        assert_eq!(get(&t.stats.rejected_packets), 0);
+        assert_eq!(get(&t.stats.packets), 1);
+        assert_eq!(t.rx.source, Some(a));
+        assert_eq!(t.rings[0].read_one(ts), Some(100 << 8));
+        assert_eq!(t.rings[1].read_one(ts + 11), Some(101 << 8));
+
+        // Another device: dropped.
+        t.send(from(Ipv4Addr::new(127, 0, 0, 2), 5000), 2_000, ts + 12, 200);
+        // The wired address while Wi-Fi, the source followed, is busy: also
+        // dropped, as another port would be.
+        let b = from(TX, 5000);
+        t.send(b, 3_000, ts + 12, 300);
+        assert_eq!(get(&t.stats.rejected_packets), 2);
+        assert_eq!(get(&t.counters.rx_rejected_packets), 2);
+        assert_eq!(t.rings[0].read_one(ts + 12), None);
+        t.send(a, 4_000, ts + 12, 400);
+        assert_eq!(t.rings[0].read_one(ts + 12), Some(400 << 8));
+
+        // Once Wi-Fi has been quiet a while, the wired address takes over:
+        // the computer moved the flow to its other interface.
+        t.send(b, 4_000 + SOURCE_HOLD_NS + 1, ts + 24, 500);
+        assert_eq!(t.rx.source, Some(b));
+        assert_eq!(t.rings[0].read_one(ts + 24), Some(500 << 8));
+        assert_eq!(get(&t.stats.packets), 3);
+        assert_eq!(get(&t.stats.rejected_packets), 2);
+    }
+
+    /// A flow keeps the address it was requested from first, and takes each
+    /// other address of the transmitter once, as many as fit.
+    #[test]
+    fn a_flow_takes_up_to_four_transmitter_addresses() {
+        let ip = |n| Ipv4Addr::new(10, 0, 0, n);
+        let tx = TxAddrs::new(ip(2), [ip(1), ip(2), ip(3), ip(1), ip(4), ip(5)]);
+        assert_eq!(tx.as_slice(), [ip(2), ip(1), ip(3), ip(4)]);
+        assert!(tx.contains(ip(4)));
+        assert!(!tx.contains(ip(5)));
+        assert_eq!(tx.to_string(), "10.0.0.2 or 10.0.0.1 or 10.0.0.3 or 10.0.0.4");
+        let one = TxAddrs::new(ip(7), []);
+        assert_eq!(one.as_slice(), [ip(7)]);
+        assert!(!one.contains(ip(2)));
+        assert_eq!(one.to_string(), "10.0.0.7");
     }
 
     /// Receivers derive fpp from a packet's length (PROTOCOL.md §8.2): a
@@ -2561,6 +2680,31 @@ mod tests {
             tx.shutdown().await;
         }
 
+        /// A flow takes audio from every address its transmitter has, the
+        /// one it was requested from first: a computer on Wi-Fi and Ethernet
+        /// may send from either.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_flow_takes_every_address_of_its_transmitter() {
+            let tx =
+                Device::start(config("multi-tx", 24560), ovsc_clock::system_clock()).await.unwrap();
+            let directory = StaticDirectory::new();
+            // Its Wi-Fi address (TEST-NET-1), after the one it is reached at.
+            let wifi = Ipv4Addr::new(192, 0, 2, 7);
+            for mut entry in tx.directory_entries() {
+                entry.addrs.push(wifi);
+                directory.insert(entry);
+            }
+            let iface = Interface::find("127.0.0.1").unwrap();
+            let mut mgr = manager(&config("multi-rx", 24570), iface, directory);
+            subscribe(&mgr, 0, "01", "multi-tx");
+            drive(&mut mgr, |m| m.flows.len() == 1).await;
+            let flow = &mgr.flows[0];
+            assert_eq!(*flow.control.ip(), Ipv4Addr::LOCALHOST);
+            assert_eq!(flow.worker.params.tx.as_slice(), [Ipv4Addr::LOCALHOST, wifi]);
+            mgr.stop_all().await;
+            tx.shutdown().await;
+        }
+
         /// A slot that took another channel holds back packets from before
         /// the switch only for a while: then the manager hands the receive
         /// thread a table without the switch, so that a media clock that
@@ -2658,6 +2802,7 @@ mod tests {
                 device: "far-tx".into(),
                 channel: "01".into(),
                 addr: Ipv4Addr::LOCALHOST,
+                addrs: vec![Ipv4Addr::LOCALHOST],
                 flow_control_port: 24799,
                 txt: txt(1, 1_000_000, 32, 4),
             });
@@ -2710,6 +2855,7 @@ mod tests {
                 device: "slow-tx".into(),
                 channel: "01".into(),
                 addr: Ipv4Addr::LOCALHOST,
+                addrs: vec![Ipv4Addr::LOCALHOST],
                 flow_control_port: 24799,
                 txt: txt(1, 50_000_000, 32, 4),
             });

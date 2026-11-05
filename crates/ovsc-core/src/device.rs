@@ -527,6 +527,7 @@ impl Device {
                     device: s.name.clone(),
                     channel: name.clone(),
                     addr: info.iface.ip,
+                    addrs: vec![info.iface.ip],
                     flow_control_port: info.ports.flow_control,
                     txt: own_channel_txt(info, i as u16 + 1),
                 });

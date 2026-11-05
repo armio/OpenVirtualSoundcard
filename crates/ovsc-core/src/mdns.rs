@@ -63,6 +63,10 @@ const CONFLICT_REFRESH: [(Duration, Duration); 2] = [
     (Duration::from_secs(20), Duration::from_secs(25)),
     (Duration::from_secs(5), Duration::from_secs(10)),
 ];
+/// RFC 6762 §10.2's one second: a record announced with cache-flush makes
+/// the cached records of its name and type obsolete if they were received
+/// more than this long before it, and they expire this long after it.
+const FLUSH_WINDOW: Duration = Duration::from_secs(1);
 
 /// A service instance found by [`Mdns::browse`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,6 +127,10 @@ struct CachedRecord {
     inserted: Instant,
     /// The host that sent it.
     source: Ipv4Addr,
+    /// A newer record of its name and type, announced with cache-flush,
+    /// made it obsolete: it expires within [`FLUSH_WINDOW`] unless announced
+    /// again, and lookups take it after the others ([`cached_records`]).
+    flushed: bool,
 }
 
 /// The records we are authoritative for.
@@ -348,17 +356,17 @@ impl Mdns {
 
             let (srv, txt) = self.lookup_service(&instance);
             if let Some((port, host)) = &srv {
-                if let Some(addr) = self.lookup_a(host) {
-                    if let Some(txt) = txt.as_deref() {
-                        let txt = ChannelTxt::from_entries(txt)?;
-                        return Ok(ResolvedChannel {
-                            device: device.to_owned(),
-                            channel: channel.to_owned(),
-                            addr,
-                            flow_control_port: *port,
-                            txt,
-                        });
-                    }
+                let addrs = self.lookup_addrs(host);
+                if let (Some(&addr), Some(txt)) = (addrs.first(), txt.as_deref()) {
+                    let txt = ChannelTxt::from_entries(txt)?;
+                    return Ok(ResolvedChannel {
+                        device: device.to_owned(),
+                        channel: channel.to_owned(),
+                        addr,
+                        addrs,
+                        flow_control_port: *port,
+                        txt,
+                    });
                 }
             }
 
@@ -402,13 +410,15 @@ impl Mdns {
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            if let Some((port, addr, txt)) = self.lookup_foreign_service(&instance) {
+            if let Some((port, addrs, txt)) = self.lookup_foreign_service(&instance) {
+                let addr = addrs[0];
                 match ChannelTxt::from_entries(&txt) {
                     Ok(txt) => {
                         return Some(ResolvedChannel {
                             device: device.to_owned(),
                             channel: channel.to_owned(),
                             addr,
+                            addrs,
                             flow_control_port: port,
                             txt,
                         });
@@ -471,7 +481,8 @@ impl Mdns {
         out
     }
 
-    /// Our own records plus cached ones that match.
+    /// Our own records plus cached ones that match, obsolete ones last (see
+    /// [`cached_records`]).
     fn find(&self, name: &Name, rtype: u16) -> Vec<Record> {
         let now = Instant::now();
         let own = lock(&self.inner.own)
@@ -480,13 +491,8 @@ impl Mdns {
             .filter(|r| r.rtype == rtype && r.name.eq_ignore_case(name))
             .cloned()
             .collect::<Vec<_>>();
-        let cached = lock(&self.inner.cache)
-            .iter()
-            .filter(|c| {
-                c.expires > now && c.record.rtype == rtype && c.record.name.eq_ignore_case(name)
-            })
-            .map(|c| c.record.clone())
-            .collect::<Vec<_>>();
+        let cache = lock(&self.inner.cache);
+        let cached = cached_records(&cache, name, rtype, now).map(|c| c.record.clone());
         own.into_iter().chain(cached).collect()
     }
 
@@ -511,27 +517,43 @@ impl Mdns {
         })
     }
 
-    /// The SRV port, address and TXT entries of `instance` as another host
+    /// Every address of `host`, each once, starting with the one
+    /// [`Mdns::lookup_a`] returns. A computer on two interfaces of this
+    /// link, Wi-Fi and Ethernet say, has one per interface (RFC 6762 §14).
+    fn lookup_addrs(&self, host: &Name) -> Vec<Ipv4Addr> {
+        let mut addrs = Vec::new();
+        for r in self.find(host, rtype::A) {
+            match r.data {
+                RData::A(a) if !addrs.contains(&a) => addrs.push(a),
+                _ => {}
+            }
+        }
+        addrs
+    }
+
+    /// The SRV port, addresses and TXT entries of `instance` as another host
     /// announces it. Its SRV record must differ from ours (our own records
-    /// come back to us); its TXT and address records are taken from the
-    /// same host, where they may well equal ours.
-    fn lookup_foreign_service(&self, instance: &Name) -> Option<(u16, Ipv4Addr, Vec<Vec<u8>>)> {
+    /// come back to us); its TXT and first address records are taken from
+    /// the same host, where they may well equal ours. The other addresses
+    /// are those of the SRV target that are not ours.
+    fn lookup_foreign_service(
+        &self,
+        instance: &Name,
+    ) -> Option<(u16, Vec<Ipv4Addr>, Vec<Vec<u8>>)> {
         let now = Instant::now();
         let own = lock(&self.inner.own);
         let cache = lock(&self.inner.cache);
-        let live = |c: &&CachedRecord, name: &Name, t: u16| {
-            c.expires > now && c.record.rtype == t && c.record.name.eq_ignore_case(name)
-        };
         let not_ours = |c: &CachedRecord| !is_own_record(&own.records, &c.record);
-        cache.iter().filter(|c| live(c, instance, rtype::SRV) && not_ours(c)).find_map(|srv| {
+        let srvs = cached_records(&cache, instance, rtype::SRV, now);
+        srvs.filter(|c| not_ours(c)).find_map(|srv| {
             let RData::Srv { port, target, .. } = &srv.record.data else { return None };
             // From the same host, or else anything that isn't ours.
             let pick = |name: &Name, t: u16| {
-                let mut candidates = cache.iter().filter(|c| live(c, name, t));
+                let candidates = cached_records(&cache, name, t, now);
                 candidates
                     .clone()
                     .find(|c| c.source == srv.source)
-                    .or_else(|| candidates.find(|c| not_ours(c)))
+                    .or_else(|| candidates.clone().find(|c| not_ours(c)))
             };
             let addr = match pick(target, rtype::A)?.record.data {
                 RData::A(a) => a,
@@ -541,7 +563,14 @@ impl Mdns {
                 RData::Txt(t) => t.clone(),
                 _ => return None,
             };
-            Some((*port, addr, txt))
+            let mut addrs = vec![addr];
+            for c in cached_records(&cache, target, rtype::A, now).filter(|c| not_ours(c)) {
+                match c.record.data {
+                    RData::A(a) if !addrs.contains(&a) => addrs.push(a),
+                    _ => {}
+                }
+            }
+            Some((*port, addrs, txt))
         })
     }
 }
@@ -558,6 +587,23 @@ impl Drop for ProbeGuard<'_> {
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The live records of `name` and `rtype` in `cache`. Those a newer record
+/// made obsolete, kept for their last second (RFC 6762 §10.2), come last: a
+/// lookup that takes the first match gets current data, while one that
+/// gathers a host's addresses still finds them.
+fn cached_records<'c>(
+    cache: &'c [CachedRecord],
+    name: &Name,
+    rtype: u16,
+    now: Instant,
+) -> impl Iterator<Item = &'c CachedRecord> + Clone {
+    let live = move |c: &&CachedRecord| {
+        c.expires > now && c.record.rtype == rtype && c.record.name.eq_ignore_case(name)
+    };
+    let current = cache.iter().filter(live).filter(|c| !c.flushed);
+    current.chain(cache.iter().filter(live).filter(|c| c.flushed))
 }
 
 fn multicast_dest() -> SocketAddr {
@@ -644,12 +690,24 @@ fn cache_response(inner: &Inner, msg: &Message, src: Ipv4Addr) -> bool {
         for (rec, ours) in msg.records().zip(ours) {
             if rec.cache_flush && !ours {
                 // RFC 6762 §10.2: older records with the same name and type
-                // are obsolete. Keep the ones added from this very packet.
-                cache.retain(|c| {
-                    c.inserted == now
-                        || c.record.rtype != rec.rtype
-                        || !c.record.name.eq_ignore_case(&rec.name)
-                });
+                // are obsolete, but only those received more than a second
+                // ago, and they expire a second from now rather than at
+                // once. Records received within the last second belong to
+                // the same announcement: a set too large for one packet, or
+                // a computer on Wi-Fi and Ethernet on this link, which
+                // announces each interface's address on that interface, in
+                // packets of their own. The delay lets such a host announce
+                // again, before it expires, an address that its other
+                // interface's announcement flushed (§10.2, §14).
+                for c in cache.iter_mut() {
+                    if c.record.rtype == rec.rtype
+                        && c.record.name.eq_ignore_case(&rec.name)
+                        && now.duration_since(c.inserted) > FLUSH_WINDOW
+                    {
+                        c.expires = c.expires.min(now + FLUSH_WINDOW);
+                        c.flushed = true;
+                    }
+                }
             }
             // One copy per sender, which tells devices with one name apart.
             cache.retain(|c| {
@@ -664,6 +722,7 @@ fn cache_response(inner: &Inner, msg: &Message, src: Ipv4Addr) -> bool {
                     expires: now + Duration::from_secs(rec.ttl as u64),
                     inserted: now,
                     source: src,
+                    flushed: false,
                 });
             }
         }
@@ -1408,6 +1467,96 @@ mod tests {
         // The ordinary lookup still finds ours.
         let ours = mdns.resolve_channel("01", "studio", wait).await.unwrap();
         assert_eq!(ours.addr, Ipv4Addr::new(10, 0, 0, 9));
+        mdns.stop();
+    }
+
+    /// The records a computer announces for one of its channels on one
+    /// interface: SRV, TXT and that interface's address, all with
+    /// cache-flush.
+    fn announced_on(addr: Ipv4Addr) -> Message {
+        let host = Name::parse("dvs-studio.local");
+        let instance =
+            Name::instance("01@dvs-studio", &discovery::service_name(discovery::CHAN_SERVICE));
+        response(vec![
+            Record::srv(instance.clone(), TTL_HOST, 4455, host.clone()),
+            Record::txt(instance, TTL_OTHER, txt(1).to_entries()),
+            Record::a(host, TTL_HOST, addr),
+        ])
+    }
+
+    /// A computer on Wi-Fi and Ethernet on one link announces its records on
+    /// each interface, with that interface's address, in packets of their
+    /// own (RFC 6762 §14). Within a second of each other, neither flushes
+    /// the other (§10.2): both addresses stay for their whole TTL, and a
+    /// lookup finds them both.
+    #[tokio::test]
+    async fn a_host_keeps_the_address_of_each_interface() {
+        let (mdns, _peer) = unicast_mdns().await;
+        let inner = &mdns.inner;
+        let host = Name::parse("dvs-studio.local");
+        let wired = Ipv4Addr::new(10, 0, 0, 21);
+        let wifi = Ipv4Addr::new(10, 0, 0, 22);
+        cache_response(inner, &announced_on(wired), wired);
+        cache_response(inner, &announced_on(wifi), wifi);
+
+        let ttl = Instant::now() + Duration::from_secs(TTL_HOST as u64 - 1);
+        {
+            let cache = lock(&inner.cache);
+            let a: Vec<_> = cache.iter().filter(|c| c.record.rtype == rtype::A).collect();
+            assert_eq!(a.len(), 2);
+            assert!(a.iter().all(|c| !c.flushed && c.expires > ttl));
+        }
+        assert_eq!(mdns.lookup_addrs(&host), [wired, wifi]);
+        let r = mdns.resolve_channel("01", "dvs-studio", Duration::ZERO).await.unwrap();
+        assert_eq!((r.addr, r.addrs), (wired, vec![wired, wifi]));
+        mdns.stop();
+    }
+
+    /// A record announced with cache-flush makes those of its name and type
+    /// received more than a second earlier obsolete: they expire a second
+    /// later (RFC 6762 §10.2), and lookups take the new one first meanwhile.
+    /// One announced again within that second stays, as when a computer on
+    /// Wi-Fi and Ethernet puts back the address that its other interface's
+    /// announcement flushed (§14).
+    #[tokio::test]
+    async fn older_records_expire_a_second_after_a_cache_flush() {
+        let (mdns, _peer) = unicast_mdns().await;
+        let inner = &mdns.inner;
+        let host = Name::parse("dvs-studio.local");
+        let wired = Ipv4Addr::new(10, 0, 0, 21);
+        let wifi = Ipv4Addr::new(10, 0, 0, 22);
+        let a = |addr| response(vec![Record::a(host.clone(), TTL_HOST, addr)]);
+        let state = |addr: Ipv4Addr| {
+            let cache = lock(&inner.cache);
+            let c = cache.iter().find(|c| c.record.data == RData::A(addr)).unwrap();
+            (c.flushed, c.expires.saturating_duration_since(Instant::now()))
+        };
+        // Received two seconds ago, as far as the cache can tell.
+        let two_seconds_ago = || {
+            for c in lock(&inner.cache).iter_mut() {
+                c.inserted -= Duration::from_secs(2);
+            }
+        };
+        cache_response(inner, &a(wired), wired);
+        two_seconds_ago();
+        cache_response(inner, &a(wifi), wifi);
+        let (flushed, left) = state(wired);
+        assert!(flushed && left <= FLUSH_WINDOW, "{left:?}");
+        assert_eq!(mdns.lookup_a(&host), Some(wifi));
+        assert_eq!(mdns.lookup_addrs(&host), [wifi, wired]);
+
+        // Announced again within the second: current again, for its TTL.
+        cache_response(inner, &a(wired), wired);
+        let (flushed, left) = state(wired);
+        assert!(!flushed && left > Duration::from_secs(100), "{left:?}");
+        assert_eq!(mdns.lookup_addrs(&host), [wifi, wired]);
+
+        // Not announced again: gone once its second is over.
+        two_seconds_ago();
+        cache_response(inner, &a(wifi), wifi);
+        assert_eq!(mdns.lookup_addrs(&host), [wifi, wired]);
+        tokio::time::sleep(FLUSH_WINDOW + Duration::from_millis(50)).await;
+        assert_eq!(mdns.lookup_addrs(&host), [wifi]);
         mdns.stop();
     }
 }

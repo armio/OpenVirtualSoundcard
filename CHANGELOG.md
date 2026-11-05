@@ -67,8 +67,9 @@ The first public version, not released yet.
 - Receive flows play at the larger of the device's latency and the latency
   the transmitter asks for, as Dante receivers do.
 - Received packets give their frame count by their length (up to 256), and
-  are accepted only from the transmitter's address and the port its audio
-  comes from.
+  are accepted only from the transmitter's addresses and the port its audio
+  comes from. A computer on Wi-Fi and Ethernet in the Dante subnet may send
+  from either of its addresses.
 - Receive recovery never waits on the network: a transmitter that does not
   answer no longer delays the others, and failures show as Dante statuses
   (`NO_CONNECTION`, `RX_FAIL`, `CHANNEL_FORMAT`, `NO_RX`, `CHANNEL_LATENCY`).
@@ -113,5 +114,9 @@ The first public version, not released yet.
   came back.
 - The app's Apply stayed disabled while the engine waited for the network
   with an empty device name.
+- The mDNS cache kept only the last address of a host that announces one per
+  interface, such as a computer on Wi-Fi and Ethernet: a record with the
+  cache-flush bit removed the others at once, even those just received. It
+  now follows RFC 6762 §10.2.
 
 [Unreleased]: https://github.com/armio/OpenVirtualSoundcard/commits/main

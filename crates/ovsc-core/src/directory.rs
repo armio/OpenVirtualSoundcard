@@ -21,7 +21,14 @@ const MDNS_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct ResolvedChannel {
     pub device: String,
     pub channel: String,
+    /// The transmitter's address that flows are requested from.
     pub addr: Ipv4Addr,
+    /// Every address the transmitter has, `addr` first. A computer with
+    /// two interfaces on the network, Wi-Fi and Ethernet say, has one per
+    /// interface (mDNS: the A records of its SRV target), and may send a
+    /// flow's audio from either, whichever address the flow was requested
+    /// from.
+    pub addrs: Vec<Ipv4Addr>,
     /// The transmitter's flow-control port.
     pub flow_control_port: u16,
     pub txt: ChannelTxt,

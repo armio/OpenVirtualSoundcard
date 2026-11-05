@@ -189,9 +189,15 @@ network can make them without anyone at the Mac knowing.
   Dante Controller. OVSC only follows the clock; it never leads.
 * Give the Mac a fixed address or a DHCP reservation. An address change
   restarts the network engine (a few seconds of silence, see below).
-* A computer that transmits to OVSC (another Mac, Dante Virtual Soundcard)
-  must have only one interface on the Dante subnet: OVSC accepts a flow's
-  audio only from the address it requested the flow from.
+* A computer that transmits to OVSC (another Mac, Dante Virtual Soundcard,
+  Dante Via) may have two interfaces on the Dante subnet, Wi-Fi and
+  Ethernet say, and send a flow's audio from either: OVSC accepts it from
+  every address the computer announces (up to four), and from no other
+  device. It reads them when it requests the flow: audio from an address
+  announced later is dropped until OVSC requests the flow again, once the
+  flow has delivered nothing for 3 s. Still keep that computer's Wi-Fi off
+  the Dante subnet for a show: audio sent over Wi-Fi arrives late or not at
+  all.
 * Run no other Dante software on the show Mac. OVSC moves its ports out of
   the way of Audinate's ConMon service, but Dante Virtual Soundcard and OVSC
   must not both carry the show.
@@ -369,8 +375,8 @@ What the common warnings point at:
 * A flow plays at the larger of OVSC's latency and the transmitter's, as on
   Dante hardware.
 * Receive flows read the packet size from the packet, as Dante receivers do,
-  and accept packets only from the transmitter's address and the port its
-  audio comes from.
+  and accept packets only from the transmitter's addresses (a computer on
+  Wi-Fi and Ethernet has one on each) and the port its audio comes from.
 * Recovery from a pulled cable or a rebooted console no longer waits on
   other transmitters, and failures show as Dante statuses
   (`NO_CONNECTION`, `RX_FAIL`, `CHANNEL_FORMAT`, `NO_RX`, `CHANNEL_LATENCY`).
@@ -393,6 +399,9 @@ These rest on code reading, Linux tests and simulation, not on hardware:
   controller writes while locked, and a flow re-requested with another
   packet size.
 * That macOS keeps the DSCP marking on the wire (check with Wireshark).
+* A transmitting computer on Wi-Fi and Ethernet on the Dante subnet: tested
+  with simulated mDNS announcements and packets, not with Dante Virtual
+  Soundcard or Dante Via.
 * The clock figures (leader change, holdover accuracy, relock times) are
   from simulation and a replay of the real servo, not from a Mac on a Dante
   network.
