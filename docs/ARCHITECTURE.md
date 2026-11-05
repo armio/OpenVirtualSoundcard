@@ -69,9 +69,12 @@ as silence. This gives:
 * automatic silence on packet loss, no read/write pointers to keep in sync;
 * free fan-out: several flows or channels can write the same ring.
 
-**Receive.** A flow task receives a packet, splits it per slot, and writes
+**Receive.** A flow's real-time thread receives a packet, keeps it only if it
+comes from the flow's transmitter (its address, and the source port its audio
+has been coming from) and has the flow's size, splits it per slot, and writes
 each slot's samples into the ring of every local channel routed to that slot,
-at the packet's timestamp. Backends read at `now − latency`.
+at the packet's timestamp, plus the extra latency the flow needs when its
+transmitter demands more than ours. Backends read at `now − latency`.
 
 **Transmit.** Backends write at `now + lead`. The transmit thread wakes when
 the next packet is due. It reads `fpp` frames per channel at the packet
@@ -84,11 +87,15 @@ and drains keepalives. Flows without keepalives for 4 s expire.
   by controllers (ARC) or the local API bump a generation counter, which wakes
   the mDNS advertiser, the persistence task and the RX manager.
 * **RX manager** is a reconcile loop. It runs on every change, debounced by
-  20 ms so that batches share flows, and once a second. It drops routes that
-  no longer match, stops dead or empty flows, routes channels into existing
-  flows (extending them with DBCP "update" when there is room), and resolves
-  and requests new flows for the rest. It then publishes per-channel status
-  for ARC.
+  20 ms so that batches share flows, whenever a lookup or request it started
+  finishes, and four times a second. It drops routes that no longer match
+  (a subscription that only changed its spelling keeps its route), stops dead
+  flows and flows left empty for 3 s, routes channels into existing flows,
+  and resolves and requests the rest: in free slots of existing flows (DBCP
+  "update") or as new flows. Lookups and requests run in the background, one
+  request job per transmitter at a time, so a pass never waits for the
+  network. Receive threads read their routing from an immutable table that
+  the manager replaces whole. It then publishes per-channel status for ARC.
 * **Flow-control server** validates requests (rate, bit depth, channel ids,
   packet size), allocates flow ids and handles, and hands flows to the
   transmit thread.
@@ -143,7 +150,9 @@ clock, or an ALSA ioplug plug-in.
   real-socket test against the bundled development master.
 * Engine: integration tests run two devices on 127.0.0.1 with distinct ports
   and check bit-exact audio, flow sharing and growth, controller routing over
-  ARC, and self-subscription.
+  ARC, and self-subscription, and how subscriptions recover: a transmitter
+  that goes away and comes back, one that never answers or can't be found,
+  a re-spelled subscription, and a transmitter that needs more latency.
 * macOS driver, everything but Apple's code: the shared layout pinned by a
   golden hash, the seqlock, every 24-bit sample through Float32, timeline
   scenarios and the real servo replayed into the timeline, the protocol and
