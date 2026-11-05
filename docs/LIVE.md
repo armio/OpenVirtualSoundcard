@@ -195,9 +195,10 @@ network can make them without anyone at the Mac knowing.
   every address the computer announces (up to four), and from no other
   device. It reads them when it requests the flow: audio from an address
   announced later is dropped until OVSC requests the flow again, once the
-  flow has delivered nothing for 3 s. Still keep that computer's Wi-Fi off
-  the Dante subnet for a show: audio sent over Wi-Fi arrives late or not at
-  all.
+  flow has delivered nothing for 3 s. The computer's channels share flows
+  as any transmitter's do, whichever of its addresses OVSC finds first.
+  Still keep that computer's Wi-Fi off the Dante subnet for a show: audio
+  sent over Wi-Fi arrives late or not at all.
 * Run no other Dante software on the show Mac. OVSC moves its ports out of
   the way of Audinate's ConMon service, but Dante Virtual Soundcard and OVSC
   must not both carry the show.

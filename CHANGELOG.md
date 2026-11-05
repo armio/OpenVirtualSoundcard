@@ -120,5 +120,10 @@ The first public version, not released yet.
   interface, such as a computer on Wi-Fi and Ethernet: a record with the
   cache-flush bit removed the others at once, even those just received. It
   now follows RFC 6762 §10.2.
+- A computer on Wi-Fi and Ethernet was taken for two transmitters when
+  lookups gave its addresses in another order: a channel found at its other
+  address got a new flow instead of a free slot in the existing one,
+  spending one more of the computer's flows. Its channels now share flows,
+  and requests to it go one at a time.
 
 [Unreleased]: https://github.com/armio/OpenVirtualSoundcard/commits/main
