@@ -39,7 +39,8 @@ pub struct HalOptions {
     pub latency_mode: InputLatencyMode,
     /// `CLOCK_ALGORITHM_RAW` or `CLOCK_ALGORITHM_SIMPLE_IIR`.
     pub clock_algorithm: u32,
-    /// Keep the Mac from idle-sleeping while the engine runs.
+    /// Keep the Mac from idle-sleeping while the daemon runs, engine restarts
+    /// included.
     pub prevent_idle_sleep: bool,
     /// How often the status line is logged; zero disables it.
     pub status_log_interval: Duration,

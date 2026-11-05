@@ -58,7 +58,7 @@ backend = "coreaudio"
 # input_latency_mode = "safety"
 # Core Audio's timestamp smoothing: "raw" (none) or "iir".
 # clock_algorithm = "raw"
-# Keep the Mac from idle-sleeping while the engine runs.
+# Keep the Mac from idle-sleeping while the daemon runs, engine restarts included.
 # prevent_idle_sleep = true
 # Seconds between status lines in the log; 0 disables them.
 # status_log_interval_s = 30
