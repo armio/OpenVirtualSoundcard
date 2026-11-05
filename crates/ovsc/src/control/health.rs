@@ -560,16 +560,25 @@ impl Health {
         let late_margin = self.margin_fell(|c| c.min_out_margin);
         if late > 0 || late_margin.is_some() {
             let worst = margin_words(h.min_output_margin);
+            let what = if late > 0 {
+                format!(
+                    "{} from the application came too late to be sent in the last {window} s \
+                     ({worst}): dropouts on the returns.",
+                    count(late, "output cycle", "output cycles")
+                )
+            } else {
+                format!(
+                    "Output from the application ran out of margin in the last {window} s \
+                     ({worst}): one cycle later is a dropout on the returns."
+                )
+            };
             out.push(Warning {
                 kind: Kind::LateOutput,
                 urgent: false,
-                audible: true,
+                audible: late > 0,
                 text: format!(
-                    "{} from the application came too late to be sent in the last {window} s \
-                     ({worst}): dropouts on the returns. The application misses its deadlines: \
-                     raise its buffer size, lower its load, or raise `[coreaudio] \
-                     output_margin_us`.",
-                    count(late, "output cycle", "output cycles")
+                    "{what} The application misses its deadlines: raise its buffer size, lower \
+                     its load, or raise `[coreaudio] output_margin_us`."
                 ),
                 short: format!("{late} late output cycles"),
             });
@@ -578,16 +587,23 @@ impl Health {
         let early_margin = self.margin_fell(|c| c.min_in_margin);
         if early > 0 || early_margin.is_some() {
             let worst = margin_words(h.min_input_margin);
+            let what = if early > 0 {
+                format!(
+                    "{} read before their audio had arrived in the last {window} s ({worst}): \
+                     dropouts on the inputs.",
+                    count(early, "input cycle was", "input cycles were")
+                )
+            } else {
+                format!(
+                    "Input was read with no margin left in the last {window} s ({worst}): one \
+                     cycle earlier is a dropout on the inputs."
+                )
+            };
             out.push(Warning {
                 kind: Kind::EarlyInput,
                 urgent: false,
-                audible: true,
-                text: format!(
-                    "{} read before their audio had arrived in the last {window} s ({worst}): \
-                     dropouts on the inputs. Raise the latency, or `[coreaudio] \
-                     input_margin_us`.",
-                    count(early, "input cycle was", "input cycles were")
-                ),
+                audible: early > 0,
+                text: format!("{what} Raise the latency, or `[coreaudio] input_margin_us`."),
                 short: format!("{early} early input cycles"),
             });
         }
@@ -1361,11 +1377,15 @@ mod tests {
         assert!(w.text.starts_with("1 output cycle from the application came too late"));
         assert!(w.text.contains("worst margin since IO started: -7 frames"), "{}", w.text);
         assert!(a.audible());
-        // A margin that falls to zero warns without a late cycle.
+        // A margin that falls to zero warns without a late cycle, as not
+        // yet audible.
         let mut h = Health::new();
         feed(&mut h, &c, 0, 5, |_| reading(hal(true), engine()));
         let a = h.observe(c.at(6.0), &cycles(0, 0)(6));
-        assert!(find(&a, Kind::LateOutput).text.starts_with("0 output cycles"));
+        let w = find(&a, Kind::LateOutput);
+        assert!(w.text.starts_with("Output from the application ran out of margin"), "{}", w.text);
+        assert!(w.text.contains("(worst margin since IO started: 0 frames)"), "{}", w.text);
+        assert!(!w.audible);
     }
 
     #[test]
