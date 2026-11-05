@@ -236,7 +236,7 @@ The `[coreaudio]` section tunes the device:
 | `output_latency_ms` | unset | Output latency reported to applications; unset means `latency_ms`. |
 | `input_latency_mode` | `"safety"` | `"safety"` or `"latency"`: see [Latency and safety offsets](#latency-and-safety-offsets). |
 | `clock_algorithm` | `"raw"` | Core Audio's time stamp smoothing: `"raw"` (none) or `"iir"`. |
-| `prevent_idle_sleep` | `true` | Keep the Mac from idle-sleeping while the engine runs. |
+| `prevent_idle_sleep` | `true` | Keep the Mac from idle-sleeping while the daemon runs, from its start and across engine restarts. A restart of the daemon itself still releases it for a moment: on a show machine, also turn system sleep off (see [Live use: sleep](#the-mac-must-not-sleep)). |
 | `status_log_interval_s` | `30` | Seconds between status lines in the log; 0 disables them. |
 | `service` | `"org.openvirtualsoundcard.audio"` | The Mach service the daemon serves. Leave it as is: the driver always connects to `org.openvirtualsoundcard.audio`, which is compiled in and listed in its Info.plist, and the launchd job holds that name. |
 | `debug_zts_jitter_ns` | `0` | Jitters the time stamps on purpose, for tests only. |
