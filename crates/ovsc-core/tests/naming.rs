@@ -1,11 +1,12 @@
-//! Device names on a network: unique defaults, and names another device
-//! already uses.
+//! Device names on a network: unique defaults, names another device already
+//! uses, and subscriptions to a name two devices share.
 
 use std::future::Future;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use ovsc_clock::system_clock;
+use ovsc_core::directory::StaticDirectory;
 use ovsc_core::mdns::{self, Advertisement, MDNS_GROUP, MDNS_PORT};
 use ovsc_core::net::{Interface, bind_multicast, into_tokio};
 use ovsc_core::{Channels, Device, DeviceConfig, DeviceInfo, NameConflict, Ports};
@@ -186,4 +187,36 @@ async fn a_device_announcing_our_name_is_reported() {
     eventually("the conflict to end", || dev.name_conflict().is_none().then_some(())).await;
     assert_eq!(dev.name(), name);
     soon(dev.shutdown()).await;
+}
+
+/// A subscription to a channel of our own name goes to another device that
+/// has the name too, rather than silently looping back; without one it
+/// loops back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_subscription_to_a_shared_name_goes_to_the_other_device() {
+    let name = unique("same");
+    let clock = system_clock();
+    let other = Device::start(config(&name, 25670, 44), clock.clone()).await.unwrap();
+    let directory = StaticDirectory::new();
+    for entry in other.directory_entries() {
+        directory.insert(entry);
+    }
+    let dev = Device::start_with_directory(config(&name, 25680, 45), clock, directory.clone())
+        .await
+        .unwrap();
+
+    dev.subscribe(1, "01", &name).unwrap();
+    eventually("a flow from the other device", || (other.tx_flows().len() == 1).then_some(()))
+        .await;
+    assert!(dev.tx_flows().is_empty(), "looped back: {:?}", dev.tx_flows());
+
+    // Our own channel, when that is what the directory knows.
+    for entry in dev.directory_entries() {
+        directory.insert(entry);
+    }
+    dev.subscribe(2, "02", &name).unwrap();
+    eventually("a flow to ourselves", || (dev.tx_flows().len() == 1).then_some(())).await;
+    assert_eq!(other.tx_flows().len(), 1);
+    soon(dev.shutdown()).await;
+    soon(other.shutdown()).await;
 }

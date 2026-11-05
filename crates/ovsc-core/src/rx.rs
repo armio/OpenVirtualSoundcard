@@ -237,8 +237,28 @@ impl RxManager {
             // Use the spelling from the subscription for lookups.
             let (channel, device) = self.desired()[chans[0]].clone().unwrap_or((channel, device));
             if device.eq_ignore_ascii_case(&own) {
-                let r = self.resolve_self(&channel);
-                lookups.spawn(async move { (chans, r) });
+                // Our own channel, unless another device uses our name too
+                // and has it: a name conflict, logged and reported while it
+                // lasts. A subscription then can't tell the two devices
+                // apart, and looping it back here would hide that the other
+                // device was the one meant.
+                let ours = self.resolve_self(&channel);
+                let directory = self.directory.clone();
+                let us = (self.shared.info.iface.ip, self.shared.info.ports.flow_control);
+                lookups.spawn(async move {
+                    let r = match foreign_channel(&directory, &channel, &device, us).await {
+                        Some(theirs) => {
+                            warn!(
+                                "subscribing to {channel}@{device} at {}, another device named \
+                                 like this one",
+                                theirs.addr
+                            );
+                            Ok(theirs)
+                        }
+                        None => ours,
+                    };
+                    (chans, r)
+                });
             } else {
                 let directory = self.directory.clone();
                 lookups.spawn(async move { (chans, directory.resolve(&channel, &device).await) });
@@ -372,7 +392,8 @@ impl RxManager {
         }
     }
 
-    /// Describes one of our own transmit channels, for self-subscriptions.
+    /// Describes one of our own transmit channels, for self-subscriptions
+    /// (see [`foreign_channel`]).
     fn resolve_self(&self, channel: &str) -> Result<ResolvedChannel> {
         let info = &self.shared.info;
         let state = self.shared.state();
@@ -521,6 +542,27 @@ impl RxManager {
             self.shared.notify(Notify::RxChannelsChanged(changed));
         }
     }
+}
+
+/// How long a subscription to our own name asks mDNS for another device
+/// that has the name too, while one is known to (see [`foreign_channel`]).
+const FOREIGN_LOOKUP: Duration = Duration::from_secs(1);
+
+/// The transmit channel `channel@device`, where `device` is our own name, of
+/// another device that has the name too, if there is one: an mDNS name
+/// conflict, or an entry of a static directory that isn't ours (`us`: our
+/// address and flow-control port).
+async fn foreign_channel(
+    directory: &Directory,
+    channel: &str,
+    device: &str,
+    us: (Ipv4Addr, u16),
+) -> Option<ResolvedChannel> {
+    match directory {
+        Directory::Mdns(m) => m.resolve_foreign_channel(channel, device, FOREIGN_LOOKUP).await,
+        Directory::Static(s) => s.get(channel, device),
+    }
+    .filter(|r| (r.addr, r.flow_control_port) != us)
 }
 
 /// Binds a receive socket in the unicast port range real receivers report
