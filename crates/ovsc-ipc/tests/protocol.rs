@@ -421,11 +421,18 @@ fn bad_storage_text_is_rejected() {
     }
 }
 
+/// round(ms * fs / 1000), as ovsc-core computes it.
+fn samples(ms: u32, fs: u32) -> u32 {
+    ((ms as u64 * fs as u64 * 2 + 1000) / 2000) as u32
+}
+
+/// The offsets at `latency_ms` of receive latency, the transmit latency
+/// left at its default (the receive latency).
 fn offsets(fs: u32, latency_ms: u32, mode: InputLatencyMode) -> Offsets {
     compute_offsets(&OffsetInputs {
         sample_rate: fs,
-        // round(latency_ms * fs / 1000), as ovsc-core computes it.
-        latency_samples: ((latency_ms as u64 * fs as u64 * 2 + 1000) / 2000) as u32,
+        latency_samples: samples(latency_ms, fs),
+        tx_latency_samples: samples(latency_ms, fs),
         tx_guard_samples: (500 * fs as u64 / 1_000_000) as u32,
         fpp_max: 32,
         input_margin_us: 500,
@@ -474,10 +481,43 @@ fn offsets_match_the_design_table() {
 }
 
 #[test]
+fn the_output_latency_is_the_transmit_latency() {
+    // Receive at 4 ms, ask receivers (the console) for 1 ms: a console at
+    // 1 ms plays the outputs 1 ms after their time, whatever L is.
+    for fs in SAMPLE_RATES {
+        for mode in [InputLatencyMode::Safety, InputLatencyMode::Latency] {
+            let both = offsets(fs, 4, mode);
+            let inputs = OffsetInputs {
+                sample_rate: fs,
+                latency_samples: samples(4, fs),
+                tx_latency_samples: samples(1, fs),
+                tx_guard_samples: (500 * fs as u64 / 1_000_000) as u32,
+                fpp_max: 32,
+                input_margin_us: 500,
+                output_margin_us: 1000,
+                output_latency_override: None,
+                latency_mode: mode,
+            };
+            let o = compute_offsets(&inputs);
+            assert_eq!(o.output_latency, samples(1, fs), "{fs} Hz");
+            // Only the output latency moves.
+            assert_eq!(Offsets { output_latency: both.output_latency, ..o }, both, "{fs} Hz");
+            // The override still wins, for a console whose latency is longer.
+            let o = compute_offsets(&OffsetInputs {
+                output_latency_override: Some(samples(2, fs)),
+                ..inputs
+            });
+            assert_eq!(o.output_latency, samples(2, fs), "{fs} Hz");
+        }
+    }
+}
+
+#[test]
 fn offsets_edge_cases() {
     let base = OffsetInputs {
         sample_rate: 48_000,
         latency_samples: 192,
+        tx_latency_samples: 192,
         tx_guard_samples: 24,
         fpp_max: 32,
         input_margin_us: 500,

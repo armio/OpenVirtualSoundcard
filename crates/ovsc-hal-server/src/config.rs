@@ -34,7 +34,7 @@ pub struct HalOptions {
     pub input_margin_us: u32,
     /// Added to the output safety offset.
     pub output_margin_us: u32,
-    /// Reported as the output latency instead of the receive latency.
+    /// Reported as the output latency instead of the transmit latency.
     pub output_latency_ms: Option<f64>,
     pub latency_mode: InputLatencyMode,
     /// `CLOCK_ALGORITHM_RAW` or `CLOCK_ALGORITHM_SIMPLE_IIR`.
@@ -70,6 +70,9 @@ pub struct EngineInfo {
     pub sample_rate: u32,
     /// The receive latency L, in samples.
     pub latency_samples: u32,
+    /// The transmit latency T, in samples: what the device asks of the
+    /// receivers of its transmit channels, and its default output latency.
+    pub tx_latency_samples: u32,
     /// How long after its timestamp a packet is sent, in samples.
     pub tx_guard_samples: u32,
     /// The most frames per packet the device sends.
@@ -89,6 +92,7 @@ impl EngineInfo {
         Self {
             sample_rate: info.sample_rate,
             latency_samples: saturate(info.latency_samples),
+            tx_latency_samples: saturate(info.tx_latency_samples),
             tx_guard_samples: saturate(ns_to_samples(info.tx_guard_ns, info.sample_rate)),
             fpp_max: FPP_MAX,
             rx_names,
@@ -107,6 +111,7 @@ impl EngineInfo {
         Ok(Self {
             sample_rate: c.sample_rate,
             latency_samples: saturate(c.latency_samples()),
+            tx_latency_samples: saturate(c.tx_latency_samples()),
             tx_guard_samples: saturate(ns_to_samples(c.tx_guard_us as u64 * 1000, c.sample_rate)),
             fpp_max: FPP_MAX,
             rx_names: c.rx_channels.names(),
@@ -162,6 +167,7 @@ pub fn driver_config(
     let offsets = compute_offsets(&OffsetInputs {
         sample_rate: fs,
         latency_samples: e.latency_samples,
+        tx_latency_samples: e.tx_latency_samples,
         tx_guard_samples: e.tx_guard_samples,
         fpp_max: e.fpp_max,
         input_margin_us: o.input_margin_us,
