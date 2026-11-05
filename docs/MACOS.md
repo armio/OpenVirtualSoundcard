@@ -197,8 +197,9 @@ already in use`. Add the section and restart the daemon.
 
 Both latencies must also be at least `tx_guard_us` (500 µs by default) plus
 0.5 ms: the device sends a packet `tx_guard_us` after its first frame's
-timestamp, so a shorter latency would make every packet late. With the
-default guard, 1 ms is the least.
+timestamp, so a latency of `tx_guard_us` or less would make every packet
+late, and the 0.5 ms leaves room for the send's wake-up and the network.
+With the default guard, 1 ms is the least.
 
 A new rate, channel count or latency reaches Core Audio as a device
 configuration change: applications that use the device see it reconfigure.

@@ -54,9 +54,10 @@ backend = "coreaudio"
 # User IDs allowed to connect: 202 is Core Audio's driver helper.
 # allowed_uids = [202]
 # Margins added to the safety offsets, in microseconds; each adds to the
-# round trip. They cover this Mac's audio timeline and the network clock
-# disagreeing (by up to 250 us) and late HAL wake-ups; the input margin also
-# packets a little later than latency_ms, the output margin late IO cycles.
+# round trip. Both cover this Mac's audio timeline and the network clock
+# disagreeing (by up to 250 us). The input margin also covers packets a
+# little later than latency_ms; the output margin, late HAL wake-ups and
+# late IO cycles.
 # Lower them only as docs/MACOS.md (Latency and safety offsets) describes.
 # input_margin_us = 500
 # output_margin_us = 1000
