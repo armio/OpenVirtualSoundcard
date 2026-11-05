@@ -26,10 +26,10 @@ anyhow = "1"
 arc-swap = "1"
 cc = "1"
 clap = { version = "4", features = ["derive", "env"] }
-# `realtime`: WASAPI callback threads join MMCSS. On Linux cpal would only
-# promote `hw:` devices, through rtkit (the `realtime-dbus` variant, which
-# needs libdbus); ovsc-soundcard promotes its ALSA threads itself.
-cpal = { version = "0.18", features = ["realtime"] }
+# Without the `realtime` feature: it would make WASAPI's callback threads
+# join MMCSS, but pulls in audio_thread_priority (MPL-2.0), a licence
+# deny.toml does not list. ovsc-soundcard promotes its ALSA threads itself.
+cpal = "0.18"
 hex = "0.4"
 libc = "0.2"
 mach2 = "0.6"

@@ -202,7 +202,7 @@ impl StatsCell {
         use cpal::ErrorKind;
         match error.kind() {
             // Not an audio error: the backend couldn't make its thread
-            // real-time (cpal's `realtime` feature, e.g. WASAPI's MMCSS).
+            // real-time (with cpal's `realtime` feature, which is off).
             ErrorKind::RealtimeDenied => {
                 self.realtime.store(RT_REFUSED, Relaxed);
                 return;

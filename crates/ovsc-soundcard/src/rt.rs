@@ -2,9 +2,11 @@
 //!
 //! With a few periods of device buffering (cpal's ALSA backend uses two),
 //! a callback that runs late by more than a period is an xrun. On macOS the
-//! callbacks run on CoreAudio's real-time IO thread, and with cpal's
-//! `realtime` feature WASAPI's threads join the MMCSS "Audio" class. cpal's
-//! ALSA threads would only be promoted through rtkit, and only for `hw:`
+//! callbacks run on CoreAudio's real-time IO thread. On Windows they are
+//! not promoted: cpal's `realtime` feature would make WASAPI's threads join
+//! the MMCSS "Audio" class, but it depends on a crate under a licence
+//! deny.toml does not list. cpal's ALSA threads would only be promoted
+//! through rtkit, and only for `hw:`
 //! devices (not the `plughw:` names the documentation recommends), so on
 //! Linux the bridge raises each callback thread to `SCHED_FIFO` itself,
 //! from its first callback. (The BSDs get the same attempt; where their

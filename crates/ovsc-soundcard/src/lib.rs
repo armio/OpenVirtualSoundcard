@@ -106,8 +106,8 @@
 //!
 //! # Real-time priority
 //!
-//! CoreAudio runs callbacks on its real-time IO thread, and WASAPI threads
-//! join the MMCSS "Audio" class (cpal's `realtime` feature). On Linux the
+//! CoreAudio runs callbacks on its real-time IO thread. WASAPI's threads are
+//! not promoted (cpal's `realtime` feature is off, see `rt.rs`). On Linux the
 //! bridge raises each callback thread to `SCHED_FIFO` itself from its first
 //! callback, for every ALSA device except `null` and those served by a
 //! sound server (`default`, `pulse`, `pipewire`, `jack`); that needs
