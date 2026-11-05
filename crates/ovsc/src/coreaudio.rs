@@ -38,7 +38,9 @@ use ovsc_clock::{MediaClock, free_running_clock_with_rate};
 use ovsc_control::{Restart, SettingsChange};
 use ovsc_core::net::Interface;
 use ovsc_core::{Device, FormatRequest, RemoteChanges, SavedState, StartOptions};
-use ovsc_hal_server::{EngineInfo, HalRegion, HalServer, ShmClockMirror};
+use ovsc_hal_server::{
+    EngineInfo, HalOptions, HalRegion, HalServer, ShmClockMirror, driver_config,
+};
 use ovsc_ipc::transport::ServerTransport;
 
 use crate::config::{self, AppConfig, ClockSource};
@@ -147,7 +149,7 @@ async fn serve(
             opts.debug_zts_jitter_ns
         );
     }
-    let initial = EngineInfo::from_config(&cfg.device)?;
+    let initial = initial_engine(&cfg, &opts)?;
     let region =
         HalRegion::create(VERSION).context("creating the region shared with the driver")?;
     let server = HalServer::start(opts, region.clone(), service.transport, initial)
@@ -240,6 +242,22 @@ async fn serve(
     server.shutdown().await;
     engine.shutdown().await;
     result
+}
+
+/// The engine offered to the driver until one runs: as the device will
+/// start, with the latency and names saved in the state file, so that its
+/// start does not reconfigure Core Audio a second time. Without them if
+/// the driver cannot take them (a long saved latency with a wide
+/// `input_margin_us`, say): the configuration alone was checked at load,
+/// and the daemon must not exit over a saved setting.
+fn initial_engine(cfg: &AppConfig, opts: &HalOptions) -> anyhow::Result<EngineInfo> {
+    let d = &cfg.device;
+    let configured = EngineInfo::from_config(d)?;
+    let saved = d.state_file.as_deref().and_then(SavedState::load).unwrap_or_default();
+    Ok(match EngineInfo::from_saved(d, &saved) {
+        Ok(e) if driver_config(&e, 1, opts).is_ok() => e,
+        _ => configured,
+    })
 }
 
 fn log_next(next: &Next) {
@@ -1182,6 +1200,75 @@ mod tests {
         assert!(engine.device.remote_settings_locked());
         assert_eq!(engine.device.saved_state().subscriptions.len(), 1);
         engine.shutdown().await;
+    }
+
+    /// A daemon that starts again (launchd starts a new one after a panic)
+    /// offers the driver the latency and names saved in the state file at
+    /// once, as the device will run with them: the device's start then
+    /// changes nothing, and Core Audio is not reconfigured a second time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_first_offer_has_the_saved_latency_and_names() {
+        let dir = std::env::temp_dir().join(format!("ovsc-ca-offer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = dir.join("state.toml");
+        // Set from the app: 2 ms, while the configuration says 4.
+        SavedState::update(&state, |s| {
+            s.latency_ns = Some(2_000_000);
+            s.name = Some("vocal-fx".into());
+            s.rx_names = vec!["Vox".into()];
+        })
+        .unwrap();
+        let mut cfg = app_config("127.0.0.1", 24956);
+        cfg.device.state_file = Some(state);
+        cfg.device.latency_ms = 4.0;
+        let registry = MemRegistry::new();
+        let (stop_tx, mut stop) = mpsc::unbounded_channel();
+        let daemon = serve(cfg, None, service(&registry), quiet(), &mut stop);
+        let driver = async {
+            let (_client, received, w) = attach(&registry).await;
+            let (_mapped, view) = map(&w);
+            let d = view.daemon();
+            wait_for("the engine", || d.flags.load(Ordering::Acquire) & DAEMON_ENGINE_RUNNING != 0)
+                .await;
+            // Asked again with the engine running: the same configuration,
+            // never replaced since the first.
+            let (_again, _, now) = attach(&registry).await;
+            assert_eq!(now.config, w.config);
+            assert_eq!(now.config.config_gen, 1);
+            assert!(!received.0.lock().unwrap().iter().any(|m| matches!(m, ToPlugin::Config(_))));
+            // 2 ms at 48 kHz, reported as the output latency.
+            assert_eq!(w.config.output_latency, 96);
+            assert_eq!(w.config.device_name, "vocal-fx");
+            assert_eq!(w.config.input_names, ["Vox", "02", "03"]);
+            stop_tx.send("test").unwrap();
+            wait_for("the bye", || received.got_bye()).await;
+        };
+        let (result, ()) = tokio::join!(daemon, driver);
+        result.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A saved latency the driver cannot take with these options is left
+    /// out of the first offer, rather than stop the daemon: the device
+    /// then reports it when it runs.
+    #[test]
+    fn the_first_offer_leaves_out_a_saved_latency_the_driver_cannot_take() {
+        let dir = std::env::temp_dir().join(format!("ovsc-ca-wide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = dir.join("state.toml");
+        let mut cfg = app_config("127.0.0.1", 24966);
+        cfg.device.sample_rate = 192_000;
+        cfg.device.state_file = Some(state.clone());
+        // Valid at the configured 4 ms; at 40 ms it spans the rings.
+        cfg.coreaudio.input_margin_us = 44_000;
+        cfg.validate_for(true).unwrap();
+        let opts = cfg.coreaudio.hal_options();
+        assert_eq!(initial_engine(&cfg, &opts).unwrap().latency_samples, 768);
+        SavedState::update(&state, |s| s.latency_ns = Some(2_000_000)).unwrap();
+        assert_eq!(initial_engine(&cfg, &opts).unwrap().latency_samples, 384);
+        SavedState::update(&state, |s| s.latency_ns = Some(40_000_000)).unwrap();
+        assert_eq!(initial_engine(&cfg, &opts).unwrap().latency_samples, 768);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

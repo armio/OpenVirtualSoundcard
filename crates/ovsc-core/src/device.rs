@@ -182,7 +182,15 @@ impl Device {
         let state_problem = recovered
             .problem
             .or_else(|| config.state_file.as_deref().and_then(persist::problem_at_start));
-        let config = with_saved_latency(config, &saved);
+        let config = config.with_saved(&saved);
+        if let Some(ns) = saved.latency_ns {
+            let ms = ns as f64 / 1e6;
+            if config.latency_ns() == ns {
+                info!("receive latency {ms} ms, as set by a controller or the app");
+            } else {
+                warn!("ignoring the saved latency of {ms} ms");
+            }
+        }
         let iface = Interface::find(&config.interface)?;
         let info = DeviceInfo::new(&config, iface)?;
         let state = initial_state(&config, &info, saved);
@@ -628,36 +636,11 @@ fn stats(shared: &Shared) -> DeviceStats {
     }
 }
 
-/// `config` with the receive latency a controller or the app saved, if it
-/// is valid.
-fn with_saved_latency(mut config: DeviceConfig, saved: &SavedState) -> DeviceConfig {
-    if let Some(ns) = saved.latency_ns {
-        let ms = ns as f64 / 1e6;
-        if crate::config::check_latency_ms("latency", ms, config.tx_guard_us).is_ok() {
-            info!("receive latency {ms} ms, as set by a controller or the app");
-            config.latency_ms = ms;
-        } else {
-            warn!("ignoring the saved latency of {ms} ms");
-        }
-    }
-    config
-}
-
+/// The state a device starts in. `config` already holds the saved name and
+/// latency ([`DeviceConfig::with_saved`]).
 fn initial_state(config: &DeviceConfig, info: &DeviceInfo, saved: SavedState) -> State {
-    let pick = |saved: &[String], factory: &[String]| -> Vec<String> {
-        factory
-            .iter()
-            .enumerate()
-            .map(|(i, f)| saved.get(i).filter(|s| !s.is_empty()).unwrap_or(f).clone())
-            .collect()
-    };
-    let name = saved
-        .name
-        .clone()
-        .filter(|n| ovsc_proto::discovery::validate_device_name(n).is_ok())
-        .unwrap_or_else(|| {
-            if config.name.is_empty() { info.factory_name.clone() } else { config.name.clone() }
-        });
+    let name = if config.name.is_empty() { info.factory_name.clone() } else { config.name.clone() };
+    let (rx_names, tx_names) = saved.channel_names(&info.rx_channels, &info.tx_channels);
     let mut subscriptions = vec![None; info.rx_channels.len()];
     let initial = config.subscriptions.iter().map(|s| (s.rx_channel, &s.tx_channel, &s.tx_device));
     let restored = saved.subscriptions.iter().map(|s| (s.rx_channel, &s.tx_channel, &s.tx_device));
@@ -676,8 +659,8 @@ fn initial_state(config: &DeviceConfig, info: &DeviceInfo, saved: SavedState) ->
     State {
         name,
         name_conflict: None,
-        tx_names: pick(&saved.tx_names, &info.tx_channels),
-        rx_names: pick(&saved.rx_names, &info.rx_channels),
+        tx_names,
+        rx_names,
         subscriptions,
         tx_flows: Vec::new(),
         rx_flows: Vec::new(),
