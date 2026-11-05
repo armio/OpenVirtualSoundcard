@@ -72,8 +72,16 @@ The first public version, not released yet.
 - Receive recovery never waits on the network: a transmitter that does not
   answer no longer delays the others, and failures show as Dante statuses
   (`NO_CONNECTION`, `RX_FAIL`, `CHANNEL_FORMAT`, `NO_RX`, `CHANNEL_LATENCY`).
-- Latencies below 1 ms are refused, in the configuration, the app and from
-  controllers: packets leave 0.5 ms after their time.
+- Latencies below 1 ms are refused from the app and controllers, and raised
+  to the minimum, with a warning, in the configuration: packets leave 0.5 ms
+  after their time.
+- A device restarted in-process (a latency change, an address change) keeps
+  the name it announced instead of probing it again, so a name conflict can
+  no longer rename it mid-show. The daemon offers Core Audio the saved
+  latency and names at start, so its restart does not reconfigure the device
+  twice.
+- While the show lock is on, controllers see the sample rate and encoding as
+  fixed.
 - Transmit flows accept 2 to 32 frames per packet and 1 to 8 channels, as
   advertised. A flow requested again with another packet size is replaced.
 - The macOS driver fades over 5 ms when its gate opens or closes, and sends
@@ -97,5 +105,13 @@ The first public version, not released yet.
   after it was written.
 - Two devices with the default name got each other's subscriptions, and a
   self-subscription could loop back when another device used the name.
+- A channel added to an existing receive flow stayed silent after the media
+  clock stepped back, for as long as the step.
+- The transmit thread allocated, freed sockets and woke a task when flows
+  came and went.
+- Settings changed in the app while the engine restarted were lost when it
+  came back.
+- The app's Apply stayed disabled while the engine waited for the network
+  with an empty device name.
 
 [Unreleased]: https://github.com/armio/OpenVirtualSoundcard/commits/main

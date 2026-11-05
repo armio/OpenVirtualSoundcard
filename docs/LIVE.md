@@ -152,7 +152,8 @@ backend = "coreaudio"
 # prevent_idle_sleep = true
 ```
 
-Every value is checked at start.
+Every value is checked at start. A latency below the minimum (1 ms with
+the default transmit guard) is raised to it, with a warning in the log.
 
 **The app and controllers win over this file.** A receive latency, device
 name or show lock set from the app or from Dante Controller, and the
@@ -229,8 +230,9 @@ network can make them without anyone at the Mac knowing.
 With the show session running at the show's buffer size:
 
 1. **Name.** Dante Controller shows the device under its intended name, with
-   no `-2` suffix. If another device already used the name, OVSC took
-   `<name>-2` at start and logged an error: rename one of them and re-patch.
+   no `-2` suffix, and the app shows no warning that another device uses the
+   name. If another device already used the name, OVSC took `<name>-2` at
+   start and logged an error: rename one of them and re-patch.
 2. **Clock.** The app's Clock is **Locked**, its Leader is the console (or
    the Preferred Leader), and Dante Controller shows OVSC as a follower of
    the same leader. No other leader is reported.
@@ -292,7 +294,7 @@ any of them.
 | The transmit thread stalls (rare: the Mac is overloaded) | A gap on the returns about as long as the stall beyond the console's slack (about 0.5 ms at a 1 ms console latency) | Packets up to 40 ms overdue are sent at once, oldest first, for receivers with longer latencies; beyond 40 ms the flow resyncs and the skipped packets are counted. Late sends and skips are warnings in the app. |
 | The daemon crashes (a panic anywhere) | 5 to 10 s of silence plus the clock relock; the returns may take longer | It logs the panic, says goodbye to the driver and exits; launchd starts a new daemon. Core Audio sees no change. The returns come back once the console requests OVSC's flows again, on its own timing. |
 | The Core Audio driver faults (a caught panic) | Silence on every channel until Core Audio restarts | Run `sudo killall coreaudiod`; the host will likely need to reopen the device. |
-| Another device uses OVSC's name mid-show | Nothing at once; new subscriptions may reach the wrong device | OVSC never renames itself mid-show; it logs an error and reports the conflict. Rename one device after the show. |
+| Another device uses OVSC's name mid-show | Nothing at once; new subscriptions may reach the wrong device | OVSC keeps its name, through engine restarts too (latency, address change); it logs an error and the app warns. Rename one device after the show. Only a restart of the daemon itself (a crash, a reboot) probes the name again and, while the other device still has it, takes `<name>-2`: clear any name warning before the show. |
 | A controller changes a setting | See [Changes that interrupt audio](#changes-that-interrupt-audio) | With the show lock on, refused and listed in the app; without it, applied and listed. |
 | The audio engine starts or the gate opens or closes | A 5 ms fade, not a click | The driver ramps in and out at its gate. |
 
@@ -360,7 +362,8 @@ What the common warnings point at:
 
 * Returns have their own latency (`tx_latency_ms`), and the device reports it
   to Core Audio as its output latency.
-* Latencies below 1 ms are refused (packets leave 0.5 ms after their time).
+* Latencies below 1 ms are refused from the app and controllers, and raised
+  to 1 ms in `ovsc.toml` (packets leave 0.5 ms after their time).
 * Leader changes, holdover and unlocks no longer interrupt audio in the
   normal case (see the table above).
 * A flow plays at the larger of OVSC's latency and the transmitter's, as on
