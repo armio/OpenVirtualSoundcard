@@ -1705,7 +1705,11 @@ impl Worker {
         std::thread::Builder::new().name(format!("ovsc-rx{id}")).spawn(move || {
             // Dropped last, once `receive` has dropped the rings.
             let _alive = alive;
-            crate::rt::raise_priority("receive", crate::rt::RtClass::Receive);
+            // Recorded where the status shows it. Never cleared by a thread
+            // that did get it: this one keeps running without it.
+            if !crate::rt::raise_priority("receive", crate::rt::RtClass::Receive) {
+                receiver.probes.counters.rx_not_realtime.store(true, Ordering::Relaxed);
+            }
             receive(socket, clock, receiver, flag)
         })?;
         Ok(Self { stop, params })
@@ -2421,6 +2425,14 @@ mod tests {
         assert_eq!(keepalives[1], 0);
         assert_eq!(get(&t.stats.rejected_packets), 40);
         assert_eq!(t.rings[0].read_one(start), Some(1 << 8));
+        // The thread, which has sent keepalives, said whether it got
+        // real-time scheduling: what this thread gets too (same process,
+        // same privileges).
+        let realtime =
+            std::thread::spawn(|| crate::rt::raise_priority("test", crate::rt::RtClass::Receive))
+                .join()
+                .unwrap();
+        assert_eq!(t.counters.rx_not_realtime.load(Ordering::Relaxed), !realtime);
     }
 
     mod manager {

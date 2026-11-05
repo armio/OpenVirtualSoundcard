@@ -390,8 +390,9 @@ without it.
   what to do; the first 10 s after the engine (re)starts and the first 3 s
   after an application starts IO do not count. Holdover (with the seconds
   left), a clock relocking, a jump of the clock, a new clock leader,
-  subscribed channels without audio for 10 s, a transmit thread without
-  real-time priority and another device using this one's name also warn.
+  subscribed channels without audio for 10 s, a transmit or receive
+  thread without real-time priority and another device using this one's
+  name also warn.
   The changes controllers made or tried to make come last, newest first,
   for 10 minutes; older ones move to **Earlier**, at the bottom. The header
   says `settings locked` while the show lock is on.
