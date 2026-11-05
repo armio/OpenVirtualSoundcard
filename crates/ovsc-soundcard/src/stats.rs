@@ -1,6 +1,6 @@
 //! Statistics shared lock-free between audio callbacks and the bridge.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering::Relaxed};
 
 use crate::controller::DriftController;
 
@@ -43,7 +43,17 @@ pub struct DirectionStats {
     pub device_errors: u64,
     /// The backend reported the device as gone; the stream is dead.
     pub device_lost: bool,
+    /// Whether the callback thread runs with real-time priority: `Some(true)`
+    /// once raised, `Some(false)` if the system refused (on Linux, grant
+    /// `CAP_SYS_NICE` or run as root), `None` if the bridge didn't try (the
+    /// platform's audio thread is real-time already, or the device is
+    /// served by a sound server) or hasn't yet.
+    pub realtime: Option<bool>,
 }
+
+/// Values of [`StatsCell::realtime`] other than 0 (not known).
+const RT_YES: u8 = 1;
+const RT_REFUSED: u8 = 2;
 
 /// The atomics behind a [`DirectionStats`].
 #[derive(Debug, Default)]
@@ -60,6 +70,7 @@ pub struct StatsCell {
     realigns: AtomicU64,
     device_errors: AtomicU64,
     device_lost: AtomicBool,
+    realtime: AtomicU8,
 }
 
 impl StatsCell {
@@ -100,9 +111,20 @@ impl StatsCell {
         self.realigns.store(controller.realigns(), Relaxed);
     }
 
+    /// Records whether raising the callback thread's priority worked.
+    pub fn set_realtime(&self, ok: bool) {
+        self.realtime.store(if ok { RT_YES } else { RT_REFUSED }, Relaxed);
+    }
+
     /// Records an error reported by the audio backend. Called from the
     /// backend's error callback.
     pub fn device_error(&self, error: &cpal::Error) {
+        // Not an audio error: the backend couldn't make its thread
+        // real-time (cpal's `realtime` feature, e.g. WASAPI's MMCSS).
+        if error.kind() == cpal::ErrorKind::RealtimeDenied {
+            self.realtime.store(RT_REFUSED, Relaxed);
+            return;
+        }
         self.device_errors.fetch_add(1, Relaxed);
         if matches!(
             error.kind(),
@@ -129,6 +151,27 @@ impl StatsCell {
             realigns: self.realigns.load(Relaxed),
             device_errors: self.device_errors.load(Relaxed),
             device_lost: self.device_lost.load(Relaxed),
+            realtime: match self.realtime.load(Relaxed) {
+                RT_YES => Some(true),
+                RT_REFUSED => Some(false),
+                _ => None,
+            },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refused_priority_is_not_a_device_error() {
+        let cell = StatsCell::new();
+        assert_eq!(cell.snapshot("d", 2, "f32").realtime, None);
+        cell.device_error(&cpal::Error::new(cpal::ErrorKind::RealtimeDenied));
+        let s = cell.snapshot("d", 2, "f32");
+        assert_eq!((s.realtime, s.device_errors), (Some(false), 0));
+        cell.set_realtime(true);
+        assert_eq!(cell.snapshot("d", 2, "f32").realtime, Some(true));
     }
 }

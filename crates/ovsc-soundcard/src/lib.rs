@@ -94,6 +94,16 @@
 //! Audio callbacks don't allocate, lock or log; statistics are atomics read
 //! by [`Bridge::stats`].
 //!
+//! # Real-time priority
+//!
+//! CoreAudio runs callbacks on its real-time IO thread, and WASAPI threads
+//! join the MMCSS "Audio" class (cpal's `realtime` feature). On Linux the
+//! bridge raises each callback thread to `SCHED_FIFO` itself from its first
+//! callback, for every ALSA device except those served by a sound server
+//! (`default`, `pulse`, `pipewire`, `jack`); that needs `CAP_SYS_NICE` (or
+//! root), and [`DirectionStats::realtime`] says when it was refused.
+//! Without it a busy machine causes xruns at small buffers.
+//!
 //! # Latency
 //!
 //! Playback reads the rings `latency + safety` behind the media clock, where
@@ -115,6 +125,7 @@ pub mod controller;
 mod device;
 mod kernel;
 mod pos;
+mod rt;
 mod sample;
 mod stats;
 mod stream;

@@ -15,6 +15,10 @@ cpal.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+# Raises the device callback threads to real-time priority (see src/rt.rs).
+[target.'cfg(all(unix, not(target_vendor = "apple")))'.dependencies]
+thread-priority.workspace = true
+
 [dev-dependencies]
 ovsc-proto.workspace = true
 

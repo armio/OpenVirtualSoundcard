@@ -10,8 +10,11 @@ use tracing::{info, warn};
 use ovsc_clock::MediaClock;
 use ovsc_core::AudioIo;
 
-use crate::device::{Direction, StreamChoice, choose_config, find_device, open_host, resolve_map};
+use crate::device::{
+    Direction, StreamChoice, choose_config, device_id, find_device, open_host, resolve_map,
+};
 use crate::kernel::HALF;
+use crate::rt;
 use crate::sample::DeviceSample;
 use crate::stats::{DirectionStats, StatsCell};
 use crate::stream::{Capture, Playout};
@@ -139,6 +142,7 @@ fn open_output(
     margin: u64,
 ) -> Result<Half> {
     let (device, name) = find_device(host, query, Direction::Output)?;
+    let promote = promotion(&device, &name);
     let ranges: Vec<_> = device
         .supported_output_configs()
         .map_err(|e| Error::audio(format!("{name}: cannot query output formats"), e))?
@@ -153,11 +157,12 @@ fn open_output(
     let config = stream_config(io, &choice);
     let clock = io.clock.clone();
     let s = stats.clone();
+    let p = promote;
     let built = match choice.format {
-        SampleFormat::F32 => build_output::<f32>(&device, config, playout, clock, s),
-        SampleFormat::I32 => build_output::<i32>(&device, config, playout, clock, s),
-        SampleFormat::I24 => build_output::<cpal::I24>(&device, config, playout, clock, s),
-        SampleFormat::I16 => build_output::<i16>(&device, config, playout, clock, s),
+        SampleFormat::F32 => build_output::<f32>(&device, config, playout, clock, s, p),
+        SampleFormat::I32 => build_output::<i32>(&device, config, playout, clock, s, p),
+        SampleFormat::I24 => build_output::<cpal::I24>(&device, config, playout, clock, s, p),
+        SampleFormat::I16 => build_output::<i16>(&device, config, playout, clock, s, p),
         other => return Err(unsupported_format(&name, other)),
     };
     let stream =
@@ -184,6 +189,7 @@ fn open_input(
     margin: u64,
 ) -> Result<Half> {
     let (device, name) = find_device(host, query, Direction::Input)?;
+    let promote = promotion(&device, &name);
     let ranges: Vec<_> = device
         .supported_input_configs()
         .map_err(|e| Error::audio(format!("{name}: cannot query input formats"), e))?
@@ -199,11 +205,12 @@ fn open_input(
     let config = stream_config(io, &choice);
     let clock = io.clock.clone();
     let s = stats.clone();
+    let p = promote;
     let built = match choice.format {
-        SampleFormat::F32 => build_input::<f32>(&device, config, capture, clock, s),
-        SampleFormat::I32 => build_input::<i32>(&device, config, capture, clock, s),
-        SampleFormat::I24 => build_input::<cpal::I24>(&device, config, capture, clock, s),
-        SampleFormat::I16 => build_input::<i16>(&device, config, capture, clock, s),
+        SampleFormat::F32 => build_input::<f32>(&device, config, capture, clock, s, p),
+        SampleFormat::I32 => build_input::<i32>(&device, config, capture, clock, s, p),
+        SampleFormat::I24 => build_input::<cpal::I24>(&device, config, capture, clock, s, p),
+        SampleFormat::I16 => build_input::<i16>(&device, config, capture, clock, s, p),
         other => return Err(unsupported_format(&name, other)),
     };
     let stream = built.map_err(|e| Error::audio(format!("{name}: cannot open input stream"), e))?;
@@ -217,6 +224,17 @@ fn open_input(
         describe_buffer(&choice),
     );
     Ok(Half { stream, stats, device: name, channels: choice.channels, format: choice.format })
+}
+
+/// Whether the bridge raises the priority of `device`'s callbacks itself
+/// (see [`rt`]).
+fn promotion(device: &cpal::Device, name: &str) -> bool {
+    let id = device_id(device).unwrap_or_else(|| name.to_owned());
+    let promote = rt::wanted(&id);
+    if cfg!(all(unix, not(target_vendor = "apple"))) && !promote {
+        info!("{name:?} ({id}) is served by a sound server: its callbacks keep their priority");
+    }
+    promote
 }
 
 fn unsupported_format(name: &str, format: SampleFormat) -> Error {
@@ -255,16 +273,46 @@ fn stream_config(io: &AudioIo, choice: &StreamChoice) -> StreamConfig {
     }
 }
 
+/// Work for a stream's first callback, on the backend's audio thread:
+/// raises its priority if `promote`, and records the outcome for the health
+/// monitor to report (the callback itself can't log).
+struct FirstCallback {
+    pending: bool,
+    promote: bool,
+    stats: Arc<StatsCell>,
+}
+
+impl FirstCallback {
+    fn new(promote: bool, stats: Arc<StatsCell>) -> Self {
+        FirstCallback { pending: true, promote, stats }
+    }
+
+    #[inline]
+    fn run(&mut self) {
+        if self.pending {
+            self.pending = false;
+            if self.promote {
+                self.stats.set_realtime(rt::promote_current_thread());
+            }
+        }
+    }
+}
+
 fn build_output<S: DeviceSample>(
     device: &cpal::Device,
     config: StreamConfig,
     mut playout: Playout,
     clock: MediaClock,
     stats: Arc<StatsCell>,
+    promote: bool,
 ) -> std::result::Result<cpal::Stream, cpal::Error> {
+    let mut first = FirstCallback::new(promote, stats.clone());
     device.build_output_stream(
         config,
-        move |data: &mut [S], _: &cpal::OutputCallbackInfo| playout.render(clock.now_ns(), data),
+        move |data: &mut [S], _: &cpal::OutputCallbackInfo| {
+            first.run();
+            playout.render(clock.now_ns(), data)
+        },
         move |e| stats.device_error(&e),
         Some(OPEN_TIMEOUT),
     )
@@ -276,10 +324,15 @@ fn build_input<S: DeviceSample>(
     mut capture: Capture,
     clock: MediaClock,
     stats: Arc<StatsCell>,
+    promote: bool,
 ) -> std::result::Result<cpal::Stream, cpal::Error> {
+    let mut first = FirstCallback::new(promote, stats.clone());
     device.build_input_stream(
         config,
-        move |data: &[S], _: &cpal::InputCallbackInfo| capture.process(clock.now_ns(), data),
+        move |data: &[S], _: &cpal::InputCallbackInfo| {
+            first.run();
+            capture.process(clock.now_ns(), data)
+        },
         move |e| stats.device_error(&e),
         Some(OPEN_TIMEOUT),
     )
