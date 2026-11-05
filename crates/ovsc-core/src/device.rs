@@ -132,6 +132,9 @@ pub struct DeviceStats {
     pub tx_expired_flows: u64,
     /// The transmit thread runs without real-time scheduling.
     pub tx_not_realtime: bool,
+    /// A receive thread started without real-time scheduling since the
+    /// device started.
+    pub rx_not_realtime: bool,
     /// The transmit thread has stopped: no flow sends audio until the
     /// device restarts.
     pub tx_engine_failed: bool,
@@ -621,6 +624,7 @@ fn stats(shared: &Shared) -> DeviceStats {
         tx_resyncs: c.tx_resyncs.load(Ordering::Relaxed),
         tx_expired_flows: c.tx_expired_flows.load(Ordering::Relaxed),
         tx_not_realtime: c.tx_not_realtime.load(Ordering::Relaxed),
+        rx_not_realtime: c.rx_not_realtime.load(Ordering::Relaxed),
         tx_engine_failed: c.tx_engine_failed.load(Ordering::Relaxed),
         rx_lost_packets: c.rx_lost_packets.load(Ordering::Relaxed),
         rx_early_packets: c.rx_early_packets.load(Ordering::Relaxed),

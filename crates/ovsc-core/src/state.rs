@@ -115,6 +115,9 @@ pub struct Counters {
     pub tx_expired_flows: AtomicU64,
     /// Set when the transmit thread runs without real-time scheduling.
     pub tx_not_realtime: AtomicBool,
+    /// Set once a receive thread has started without real-time scheduling,
+    /// until the device restarts.
+    pub rx_not_realtime: AtomicBool,
     /// Set when the transmit thread has stopped on a panic: no flow sends
     /// audio any more, and flow requests are refused until the device
     /// restarts.

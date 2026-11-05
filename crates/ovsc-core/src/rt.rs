@@ -7,6 +7,7 @@
 //! thread that runs for about a second without blocking, and the thread then
 //! competes with everything else again.
 
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::{debug, warn};
@@ -61,64 +62,89 @@ impl RtClass {
 /// not expected to), the thread gets a raised priority that is not
 /// real-time. Other Unix systems get `SCHED_FIFO`, which Linux grants only
 /// with `CAP_SYS_NICE` (or through rtkit); failing that, the thread gets
-/// the highest normal priority it may have. Whenever the thread ends up
-/// without real-time scheduling the function warns (once per process) and
-/// returns false, so that the caller can record it where the status shows
-/// it. Elsewhere (Windows) the highest priority is the best there is, and
-/// counts as real-time.
+/// the highest normal priority it may have. Elsewhere (Windows) the highest
+/// priority is the best there is, and counts as real-time.
+///
+/// Whenever the thread ends up without real-time scheduling, on any
+/// platform, the function returns false, so that the caller can record it
+/// where the status shows it, and logs one warning that says "the {what}
+/// thread is not real-time", what it got instead and why, so that a single
+/// search of the log finds every case. It warns once per process for each
+/// [`RtClass`], since every thread of a kind fares the same.
 pub fn raise_priority(what: &str, class: RtClass) -> bool {
+    // Why the thread is not real-time, should it end up so.
     #[cfg(target_os = "macos")]
-    match macos::set_time_constraint(class.time_constraint()) {
+    let why: Cow<'static, str> = match macos::set_time_constraint(class.time_constraint()) {
         Ok(()) => {
             debug!("{what} thread runs with the real-time time-constraint policy");
             return true;
         }
-        Err(kr) => {
-            static WARNED: AtomicBool = AtomicBool::new(false);
-            if !WARNED.swap(true, Ordering::Relaxed) {
-                warn!(
-                    "cannot give the {what} thread the real-time time-constraint policy \
-                     (thread_policy_set returned {kr}); trying a raised priority instead"
-                );
-            }
-        }
-    }
+        Err(kr) => Cow::Owned(format!(
+            "macOS refused it the time-constraint policy (thread_policy_set returned {kr}), \
+             which needs no privileges. Restart the daemon, and report it if it happens again."
+        )),
+    };
     #[cfg(not(target_os = "macos"))]
-    let _ = class;
+    let why: Cow<'static, str> =
+        Cow::Borrowed("Grant real-time scheduling (e.g. CAP_SYS_NICE) to avoid it.");
 
     use thread_priority::{ThreadPriority, set_current_thread_priority};
     #[cfg(unix)]
-    {
+    let fifo = {
         use thread_priority::{
             RealtimeThreadSchedulePolicy, ThreadSchedulePolicy, set_thread_priority_and_policy,
             thread_native_id,
         };
         let fifo = ThreadSchedulePolicy::Realtime(RealtimeThreadSchedulePolicy::Fifo);
-        if set_thread_priority_and_policy(thread_native_id(), ThreadPriority::Max, fifo).is_ok() {
+        set_thread_priority_and_policy(thread_native_id(), ThreadPriority::Max, fifo).is_ok()
+    };
+    #[cfg(not(unix))]
+    let fifo = false;
+    // What the thread got instead.
+    let got = if fifo {
+        // On macOS only the time-constraint policy is real-time: SCHED_FIFO
+        // there is a fixed priority below the real-time band that Core
+        // Audio's threads run in.
+        if cfg!(not(target_os = "macos")) {
             debug!("{what} thread runs with the SCHED_FIFO policy");
-            // On macOS only the time-constraint policy is real-time:
-            // SCHED_FIFO there is a fixed priority below the real-time band
-            // that Core Audio's threads run in, and the warning above said so.
-            return cfg!(not(target_os = "macos"));
+            return true;
         }
-    }
-    let raised = set_current_thread_priority(ThreadPriority::Max);
-    if cfg!(not(unix)) && raised.is_ok() {
-        debug!("{what} thread runs with the highest priority");
-        return true;
-    }
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, Ordering::Relaxed) {
-        let how = match raised {
-            Ok(()) => "a raised but not real-time priority".to_string(),
+        "a raised fixed priority (SCHED_FIFO), below Core Audio's real-time threads".to_owned()
+    } else {
+        match set_current_thread_priority(ThreadPriority::Max) {
+            Ok(()) if cfg!(not(unix)) => {
+                debug!("{what} thread runs with the highest priority");
+                return true;
+            }
+            Ok(()) => "a raised but not real-time priority".to_owned(),
             Err(e) => format!("normal priority ({e:?})"),
-        };
-        warn!(
-            "the {what} thread runs at {how}; on a busy host this can cause dropouts. \
-             Grant real-time scheduling (e.g. CAP_SYS_NICE) to avoid it."
-        );
+        }
+    };
+    if first_miss(class) {
+        warn!("{}", not_realtime_warning(what, &got, &why));
     }
     false
+}
+
+/// Whether no `class` thread has missed real-time scheduling before in this
+/// process: each kind is warned about once, not once per flow.
+fn first_miss(class: RtClass) -> bool {
+    static MISSED: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
+    let kind = match class {
+        RtClass::Transmit => 0,
+        RtClass::Receive => 1,
+    };
+    !MISSED[kind].swap(true, Ordering::Relaxed)
+}
+
+/// The warning for a `what` thread that runs at `got` rather than
+/// real-time, for the reason or remedy `why`. Every such outcome, on every
+/// platform, says "the {what} thread is not real-time" in the same words.
+fn not_realtime_warning(what: &str, got: &str, why: &str) -> String {
+    format!(
+        "the {what} thread is not real-time: it runs at {got}, and on a busy host this can \
+         cause dropouts. {why}"
+    )
 }
 
 /// Blocks the calling thread until [`ovsc_clock::local_now_ns`]
@@ -294,6 +320,32 @@ mod tests {
         sleep_until(local_now_ns().saturating_sub(1_000_000));
         sleep_until(local_now_ns());
         assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// Every way a thread misses real-time scheduling is logged in the same
+    /// words, which one search of the log finds.
+    #[test]
+    fn not_realtime_is_logged_in_the_same_words() {
+        for got in [
+            "a raised fixed priority (SCHED_FIFO), below Core Audio's real-time threads",
+            "a raised but not real-time priority",
+            "normal priority (OS(1))",
+        ] {
+            let w = not_realtime_warning("receive", got, "Why.");
+            assert!(w.starts_with("the receive thread is not real-time: it runs at "), "{w}");
+            assert!(w.contains(got) && w.ends_with(" Why."), "{w}");
+        }
+    }
+
+    /// Each kind of thread is warned about once per process, not once per
+    /// thread.
+    #[test]
+    fn each_kind_warns_once() {
+        for class in [RtClass::Transmit, RtClass::Receive] {
+            // Another test's thread may have missed first.
+            first_miss(class);
+            assert!(!first_miss(class), "{class:?}");
+        }
     }
 
     #[test]

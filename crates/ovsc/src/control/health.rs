@@ -117,6 +117,7 @@ pub enum Kind {
     RxLate,
     RxEarly,
     RxRejected,
+    RxNotRealtime,
     TxSendErrors,
     TxSkipped,
     TxLate,
@@ -150,6 +151,7 @@ impl Kind {
             Kind::RxLate => "received packets too late to play",
             Kind::RxEarly => "received packets ahead of our clock",
             Kind::RxRejected => "stray datagrams dropped",
+            Kind::RxNotRealtime => "a receive thread lacks real-time priority",
             Kind::TxSendErrors => "packets that could not be sent",
             Kind::TxSkipped => "the transmit thread fell behind",
             Kind::TxLate => "packets sent late",
@@ -793,6 +795,18 @@ impl Health {
                      this computer; the log names its sender."
                 ),
                 short: format!("{rejected} stray datagrams"),
+            });
+        }
+        if s.rx_not_realtime {
+            out.push(Warning {
+                kind: Kind::RxNotRealtime,
+                urgent: false,
+                audible: false,
+                text: "A receive thread runs without real-time priority, so the inputs may drop \
+                       out while this computer is busy. Restart the daemon; if it stays, the log \
+                       says why."
+                    .to_owned(),
+                short: "receive thread not real-time".to_owned(),
             });
         }
 
@@ -1590,6 +1604,32 @@ mod tests {
             w.text
         );
         assert_eq!(w.short, "2 transmit restarts");
+    }
+
+    #[test]
+    fn a_receive_thread_without_real_time_priority() {
+        let c = clock();
+        let mut h = Health::new();
+        let rx = |s: u32| {
+            let mut e = engine();
+            e.stats.rx_not_realtime = s >= 5;
+            reading(hal(true), e)
+        };
+        assert!(feed(&mut h, &c, 0, 4, rx).warnings.is_empty());
+        let a = feed(&mut h, &c, 5, 5, rx);
+        assert_eq!(kinds(&a), [Kind::RxNotRealtime]);
+        let w = find(&a, Kind::RxNotRealtime);
+        assert!(!w.urgent && !w.audible);
+        assert!(
+            w.text.starts_with("A receive thread runs without real-time priority, so the inputs"),
+            "{}",
+            w.text
+        );
+        assert_eq!(h.summary(), "warnings: receive thread not real-time");
+        // With the receive warnings, before the transmit thread's.
+        let mut r = rx(6);
+        r.engine.as_mut().unwrap().stats.tx_not_realtime = true;
+        assert_eq!(kinds(&h.observe(c.at(6.0), &r)), [Kind::RxNotRealtime, Kind::TxNotRealtime]);
     }
 
     #[test]
