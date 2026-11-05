@@ -182,7 +182,8 @@ pub struct CoreAudioConfig {
     pub output_latency_ms: Option<f64>,
     pub input_latency_mode: LatencyMode,
     pub clock_algorithm: ClockAlgorithm,
-    /// Keep the Mac from idle-sleeping while the engine runs.
+    /// Keep the Mac from idle-sleeping while the daemon runs, engine restarts
+    /// included.
     pub prevent_idle_sleep: bool,
     /// Seconds between status lines in the log; 0 disables them.
     pub status_log_interval_s: u64,

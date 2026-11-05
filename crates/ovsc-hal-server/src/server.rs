@@ -5,7 +5,8 @@
 //! instances attached, and pushes a new configuration to all of them
 //! whenever a change of the engine changes it. It also owns the engine
 //! words of the region's daemon status, the status task and the power
-//! assertion.
+//! assertion, which it holds from its start to its shutdown: across engine
+//! restarts too, so the Mac never gets a window to idle-sleep in.
 //!
 //! Transport callbacks run on the transport's queue and only hold the
 //! server's state lock briefly; the daemon never waits on a driver.
@@ -118,6 +119,11 @@ impl HalServer {
             .map_err(|_| io::Error::other("the driver service needs a tokio runtime"))?;
         let config = driver_config(&initial, 1, &o)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        // Taken first thing and held until shutdown, not only while an
+        // engine runs: macOS may start an idle sleep as soon as the last
+        // assertion goes, and an engine restart (a new latency, the network
+        // coming back) would otherwise release it for seconds.
+        let power = o.prevent_idle_sleep.then(take_power).flatten();
         let view = region.view();
         let d = view.daemon();
         d.flags.store(0, Ordering::Release);
@@ -138,7 +144,7 @@ impl HalServer {
                 epoch: 0,
                 observer: None,
                 watcher: None,
-                power: None,
+                power,
                 peers: BTreeMap::new(),
                 closing: false,
             }),
@@ -160,8 +166,9 @@ impl HalServer {
 
     /// The engine is running on `device`, whose rings are the region's:
     /// offers its configuration (pushed to attached drivers if it changed),
-    /// writes the engine words and sets ENGINE_RUNNING, watches the device
-    /// for renames, and takes the power assertion if configured.
+    /// writes the engine words and sets ENGINE_RUNNING, and watches the
+    /// device for renames. Takes the power assertion if configured and
+    /// [`HalServer::start`] could not.
     pub fn engine_started(&self, device: &Device) {
         // Subscribed before the names are read, so no change is missed.
         let changes = device.changes();
@@ -187,18 +194,15 @@ impl HalServer {
         );
         inner.update_engine(&mut st, engine.clone());
         if inner.opts.prevent_idle_sleep && st.power.is_none() {
-            match PowerAssertion::take(POWER_REASON) {
-                Ok(a) => st.power = Some(a),
-                Err(e) => warn!("hal: cannot keep the system awake: {e}"),
-            }
+            st.power = take_power();
         }
         let watcher = watch_device(Arc::downgrade(inner), st.epoch, observer, engine, changes);
         st.watcher = Some(inner.runtime.spawn(watcher));
     }
 
-    /// The engine stopped: clears ENGINE_RUNNING and the audio word, stops
-    /// watching the device and releases the power assertion. The
-    /// configuration stays on offer.
+    /// The engine stopped: clears ENGINE_RUNNING and the audio word and
+    /// stops watching the device. The configuration stays on offer, and the
+    /// power assertion stays held: the engine is normally about to restart.
     pub fn engine_stopped(&self) {
         let mut st = self.inner.lock();
         st.epoch += 1;
@@ -206,7 +210,6 @@ impl HalServer {
             w.abort();
         }
         st.observer = None;
-        st.power = None;
         if std::mem::replace(&mut st.running, false) {
             info!("hal: engine stopped");
         }
@@ -216,6 +219,20 @@ impl HalServer {
     /// The driver link at a glance.
     pub fn status(&self) -> HalStatus {
         self.inner.status()
+    }
+
+    /// Whether the server holds its power assertion, keeping the Mac from
+    /// idle-sleeping (always false off macOS's `prevent_idle_sleep`).
+    pub fn keeps_system_awake(&self) -> bool {
+        self.inner.lock().power.is_some()
+    }
+
+    /// Whether the status task, which writes the 10 Hz heartbeat the driver
+    /// checks, has ended. It only ends at shutdown, so this means it failed
+    /// (a panic): the driver then closes its gate and the device goes
+    /// silent, and only a new daemon brings it back.
+    pub fn status_task_ended(&self) -> bool {
+        self.status_task.as_ref().is_some_and(|t| t.is_finished())
     }
 
     /// Stops the service politely: sets SHUTTING_DOWN, clears
@@ -268,6 +285,17 @@ impl Drop for HalServer {
         // Closes the listener and every connection; the transport drops its
         // reference to the handler.
         self.transport = None;
+    }
+}
+
+/// Takes the power assertion; `None`, with a warning, if the system refuses.
+fn take_power() -> Option<PowerAssertion> {
+    match PowerAssertion::take(POWER_REASON) {
+        Ok(a) => Some(a),
+        Err(e) => {
+            warn!("hal: cannot keep the system awake: {e}");
+            None
+        }
     }
 }
 
@@ -544,5 +572,41 @@ async fn watch_device(
         }
         let e = EngineInfo { rx_names, tx_names, device_name, ..engine.clone() };
         inner.update_engine(&mut st, e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ovsc_core::DeviceConfig;
+    use ovsc_ipc::mem::MemRegistry;
+
+    use super::*;
+
+    fn start_server(prevent_idle_sleep: bool) -> HalServer {
+        let registry = MemRegistry::new();
+        let cfg = DeviceConfig { name: "power".into(), ..Default::default() };
+        HalServer::start(
+            HalOptions { prevent_idle_sleep, allowed_uids: vec![501], ..Default::default() },
+            HalRegion::create("power test").unwrap(),
+            Box::new(registry.bind("org.openvirtualsoundcard.audio.power-test")),
+            EngineInfo::from_config(&cfg).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_power_assertion_is_held_from_start_to_shutdown() {
+        let server = start_server(true);
+        // Before any engine runs: the daemon waits for its network awake.
+        assert!(server.keeps_system_awake());
+        // An engine restart does not let go of it.
+        server.engine_stopped();
+        assert!(server.keeps_system_awake());
+        assert!(!server.status_task_ended());
+        server.shutdown().await;
+
+        let server = start_server(false);
+        assert!(!server.keeps_system_awake());
+        server.shutdown().await;
     }
 }

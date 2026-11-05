@@ -7,6 +7,11 @@
   /Library/LaunchDaemons/org.openvirtualsoundcard.daemon.plist by install.sh or the
   package. ProcessType Interactive keeps launchd from throttling it and
   coalescing its timers. NO_COLOR keeps terminal colour codes out of the log.
+  KeepAlive restarts it whenever it exits: it exits with an error when a
+  part of it failed (a panic), for a fresh start.
+  The daemon opens its log itself (log-file) and reopens it after newsyslog
+  rotates it; StandardOutPath and StandardErrorPath, the same file, only
+  catch what is printed before that.
 -->
 <plist version="1.0">
 <dict>
@@ -18,6 +23,8 @@
 		<string>run</string>
 		<string>--config</string>
 		<string>/Library/Application Support/OpenVirtualSoundcard/ovsc.toml</string>
+		<string>--log-file</string>
+		<string>/Library/Logs/OpenVirtualSoundcard/ovsc.log</string>
 	</array>
 	<key>MachServices</key>
 	<dict>

@@ -1,6 +1,7 @@
 //! Keeps the Mac from idle-sleeping while audio streams: an IOKit power
-//! assertion (`kIOPMAssertPreventUserIdleSystemSleep`), held while the
-//! engine runs (design section 14.3). On other systems it does nothing.
+//! assertion (`kIOPMAssertPreventUserIdleSystemSleep`), held from the start
+//! of the driver service to its shutdown (design section 14.3), engine
+//! restarts included. On other systems it does nothing.
 
 use std::io;
 

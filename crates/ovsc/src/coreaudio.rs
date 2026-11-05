@@ -17,6 +17,13 @@
 //!    would have to swap in every time.
 //! 3. It runs until Ctrl-C or SIGTERM, then says goodbye to the driver
 //!    before stopping the engine.
+//!
+//! While it runs, the engine is restarted on the network interface when
+//! that changes under it (a new address, an adapter that came back; see
+//! [`crate::netwatch`]), and a failed part of the daemon (a panic, a device
+//! task or the driver heartbeat that stopped; see [`crate::supervise`])
+//! ends the daemon with an error after the driver's goodbye, for launchd to
+//! start a fresh one.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,12 +37,14 @@ use ovsc_clock::ptp::{PtpConfig, PtpFollower};
 use ovsc_clock::{MediaClock, free_running_clock_with_rate};
 use ovsc_control::{Restart, SettingsChange};
 use ovsc_core::net::Interface;
-use ovsc_core::{Device, FormatRequest, RemoteChanges, StartOptions};
+use ovsc_core::{Device, FormatRequest, RemoteChanges, SavedState, StartOptions};
 use ovsc_hal_server::{EngineInfo, HalRegion, HalServer, ShmClockMirror};
 use ovsc_ipc::transport::ServerTransport;
 
 use crate::config::{self, AppConfig, ClockSource};
 use crate::control::{self, Control};
+use crate::netwatch::{self, Verdict};
+use crate::supervise::Supervision;
 use crate::{ClockStateLog, Stop, StopSignals, status_line};
 
 /// The daemon version in the region header.
@@ -43,7 +52,7 @@ const VERSION: &str = concat!("ovsc ", env!("CARGO_PKG_VERSION"));
 
 /// The wait after the first failed engine start; each further failure
 /// waits a second longer, up to [`RETRY_MAX`].
-const RETRY_FIRST: Duration = Duration::from_secs(2);
+pub(crate) const RETRY_FIRST: Duration = Duration::from_secs(2);
 const RETRY_MAX: Duration = Duration::from_secs(5);
 
 /// How to start the daemon so that launchd gives it the driver's service.
@@ -58,7 +67,7 @@ pub async fn run(cfg: AppConfig, config_path: Option<PathBuf>) -> anyhow::Result
     cfg.validate()?;
     let mut stop = StopSignals::new()?;
     let service = transport(&cfg.coreaudio.service)?;
-    serve(cfg, config_path, service, &mut stop).await
+    serve(cfg, config_path, service, Supervision::daemon(), &mut stop).await
 }
 
 /// Why [`run_engine`] or [`start_engine`] returned.
@@ -67,6 +76,9 @@ enum Next {
     Stop(&'static str),
     /// A controller or the app set a new latency: restart the device.
     RestartDevice,
+    /// The network interface changed under the engine: restart all of it,
+    /// the clock included, on the interface as it is now.
+    RestartEngine,
     /// The app saved settings that take a new daemon.
     RestartDaemon,
 }
@@ -114,11 +126,13 @@ fn transport(_service: &str) -> anyhow::Result<Service> {
     anyhow::bail!("the coreaudio backend needs macOS")
 }
 
-/// Serves the driver on `service` and runs the engine until `stop`.
+/// Serves the driver on `service` and runs the engine until `stop`, or
+/// until `sup` finds a fault.
 async fn serve(
     cfg: AppConfig,
     config_path: Option<PathBuf>,
     service: Service,
+    sup: Supervision,
     stop: &mut impl Stop,
 ) -> anyhow::Result<()> {
     let mut opts = cfg.coreaudio.hal_options();
@@ -153,9 +167,10 @@ async fn serve(
         listener: &mut listener,
         status: &mut status,
         control: &mut control,
+        sup,
     };
 
-    let mut engine = match start_engine(&mut ctx, stop).await {
+    let mut engine = match start_engine(&mut ctx, None, stop).await {
         Ok(Ok(engine)) => engine,
         Ok(Err(next)) => {
             log_next(&next);
@@ -176,22 +191,33 @@ async fn serve(
                     engine.device.configured_latency_ns() as f64 / 1e6
                 );
                 server.engine_stopped();
+                let carry = Carry::from(&engine.device);
                 engine = match engine.restart_device(&cfg, &region).await {
                     Ok(engine) => engine,
                     Err(e) => {
                         error!("cannot restart the network engine: {e:#}");
-                        match start_engine(&mut ctx, stop).await {
-                            Ok(Ok(engine)) => engine,
-                            Ok(Err(next)) => {
-                                log_next(&next);
+                        match start_again(&mut ctx, carry, stop).await {
+                            Ok(engine) => engine,
+                            Err(end) => {
                                 server.shutdown().await;
-                                return Ok(());
-                            }
-                            Err(e) => {
-                                server.shutdown().await;
-                                return Err(e);
+                                return end;
                             }
                         }
+                    }
+                };
+                server.engine_started(&engine.device);
+            }
+            Ok(Next::RestartEngine) => {
+                // The driver keeps the region and its configuration; it
+                // reads silence until the engine runs again.
+                server.engine_stopped();
+                let carry = Carry::from(&engine.device);
+                engine.shutdown().await;
+                engine = match start_again(&mut ctx, carry, stop).await {
+                    Ok(engine) => engine,
+                    Err(end) => {
+                        server.shutdown().await;
+                        return end;
                     }
                 };
                 server.engine_started(&engine.device);
@@ -215,7 +241,27 @@ fn log_next(next: &Next) {
     match next {
         Next::Stop(why) => info!("{why}: shutting down"),
         Next::RestartDaemon => info!("restarting to apply the new settings"),
-        Next::RestartDevice => {}
+        Next::RestartDevice | Next::RestartEngine => {}
+    }
+}
+
+/// Starts the engine again after it stopped, retrying until it runs; `Err`
+/// holds what the daemon returns instead, when it stops first.
+async fn start_again(
+    ctx: &mut Ctx<'_>,
+    carry: Carry,
+    stop: &mut impl Stop,
+) -> Result<Engine, anyhow::Result<()>> {
+    match start_engine(ctx, Some(carry), stop).await {
+        Ok(Ok(engine)) => Ok(engine),
+        Ok(Err(next)) => {
+            log_next(&next);
+            Err(Ok(()))
+        }
+        Err(e) => {
+            error!("shutting down: {e:#}");
+            Err(Err(e))
+        }
     }
 }
 
@@ -228,9 +274,18 @@ struct Ctx<'a> {
     listener: &'a mut ListenerCheck,
     status: &'a mut StatusTimer,
     control: &'a mut Control,
+    sup: Supervision,
 }
 
 impl Ctx<'_> {
+    /// Why the daemon must restart, if it must: a panic, a part of the
+    /// running `engine`'s device, or the driver heartbeat, that stopped.
+    fn fault(&self, engine: Option<&Engine>) -> Option<String> {
+        self.sup.fault(engine.map(|e| &e.device)).or_else(|| {
+            self.server.status_task_ended().then(|| "the driver heartbeat task stopped".to_owned())
+        })
+    }
+
     /// Answers a control call; whether the daemon must restart.
     fn answer(&self, call: control::Call, engine: Option<&Engine>, error: &str) -> bool {
         let view = control::View {
@@ -281,6 +336,7 @@ impl Ctx<'_> {
 /// status and the last failure, and the app's calls are answered.
 async fn start_engine(
     ctx: &mut Ctx<'_>,
+    carry: Option<Carry>,
     stop: &mut impl Stop,
 ) -> anyhow::Result<Result<Engine, Next>> {
     let mut delay = RETRY_FIRST;
@@ -288,7 +344,7 @@ async fn start_engine(
     let mut last_error = String::new();
     loop {
         attempts += 1;
-        match Engine::start(ctx.cfg, ctx.region).await {
+        match Engine::start(ctx.cfg, ctx.region, carry.clone()).await {
             Ok(engine) => {
                 if attempts > 1 {
                     info!("engine started at attempt {attempts}");
@@ -308,10 +364,16 @@ async fn start_engine(
         }
         ctx.listener.poll();
         let mut retry = std::pin::pin!(tokio::time::sleep(delay));
+        let mut second = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
                 r = stop.requested() => return Ok(Err(Next::Stop(r?))),
                 () = &mut retry => break,
+                _ = second.tick() => {
+                    if let Some(fault) = ctx.fault(None) {
+                        anyhow::bail!("{fault}: restarting the daemon");
+                    }
+                }
                 () = ctx.status.tick() => {
                     info!(
                         "engine not running: {last_error} (attempts: {attempts}); hal: {}",
@@ -329,12 +391,13 @@ async fn start_engine(
     }
 }
 
-fn next_retry_delay(delay: Duration) -> Duration {
+pub(crate) fn next_retry_delay(delay: Duration) -> Duration {
     (delay + Duration::from_secs(1)).min(RETRY_MAX)
 }
 
-/// Runs until a stop, a new latency or a restart is asked for, logging the
-/// status line at its cadence and answering the app's calls.
+/// Runs until a stop, a new latency or a restart is asked for, or the
+/// network interface changes, logging the status line at its cadence and
+/// answering the app's calls. A fault is an error.
 async fn run_engine(
     engine: &Engine,
     ctx: &mut Ctx<'_>,
@@ -342,19 +405,40 @@ async fn run_engine(
 ) -> anyhow::Result<Next> {
     let mut second = tokio::time::interval(Duration::from_secs(1));
     let mut clock_log = ClockStateLog::default();
+    let iface = &engine.device.info().iface;
+    let mut watch = ctx.sup.probe.watch(&iface.name, iface.ip);
     let mut latency = engine.device.latency_requests();
     latency.mark_unchanged();
+    // A latency set between the device's start and this subscription
+    // was not seen as a change: apply it now.
+    if engine.device.configured_latency_ns() != engine.device.info().latency_ns {
+        return Ok(Next::RestartDevice);
+    }
     let mut format = engine.device.format_requests();
     format.mark_unchanged();
     loop {
         tokio::select! {
             r = stop.requested() => return Ok(Next::Stop(r?)),
             () = ctx.status.tick() => {
-                info!("{}; hal: {}", status_line(&engine.device, &engine.clock), ctx.server.status());
+                let network = netwatch::status_note(watch.as_ref());
+                info!(
+                    "{}{network}; hal: {}",
+                    status_line(&engine.device, &engine.clock),
+                    ctx.server.status()
+                );
             }
             _ = second.tick() => {
                 clock_log.poll(&engine.clock);
                 ctx.listener.poll();
+                if let Some(fault) = ctx.fault(Some(engine)) {
+                    anyhow::bail!("{fault}: restarting the daemon");
+                }
+                if let Some(w) = &mut watch {
+                    if let Verdict::Restart(why) = w.poll(ctx.sup.probe, &engine.clock) {
+                        warn!("{why}: restarting the network engine");
+                        return Ok(Next::RestartEngine);
+                    }
+                }
             }
             Ok(()) = latency.changed() => {
                 if engine.device.configured_latency_ns() != engine.device.info().latency_ns {
@@ -411,10 +495,31 @@ struct Engine {
     started: std::time::Instant,
 }
 
+/// What a device hands on to the one that replaces it, so that a restart
+/// keeps the names, subscriptions, latency and show lock set since the
+/// start even without a state file, and still lists the controllers'
+/// changes that explain the restart.
+#[derive(Clone)]
+struct Carry {
+    state: SavedState,
+    remote_changes: RemoteChanges,
+}
+
+impl From<&Device> for Carry {
+    fn from(device: &Device) -> Self {
+        Carry { state: device.saved_state(), remote_changes: device.remote_changes() }
+    }
+}
+
 impl Engine {
     /// Starts the device on `region`'s rings, with its clock mirrored into
-    /// the region. Whatever started is stopped again on failure.
-    async fn start(cfg: &AppConfig, region: &Arc<HalRegion>) -> anyhow::Result<Engine> {
+    /// the region, from what a previous device left (`carry`), if any.
+    /// Whatever started is stopped again on failure.
+    async fn start(
+        cfg: &AppConfig,
+        region: &Arc<HalRegion>,
+        carry: Option<Carry>,
+    ) -> anyhow::Result<Engine> {
         let d = &cfg.device;
         let iface = Interface::find(&d.interface)?;
         let (clock, follower) = match cfg.clock.source {
@@ -433,7 +538,7 @@ impl Engine {
             ClockSource::System => anyhow::bail!("the driver cannot follow the system clock"),
         };
         clock.set_mirror(Some(ShmClockMirror::new(region.clone())))?;
-        let device = match Self::start_device(cfg, region, &clock, None).await {
+        let device = match Self::start_device(cfg, region, &clock, carry).await {
             Ok(device) => device,
             Err(e) => {
                 if let Some(f) = follower {
@@ -452,13 +557,13 @@ impl Engine {
         Ok(Engine { device, clock, follower, started: std::time::Instant::now() })
     }
 
-    /// Starts the device on `region`'s rings, following `clock`. It notes
-    /// controllers' changes in `remote_changes`, or in a new log.
+    /// Starts the device on `region`'s rings, following `clock`, from what
+    /// a previous device left (`carry`), if any.
     async fn start_device(
         cfg: &AppConfig,
         region: &Arc<HalRegion>,
         clock: &MediaClock,
-        remote_changes: Option<RemoteChanges>,
+        carry: Option<Carry>,
     ) -> anyhow::Result<Device> {
         let d = &cfg.device;
         let rings = region
@@ -467,10 +572,15 @@ impl Engine {
         // Controllers may change the sample rate and the bit depth: the
         // daemon applies them (run_engine), unless the show lock
         // (`[device] lock_remote_settings`, or the app) refuses them.
+        let (state, remote_changes) = match carry {
+            Some(c) => (Some(c.state), Some(c.remote_changes)),
+            None => (None, None),
+        };
         let options = StartOptions {
             rings: Some(rings),
             format_configurable: true,
             remote_changes,
+            state,
             ..Default::default()
         };
         Ok(Device::start_with_options(d.clone(), clock.clone(), options).await?)
@@ -491,9 +601,9 @@ impl Engine {
         // state file keeps the lock, but there may be none, and the list
         // explains the very dropout this restart causes.
         cfg.device.lock_remote_settings = device.remote_settings_locked();
-        let remote_changes = device.remote_changes();
+        let carry = Carry::from(&device);
         device.shutdown().await;
-        match Self::start_device(&cfg, region, &clock, Some(remote_changes)).await {
+        match Self::start_device(&cfg, region, &clock, Some(carry)).await {
             Ok(device) => Ok(Engine { device, clock, follower, started }),
             Err(e) => {
                 if let Some(f) = follower {
@@ -536,7 +646,7 @@ impl ListenerCheck {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Instant;
 
     use tokio::sync::mpsc;
@@ -554,6 +664,7 @@ mod tests {
 
     use super::*;
     use crate::config::BackendKind;
+    use crate::netwatch::{Probe, Seen};
 
     const SERVICE: &str = "org.openvirtualsoundcard.audio.cli-test";
     const UID: u32 = 501;
@@ -660,6 +771,13 @@ mod tests {
         }
     }
 
+    /// Supervision without faults, on the system's interfaces (loopback
+    /// ones are not watched).
+    fn quiet() -> Supervision {
+        static NEVER: AtomicBool = AtomicBool::new(false);
+        Supervision { probe: Probe::System, panicked: &NEVER }
+    }
+
     fn service(registry: &Arc<MemRegistry>) -> Service {
         Service {
             transport: Box::new(registry.bind(SERVICE)),
@@ -671,7 +789,8 @@ mod tests {
     async fn the_driver_attaches_and_the_engine_runs_on_the_region() {
         let registry = MemRegistry::new();
         let (stop_tx, mut stop) = mpsc::unbounded_channel();
-        let daemon = serve(app_config("127.0.0.1", 24790), None, service(&registry), &mut stop);
+        let daemon =
+            serve(app_config("127.0.0.1", 24790), None, service(&registry), quiet(), &mut stop);
         let driver = async {
             let (_client, received, w) = attach(&registry).await;
             assert_eq!((w.config.input_channels, w.config.output_channels), (3, 2));
@@ -706,7 +825,8 @@ mod tests {
         let registry = MemRegistry::new();
         let (stop_tx, mut stop) = mpsc::unbounded_channel();
         // No interface has this address (TEST-NET-1), so every start fails.
-        let daemon = serve(app_config("192.0.2.1", 24800), None, service(&registry), &mut stop);
+        let daemon =
+            serve(app_config("192.0.2.1", 24800), None, service(&registry), quiet(), &mut stop);
         let driver = async {
             let (_client, received, w) = attach(&registry).await;
             // The configured layout is on offer before the engine runs.
@@ -756,7 +876,7 @@ mod tests {
         cfg.device.latency_ms = 4.0;
         let registry = MemRegistry::new();
         let (stop_tx, mut stop) = mpsc::unbounded_channel();
-        let daemon = serve(cfg, None, service(&registry), &mut stop);
+        let daemon = serve(cfg, None, service(&registry), quiet(), &mut stop);
         let app = async {
             let (_client, received, w) = attach(&registry).await;
             let (_mapped, view) = map(&w);
@@ -765,7 +885,13 @@ mod tests {
             wait_for("the engine", running).await;
             assert_eq!(latency_ms(&socket).await, Some(4.0));
 
-            let change = SettingsChange { latency_ms: Some(2.0), ..Default::default() };
+            // The running device saves the name and latency itself: the
+            // control socket does not write the state file behind its back.
+            let change = SettingsChange {
+                latency_ms: Some(2.0),
+                name: Some("vocal-fx".into()),
+                ..Default::default()
+            };
             match ask(&socket, Request::Apply { change }).await {
                 Response::Applied { restart } => assert_eq!(restart, Restart::Device),
                 other => panic!("not applied: {other:?}"),
@@ -784,6 +910,7 @@ mod tests {
             }
             let saved = std::fs::read_to_string(dir.join("state.toml")).unwrap();
             assert!(saved.contains("latency_ns = 2000000"), "{saved}");
+            assert!(saved.contains("name = \"vocal-fx\""), "{saved}");
 
             // Out of range: refused, and nothing restarts.
             let change = SettingsChange { latency_ms: Some(80.0), ..Default::default() };
@@ -797,6 +924,89 @@ mod tests {
         let (result, ()) = tokio::join!(daemon, app);
         result.unwrap();
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The interface the fake probe shows: 127.0.0.1 until `MOVED`.
+    static MOVED: AtomicBool = AtomicBool::new(false);
+
+    fn moving_probe(_name: &str) -> std::io::Result<Option<Seen>> {
+        let ip = if MOVED.load(Ordering::SeqCst) {
+            std::net::Ipv4Addr::new(127, 0, 0, 9)
+        } else {
+            std::net::Ipv4Addr::LOCALHOST
+        };
+        Ok(Some(Seen { index: 1, ipv4: vec![ip] }))
+    }
+
+    /// The local time the region's clock mapping was made at: a new one
+    /// means a new clock, so a restarted engine.
+    fn clock_ref(view: &RegionRef<'_>) -> u64 {
+        match view.clock().read_bounded(READ_TRIES) {
+            ClockRead::Record(r) => r.snapshot.local_ref_ns,
+            _ => 0,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_new_address_restarts_the_engine_on_the_same_region() {
+        static NEVER: AtomicBool = AtomicBool::new(false);
+        let sup = Supervision { probe: Probe::Fake(moving_probe), panicked: &NEVER };
+        let registry = MemRegistry::new();
+        let (stop_tx, mut stop) = mpsc::unbounded_channel();
+        let daemon =
+            serve(app_config("127.0.0.1", 24830), None, service(&registry), sup, &mut stop);
+        let driver = async {
+            let (_client, received, w) = attach(&registry).await;
+            let (_mapped, view) = map(&w);
+            let d = view.daemon();
+            let running = || d.flags.load(Ordering::Acquire) & DAEMON_ENGINE_RUNNING != 0;
+            wait_for("the engine", running).await;
+            let first = clock_ref(&view);
+            assert_ne!(first, 0);
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            assert_eq!(clock_ref(&view), first, "restarted without a reason");
+
+            // The address moves: the engine restarts, clock and all, and
+            // goes on restarting until the address is back.
+            MOVED.store(true, Ordering::SeqCst);
+            wait_for("a new clock", || clock_ref(&view) != first).await;
+            MOVED.store(false, Ordering::SeqCst);
+            wait_for("the engine again", running).await;
+            let settled = clock_ref(&view);
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+            if running() {
+                assert_eq!(clock_ref(&view), settled, "still restarting");
+            }
+            // The driver stayed attached to the same region throughout.
+            assert!(!received.got_bye());
+            stop_tx.send("test").unwrap();
+            wait_for("the bye", || received.got_bye()).await;
+        };
+        let (result, ()) = tokio::join!(daemon, driver);
+        result.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panic_ends_the_daemon_after_the_drivers_goodbye() {
+        static PANICKED: AtomicBool = AtomicBool::new(false);
+        let sup = Supervision { probe: Probe::System, panicked: &PANICKED };
+        let registry = MemRegistry::new();
+        let (_stop_tx, mut stop) = mpsc::unbounded_channel();
+        let daemon =
+            serve(app_config("127.0.0.1", 24840), None, service(&registry), sup, &mut stop);
+        let driver = async {
+            let (_client, received, w) = attach(&registry).await;
+            let (_mapped, view) = map(&w);
+            let d = view.daemon();
+            wait_for("the engine", || d.flags.load(Ordering::Acquire) & DAEMON_ENGINE_RUNNING != 0)
+                .await;
+            // What the panic hook does when any thread panics.
+            PANICKED.store(true, Ordering::SeqCst);
+            wait_for("the bye", || received.got_bye()).await;
+        };
+        let (result, ()) = tokio::join!(daemon, driver);
+        let e = result.unwrap_err();
+        assert!(e.to_string().contains("panicked"), "{e:#}");
     }
 
     /// Sends Dante Controller's latency write for `ns` to ARC on `port` and
@@ -850,7 +1060,7 @@ mod tests {
         cfg.device.latency_ms = 4.0;
         let registry = MemRegistry::new();
         let (stop_tx, mut stop) = mpsc::unbounded_channel();
-        let daemon = serve(cfg, None, service(&registry), &mut stop);
+        let daemon = serve(cfg, None, service(&registry), quiet(), &mut stop);
         let app = async {
             let (_client, received, w) = attach(&registry).await;
             let (_mapped, view) = map(&w);
@@ -915,15 +1125,15 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Without a state file the lock lives only in the running device, so
-    /// the restart for a new latency hands it on, with the list of
-    /// controllers' changes.
+    /// Without a state file the lock, the name and the subscriptions live
+    /// only in the running device, so the restart for a new latency hands
+    /// them on, with the list of controllers' changes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_device_restart_keeps_the_lock_and_the_remote_changes() {
         let cfg = app_config("127.0.0.1", 24866);
         assert!(cfg.device.state_file.is_none() && !cfg.device.lock_remote_settings);
         let region = HalRegion::create(VERSION).unwrap();
-        let engine = Engine::start(&cfg, &region).await.unwrap();
+        let engine = Engine::start(&cfg, &region, None).await.unwrap();
         engine.device.lock_remote_settings(true);
         let change = ovsc_core::RemoteChange {
             at: std::time::SystemTime::now(),
@@ -932,11 +1142,29 @@ mod tests {
             refused: true,
         };
         engine.device.remote_changes().push(change.clone());
+        engine.device.rename("stage-left").unwrap();
+        engine.device.subscribe(1, "01", "console").unwrap();
         engine.device.request_latency(2_000_000).unwrap();
         let engine = engine.restart_device(&cfg, &region).await.unwrap();
         assert_eq!(engine.device.info().latency_ns, 2_000_000);
         assert!(engine.device.remote_settings_locked());
         assert_eq!(engine.device.remote_changes().recent(), [change]);
+        assert_eq!(engine.device.name(), "stage-left");
+        let saved = engine.device.saved_state();
+        assert_eq!(saved.subscriptions.len(), 1);
+        assert_eq!(
+            (saved.subscriptions[0].tx_channel.as_str(), saved.subscriptions[0].tx_device.as_str()),
+            ("01", "console")
+        );
+
+        // A restart of the whole engine (a new address) carries them too.
+        let carry = Carry::from(&engine.device);
+        engine.shutdown().await;
+        let engine = Engine::start(&cfg, &region, Some(carry)).await.unwrap();
+        assert_eq!(engine.device.name(), "stage-left");
+        assert_eq!(engine.device.info().latency_ns, 2_000_000);
+        assert!(engine.device.remote_settings_locked());
+        assert_eq!(engine.device.saved_state().subscriptions.len(), 1);
         engine.shutdown().await;
     }
 
@@ -944,7 +1172,7 @@ mod tests {
     async fn the_engine_runs_on_the_regions_rings() {
         let cfg = app_config("127.0.0.1", 24810);
         let region = HalRegion::create(VERSION).unwrap();
-        let engine = Engine::start(&cfg, &region).await.unwrap();
+        let engine = Engine::start(&cfg, &region, None).await.unwrap();
         let audio = engine.device.audio();
         assert_eq!((audio.rx.len(), audio.tx.len()), (3, 2));
         // Samples cross between the device's rings and the region's, both
