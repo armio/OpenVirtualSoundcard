@@ -13,7 +13,7 @@ use ovsc_clock::MediaClock;
 use ovsc_proto::arc::SubscriptionStatus;
 use ovsc_proto::audio::{Sample, SampleFormat};
 
-use crate::buffer::TimedRing;
+use crate::buffer::{SWEEP_INTERVAL, Sweeper, TimedRing};
 use crate::config::DeviceConfig;
 use crate::control;
 use crate::directory::{Directory, ResolvedChannel, StaticDirectory};
@@ -42,6 +42,9 @@ pub struct Device {
     rx_threads: mpsc::Receiver<()>,
     tx_commands: std::sync::mpsc::Sender<TxCommand>,
     tx_thread: Option<std::thread::JoinHandle<()>>,
+    /// Forgets samples in the rings whose writer stopped, before their
+    /// 32-bit tags could match again (see [`Sweeper`]).
+    sweeper: Sweeper,
     /// Where the device saves its state; saved once more on shutdown.
     state_file: Option<std::path::PathBuf>,
 }
@@ -141,6 +144,12 @@ impl Device {
             options.rings,
             options.format_configurable,
         )?;
+        // Rings in a region shared with a driver outlive the device, so the
+        // sweeper's first pass, at once, also forgets what an earlier device
+        // left behind.
+        let rings = shared.rx_rings.iter().chain(&shared.tx_rings).cloned().collect();
+        let (clock, rate) = (shared.clock.clone(), shared.info.sample_rate);
+        let sweeper = Sweeper::spawn(rings, SWEEP_INTERVAL, move || clock.now_samples(rate))?;
 
         // Bind everything first so that port conflicts fail the start.
         let arc_socket = into_tokio(bind_udp(ip, ports.arc)?)?;
@@ -223,6 +232,7 @@ impl Device {
             rx_threads,
             tx_commands,
             tx_thread: Some(tx_thread),
+            sweeper,
             state_file: config.state_file,
         })
     }
@@ -426,8 +436,8 @@ impl Device {
         }
     }
 
-    /// Aborts the tasks, stops the transmit thread and mDNS, and returns the
-    /// aborted tasks' handles.
+    /// Aborts the tasks, stops the transmit thread, the ring sweeper and
+    /// mDNS, and returns the aborted tasks' handles.
     fn stop_now(&mut self) -> Vec<JoinHandle<()>> {
         for t in &self.tasks {
             t.abort();
@@ -436,6 +446,7 @@ impl Device {
         if let Some(t) = self.tx_thread.take() {
             let _ = t.join();
         }
+        self.sweeper.stop();
         if let Some(m) = &self.mdns {
             m.stop();
         }
@@ -623,5 +634,50 @@ impl AudioIo {
     /// Writes transmit channel `ch` at timestamps `ts..`.
     pub fn write_tx(&self, ch: usize, ts: u64, samples: &[Sample]) {
         self.tx[ch].write(ts, samples)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Channels, Ports};
+
+    /// A device's rings that held audio from before it started (rings in a
+    /// region shared with a driver outlive the device) are swept when it
+    /// starts: nothing written a day ago can come back when the 32-bit tags
+    /// match again.
+    #[tokio::test]
+    async fn a_device_sweeps_its_rings() {
+        let clock = ovsc_clock::system_clock();
+        let rate = 48_000;
+        let ring = || Arc::new(TimedRing::new(crate::buffer::DEFAULT_CAPACITY));
+        let rings = ExternalRings { rx: vec![ring(), ring()], tx: vec![ring(), ring()] };
+        let day_ago = clock.now_samples(rate).unwrap() - u64::from(rate) * 86_400;
+        for r in rings.rx.iter().chain(&rings.tx) {
+            r.write(day_ago, &[0x7fff_ff00; 64]);
+        }
+        let config = DeviceConfig {
+            name: "sweep-dev".into(),
+            interface: "127.0.0.1".into(),
+            sample_rate: rate,
+            tx_channels: Channels::Count(2),
+            rx_channels: Channels::Count(2),
+            ports: Ports { arc: 25130, cmc: 25131, flow_control: 25132, settings: 25133 },
+            discovery: false,
+            process_id: 41,
+            ..Default::default()
+        };
+        let options = StartOptions { rings: Some(rings.clone()), ..Default::default() };
+        let device = Device::start_with_options(config, clock, options).await.unwrap();
+        let all = || rings.rx.iter().chain(&rings.tx);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while all().any(|r| r.read_one(day_ago).is_some()) {
+            assert!(tokio::time::Instant::now() < deadline, "rings not swept");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(all().all(|r| r.read_one(day_ago + 63).is_none()));
+        // Shutting down stops the sweeper, which then holds no ring.
+        device.shutdown().await;
+        assert!(all().all(|r| Arc::strong_count(r) == 1), "only the test holds the rings");
     }
 }
