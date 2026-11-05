@@ -402,8 +402,10 @@ These rest on code reading, Linux tests and simulation, not on hardware:
 * The interface watcher on macOS (a USB adapter re-attached, DHCP renewing
   a 169.254 address), the log rotation, and `F_FULLFSYNC` on the state file.
 * The driver's gate fades in Core Audio on a Mac.
-* The end-to-end macOS test (`ci/macos/e2e.sh`) has not been run on these
-  changes yet.
+* The macOS end-to-end test (`ci/macos/e2e-local.sh`, every scenario against
+  the real Core Audio device and a test PTP master on the same Mac) passed on
+  an M1 Mac with macOS 26.6. That covers the driver, the daemon and Core
+  Audio on one machine, not a Dante network.
 
 ## The sound-card bridge is not for live use
 
