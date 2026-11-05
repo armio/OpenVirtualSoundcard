@@ -5,6 +5,7 @@ mod config;
 mod control;
 mod coreaudio;
 mod generic;
+mod logfile;
 mod netwatch;
 mod supervise;
 
@@ -139,6 +140,10 @@ struct RunArgs {
     /// Output file of the `record` backend.
     #[arg(long)]
     record_path: Option<PathBuf>,
+    /// Log to this file instead of the standard output, reopening it
+    /// whenever it was rotated (renamed or removed), as by newsyslog.
+    #[arg(long, env = "OVSC_LOG_FILE")]
+    log_file: Option<PathBuf>,
 }
 
 fn parse_clock(s: &str) -> Result<ClockSource, String> {
@@ -159,7 +164,18 @@ fn parse_backend(s: &str) -> Result<BackendKind, String> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    if matches!(cli.command, Command::Run(_)) {
+    if let Command::Run(args) = &cli.command {
+        if let Some(path) = &args.log_file {
+            match logfile::LogFile::stdout_and_stderr(path) {
+                Ok(log) => {
+                    tokio::spawn(log.keep());
+                }
+                Err(e) => eprintln!(
+                    "ovsc: cannot log to {}: {e}; logging to the standard output",
+                    path.display()
+                ),
+            }
+        }
         // The daemon restarts rather than run on with a dead part.
         supervise::install_panic_hook();
     }
@@ -594,6 +610,13 @@ mod tests {
         assert_eq!(args.backend, Some(BackendKind::CoreAudio));
         assert_eq!(args.clock, Some(ClockSource::Free));
         assert!(Cli::try_parse_from(["ovsc", "run", "--clock", "wall"]).is_err());
+    }
+
+    #[test]
+    fn run_takes_a_log_file() {
+        let cli = Cli::try_parse_from(["ovsc", "run", "--log-file", "/tmp/ovsc.log"]).unwrap();
+        let Command::Run(args) = cli.command else { panic!("not run") };
+        assert_eq!(args.log_file, Some(PathBuf::from("/tmp/ovsc.log")));
     }
 
     #[cfg(not(target_os = "macos"))]
