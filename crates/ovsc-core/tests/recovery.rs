@@ -412,9 +412,30 @@ async fn dead_flows_to_one_transmitter_are_stopped_together() {
         let stop = l.iter().position(|&(what, h, _)| what == "stop" && h == old);
         assert!(stop.is_some_and(|s| s < again), "flow {old} not stopped first: {l:?}");
     }
-    let first_stop = l.iter().find(|&&(what, _, _)| what == "stop").unwrap().2;
-    let waited = l[again].2 - first_stop;
-    assert!(waited < Duration::from_millis(2000), "requested again {waited:?} after the stops");
+    // The flows die 3 s after they were granted, a millisecond apart, so
+    // the once-a-second check can find one dead a tick before the others.
+    // Flows found dead together are stopped together: at most two batches
+    // for three flows, and the flows are requested again within about the
+    // 1 s an unanswered stop takes after the last batch. Stopping them one
+    // by one would space the first stops of all three 1 s apart.
+    let first_stops: Vec<Instant> = (1..=3)
+        .map(|old| l.iter().find(|&&(what, h, _)| what == "stop" && h == old).unwrap().2)
+        .collect();
+    let together = (0..3).any(|a| {
+        (0..3).any(|b| {
+            a != b
+                && first_stops[a].max(first_stops[b]) - first_stops[a].min(first_stops[b])
+                    < Duration::from_millis(100)
+        })
+    });
+    let at: Vec<(&str, u8, Duration)> = l.iter().map(|&(w, h, t)| (w, h, t - l[0].2)).collect();
+    assert!(together, "the stops were not sent together: {at:?}");
+    let last_batch = *first_stops.iter().max().unwrap();
+    let waited = l[again].2 - last_batch;
+    assert!(
+        waited < Duration::from_millis(1600),
+        "requested again {waited:?} after the last stops: {at:?}"
+    );
     rx.shutdown().await;
     server.abort();
 }

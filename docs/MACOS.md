@@ -161,6 +161,46 @@ address, the daemon keeps running and retries every few seconds (2 s, backing
 off to 5 s), logging `cannot start the engine: ...; retrying until it
 starts`. The device stays present and silent meanwhile.
 
+### The device name
+
+Dante Controller lists devices by name, and subscriptions find their
+transmitters by name (`<channel>@<device>`), so every device on the network
+needs a name of its own.
+
+* The installer names the device after the Mac (`scutil --get
+  LocalHostName`, which macOS keeps unique on the network). With
+  `name = ""` the device is called `ovsc-` and the last six hex digits of
+  the Dante interface's MAC address, such as `ovsc-5279b6` (with
+  `-<process_id>` for a second device on one Mac). Neither changes when the
+  IP address does. A name set from Dante Controller or the app is saved in
+  `state.toml` and wins over the configuration.
+* The device's service records point at the host name `<default
+  name>.local` (`ovsc-5279b6.local`), as Dante hardware points at its
+  factory name, so a device named after the Mac does not clash with the
+  Mac's own `<name>.local`.
+* When the device starts, and when it is renamed, it first asks the network
+  whether another device has the name (mDNS probing, RFC 6762 §8.1); this
+  takes about a second before the device appears. If one answers, the
+  device takes `<name>-2` (or `-3`, ...), saves it like a rename, and logs
+  an error: `the device at <address> already uses the name <name>: this
+  device takes the name <name>-2`. The device that had the name keeps it,
+  and neither changes name at its next start. Receivers' subscriptions to
+  `<name>` reach the device that kept it: re-patch the ones meant for this
+  one before the show.
+* If another device starts announcing the name while this one runs (one
+  that does not probe, or two devices started at the same instant), this
+  device keeps its name, since renaming it mid-show would break every
+  subscription to it. It logs `the device at <address> also announces
+  <name>...: Rename one of them.`, announces its records again, and keeps
+  reporting the conflict until the other device withdraws the name or its
+  records expire. Meanwhile a subscription on this device to
+  `<channel>@<name>` that is made (or that reconnects) goes to the other
+  device if that one has the channel, rather than looping back to this one,
+  and logs a warning. Subscriptions already receiving stay where they are.
+* A Mac cloned from another one's disk has the same `ovsc.toml` and
+  `state.toml`, so the same device name. Rename one of the two (Dante
+  Controller or the app) before putting both on one network.
+
 ### Ports and other Dante software
 
 Audinate's ConMon service (`conmon_cm`), installed with Dante Controller,

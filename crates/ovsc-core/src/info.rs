@@ -68,8 +68,21 @@ impl DeviceInfo {
                 id
             }
         };
-        let factory_name =
-            format!("ovsc-{}", hex::encode(&device_id[2..])).chars().take(31).collect();
+        // The name the device has until someone names it, and its mDNS host
+        // name. It must not change with the IP address, as the device id
+        // does: controllers' subscriptions to the device go by name. So, as
+        // Dante hardware does, it ends in the last three bytes of the
+        // interface's MAC address, which tell computers apart, and the
+        // process id when there are several devices on one computer. Without
+        // a MAC address (loopback), the device id stands in.
+        let factory_name = if iface.mac != [0; 6] {
+            match config.process_id {
+                0 => format!("ovsc-{}", hex::encode(&iface.mac[3..])),
+                p => format!("ovsc-{}-{p}", hex::encode(&iface.mac[3..])),
+            }
+        } else {
+            format!("ovsc-{}", hex::encode(&device_id[2..]))
+        };
         let format = SampleFormat::from_bits(config.bits_per_sample as u32)
             .ok_or_else(|| Error::Config("bits_per_sample".into()))?;
         let version = [

@@ -810,6 +810,10 @@ impl RxManager {
                         self.lookup(k, channel, device);
                         continue;
                     }
+                    if self.foreign_possible() {
+                        self.lookup_self(k, channel, device);
+                        continue;
+                    }
                     match self.resolve_self(&channel) {
                         Ok(r) => r,
                         Err(e) => {
@@ -841,6 +845,43 @@ impl RxManager {
         for control in idle {
             self.dispatch(control, Vec::new(), Vec::new());
         }
+    }
+
+    /// Whether another device may use our name: a static directory may list
+    /// one, and mDNS knows of one only while it reports a name conflict.
+    fn foreign_possible(&self) -> bool {
+        match &self.directory {
+            Directory::Mdns(m) => m.has_conflicts(),
+            Directory::Static(_) => true,
+        }
+    }
+
+    /// Starts looking up `channel@device`, where `device` is our own name:
+    /// our own channel, unless another device uses our name too and has it.
+    /// That is a name conflict, logged and reported while it lasts. A
+    /// subscription then can't tell the two devices apart, and looping it
+    /// back here would hide that the other device was the one meant.
+    fn lookup_self(&mut self, k: Key, channel: String, device: String) {
+        let ours = self.resolve_self(&channel);
+        let directory = self.directory.clone();
+        let us = (self.shared.info.iface.ip, self.shared.info.ports.flow_control);
+        let key = k.clone();
+        let job = self.jobs.spawn(async move {
+            let result = match foreign_channel(&directory, &channel, &device, us).await {
+                Some(theirs) => {
+                    warn!(
+                        "subscribing to {channel}@{device} at {}, another device named like \
+                         this one",
+                        theirs.addr
+                    );
+                    Ok(theirs)
+                }
+                None => ours,
+            };
+            Done::Lookup { key, result }
+        });
+        self.resolving.insert(k.clone());
+        self.job_info.insert(job.id(), Job::Lookup(k));
     }
 
     /// Starts looking up `channel@device`, subscribed as `k`.
@@ -1367,7 +1408,8 @@ impl RxManager {
         txt.nchan.max(1).min(self.shared.info.max_channels_per_rx_flow) as usize
     }
 
-    /// Describes one of our own transmit channels, for self-subscriptions.
+    /// Describes one of our own transmit channels, for self-subscriptions
+    /// (see [`foreign_channel`]).
     fn resolve_self(&self, channel: &str) -> Result<ResolvedChannel> {
         let info = &self.shared.info;
         let state = self.shared.state();
@@ -1493,6 +1535,27 @@ async fn request_job(
         }
     }
     Done::Request { control: tx, grows: grown, creates: created }
+}
+
+/// How long a subscription to our own name asks mDNS for another device
+/// that has the name too, while one is known to (see [`foreign_channel`]).
+const FOREIGN_LOOKUP: Duration = Duration::from_secs(1);
+
+/// The transmit channel `channel@device`, where `device` is our own name, of
+/// another device that has the name too, if there is one: an mDNS name
+/// conflict, or an entry of a static directory that isn't ours (`us`: our
+/// address and flow-control port).
+async fn foreign_channel(
+    directory: &Directory,
+    channel: &str,
+    device: &str,
+    us: (Ipv4Addr, u16),
+) -> Option<ResolvedChannel> {
+    match directory {
+        Directory::Mdns(m) => m.resolve_foreign_channel(channel, device, FOREIGN_LOOKUP).await,
+        Directory::Static(s) => s.get(channel, device),
+    }
+    .filter(|r| (r.addr, r.flow_control_port) != us)
 }
 
 /// Binds a receive socket in the unicast port range real receivers report
@@ -2229,6 +2292,7 @@ mod tests {
                 rx_flows: Vec::new(),
                 rx_flow_stats: Vec::new(),
                 latency_override_ns: None,
+                name_conflict: None,
             };
             let clock = ovsc_clock::system_clock();
             let ring_capacity = crate::buffer::DEFAULT_CAPACITY;

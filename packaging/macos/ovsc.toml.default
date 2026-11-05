@@ -12,7 +12,9 @@
 
 [device]
 # Name shown in Dante Controller: 1-31 of A-Z a-z 0-9 and inner hyphens.
-name = "ovsc"
+# Two devices must not share one. The installer names the device after this
+# Mac. Empty: "ovsc-" and the end of the interface's MAC address.
+name = ""
 # Network interface name (en0) or IPv4 address. Empty: the interface of the
 # default route, which may be Wi-Fi; name the Dante interface if so.
 interface = ""

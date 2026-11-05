@@ -813,6 +813,7 @@ mod tests {
             rx_flows: Vec::new(),
             rx_flow_stats: Vec::new(),
             latency_override_ns: None,
+            name_conflict: None,
         };
         // One fixed mapping from the monotonic clock, so that the transmit
         // thread and a test reading the time agree exactly (the system
