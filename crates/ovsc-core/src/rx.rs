@@ -41,7 +41,7 @@ use tokio::task::{JoinError, JoinSet};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
-use ovsc_clock::{MediaClock, local_now_ns};
+use ovsc_clock::{MediaClock, local_now_ns, ns_to_samples};
 use ovsc_proto::arc::{RxFlowInfo, SubscriptionStatus};
 use ovsc_proto::audio::{self, AudioPacket, Sample, SampleFormat};
 use ovsc_proto::dbcp::{self, FlowHandle, FlowRequest};
@@ -86,6 +86,14 @@ const DEGRADED_HOLD: Duration = Duration::from_secs(5);
 /// A receive thread that follows one source port of its transmitter moves to
 /// another only after the first has been quiet this long.
 const SOURCE_HOLD_NS: u64 = KEEPALIVE_INTERVAL.as_nanos() as u64;
+/// How long packets the transmitter sent before a slot switched to another
+/// transmit channel may matter. They are stamped at most the flow's latency
+/// plus the network's delay before the switch, far less than this. A slot
+/// holds back packets stamped up to this much before its switch, and the
+/// manager forgets the switch this long after it: a media clock that steps
+/// back (a new leader whose time is behind) must not keep the slot silent
+/// until media time reaches the switch again.
+const FRESH_HOLD: Duration = Duration::from_secs(1);
 
 /// Subscription statuses without a variant of their own (PROTOCOL.md
 /// §4.14).
@@ -175,9 +183,12 @@ fn is_local(e: &std::io::Error) -> bool {
 struct Routes {
     /// Slot → local receive channels fed by that slot.
     slots: Vec<Vec<usize>>,
-    /// Per slot, the earliest packet timestamp it may write. A slot that
-    /// just took another transmit channel still carries the previous one in
-    /// packets the transmitter sent before it switched.
+    /// Per slot, the media time it switched to another transmit channel, 0
+    /// if not recently. A slot that just took another transmit channel
+    /// still carries the previous one in packets the transmitter sent before
+    /// it switched: packets stamped up to [`FRESH_HOLD`] before this time
+    /// are not written. The manager sets it back to 0 [`FRESH_HOLD`] after
+    /// the switch.
     fresh_from: Vec<u64>,
 }
 
@@ -214,6 +225,9 @@ struct RxFlow {
     /// What the receive thread reads, and the table last stored in it.
     routing: Routing,
     routes: Arc<Routes>,
+    /// Per slot, when it switched to another transmit channel, until the
+    /// manager resets its [`Routes::fresh_from`].
+    switched_at: Vec<Option<Instant>>,
     /// The subscription each routed local channel was routed for.
     spelled: HashMap<usize, Key>,
     /// Slots a request in flight is changing.
@@ -1172,6 +1186,7 @@ impl RxManager {
 
     fn grown(&mut self, grows: Vec<(Grow, Result<()>)>) {
         let media_now = self.shared.clock.now_samples(self.shared.info.sample_rate).unwrap_or(0);
+        let now = Instant::now();
         for (g, result) in grows {
             let Some(f) = self.flows.iter().position(|f| f.id == g.flow && f.handle == g.handle)
             else {
@@ -1189,8 +1204,10 @@ impl RxManager {
                         routes.slots[p.slot] = chans.clone();
                         // The transmitter has switched by the time it
                         // answers: from now on the slot carries the new
-                        // channel.
+                        // channel. `housekeeping` forgets the switch once
+                        // its packets from before can no longer arrive.
                         routes.fresh_from[p.slot] = media_now;
+                        flow.switched_at[p.slot] = Some(now);
                         flow.slot_names[p.slot] = p.resolved.channel.clone();
                         for ch in chans {
                             flow.spelled.insert(ch, p.key.clone());
@@ -1322,6 +1339,7 @@ impl RxManager {
             bits: request.bits_per_sample as u16,
             routing,
             routes,
+            switched_at: vec![None; slots],
             spelled,
             changing: HashSet::new(),
             grow_refused: false,
@@ -1370,9 +1388,27 @@ impl RxManager {
         changed
     }
 
-    /// Clears the rings of channels that lost their route, forgets old
-    /// routing tables, and looks at the flows' problem counters.
+    /// Clears the rings of channels that lost their route, forgets slot
+    /// switches and old routing tables, and looks at the flows' problem
+    /// counters.
     fn housekeeping(&mut self, now: Instant) {
+        // Packets from before a slot's switch have arrived by now (see
+        // FRESH_HOLD): let the slot write whatever it is sent, so that a
+        // media clock that steps back later cannot silence it.
+        let Self { flows, retired, .. } = self;
+        for flow in flows.iter_mut() {
+            let mut routes = None;
+            for (slot, at) in flow.switched_at.iter_mut().enumerate() {
+                if at.is_some_and(|t| now.duration_since(t) >= FRESH_HOLD) {
+                    *at = None;
+                    routes.get_or_insert_with(|| (*flow.routes).clone()).fresh_from[slot] = 0;
+                }
+            }
+            if let Some(routes) = routes {
+                flow.set_routes(routes, retired);
+            }
+        }
+
         let routed: HashSet<usize> =
             self.flows.iter().flat_map(|f| f.routes.slots.iter().flatten().copied()).collect();
         for &ch in self.routed.difference(&routed) {
@@ -1766,6 +1802,8 @@ struct Receiver {
     rings: Vec<Arc<TimedRing>>,
     probes: Probes,
     samples: Vec<Sample>,
+    /// [`FRESH_HOLD`] in samples.
+    fresh_hold: u64,
     /// Where the transmitter sends the flow from, once known.
     source: Option<SocketAddr>,
     /// Local time of the last packet accepted from `source`.
@@ -1789,6 +1827,7 @@ impl Receiver {
             // Room for any packet that fits the receive buffer: a
             // transmitter may send another fpp than the one asked for.
             samples: vec![0; max_frames(&params)],
+            fresh_hold: ns_to_samples(FRESH_HOLD.as_nanos() as u64, params.sample_rate),
             source: None,
             source_ns: 0,
             expected: None,
@@ -1838,7 +1877,12 @@ impl Receiver {
         }
         let routes = self.routing.load();
         for (slot, targets) in routes.slots.iter().enumerate().take(p.slots) {
-            if targets.is_empty() || ts < routes.fresh_from.get(slot).copied().unwrap_or(0) {
+            // Held back: stamped shortly before the slot switched, so it may
+            // carry the previous channel. One stamped longer before is our
+            // timeline that stepped back, and plays.
+            let switched = routes.fresh_from.get(slot).copied().unwrap_or(0);
+            let before_switch = ts < switched && switched - ts <= self.fresh_hold;
+            if targets.is_empty() || before_switch {
                 continue;
             }
             let n = packet.read_channel(slot, &mut self.samples);
@@ -2233,6 +2277,53 @@ mod tests {
         assert_eq!(t.rings[0].read_one(switch), Some(20 << 8));
     }
 
+    /// Only packets stamped shortly before a slot's switch are held back.
+    /// When the media clock steps back further (a new leader whose time is
+    /// behind), the slot plays at once rather than staying silent until
+    /// media time reaches the switch again, hours later.
+    #[test]
+    fn a_switched_slot_plays_after_the_clock_steps_back() {
+        use ovsc_clock::ClockSnapshot;
+        let hours = |h: u64| h * 3600 * 1_000_000_000;
+        let (clock, writer) = MediaClock::new();
+        let set = |media_ns: u64| {
+            writer.publish(ClockSnapshot {
+                local_ref_ns: local_now_ns(),
+                media_ref_ns: media_ns,
+                rate: 1.0,
+            })
+        };
+        let mut t = test_rx(2, 12, 0);
+        t.clock = clock;
+        let src = from(TX, 5000);
+        // Ten hours into the leader's timeline, slot 1 takes another
+        // channel.
+        set(hours(10));
+        let switch = t.now();
+        t.routing
+            .store(Arc::new(Routes { slots: vec![vec![0], vec![1]], fresh_from: vec![0, switch] }));
+        // Up to a second before the switch, a packet may carry the previous
+        // channel.
+        assert_eq!(t.rx.fresh_hold, u64::from(RATE));
+        let old = switch - t.rx.fresh_hold;
+        t.send(src, 1, old, 10);
+        assert_eq!(t.rings[0].read_one(old), Some(10 << 8));
+        assert_eq!(t.rings[1].read_one(old), None);
+        let late = get(&t.stats.late_packets);
+
+        // A leader three hours behind takes over: our clock and the
+        // transmitter's step back together.
+        set(hours(7));
+        let start = t.now();
+        for i in 0..100u64 {
+            let ts = start + i * 12;
+            t.send(src, 2 + i, ts, 20);
+            assert_eq!(t.rings[0].read_one(ts), Some(20 << 8), "packet {i}");
+            assert_eq!(t.rings[1].read_one(ts), Some(21 << 8), "packet {i}");
+        }
+        assert_eq!(get(&t.stats.late_packets), late);
+    }
+
     /// The receive thread never logs, however much goes wrong: it counts,
     /// and the manager reports at most every few seconds.
     #[test]
@@ -2444,6 +2535,51 @@ mod tests {
             assert!(!Arc::ptr_eq(&table, &mgr.flows[0].routing.load_full()));
             // The table the thread may still be reading is kept for a while.
             assert!(mgr.retired.iter().any(|(_, t)| Arc::ptr_eq(t, &table)));
+            mgr.stop_all().await;
+            tx.shutdown().await;
+        }
+
+        /// A slot that took another channel holds back packets from before
+        /// the switch only for a while: then the manager hands the receive
+        /// thread a table without the switch, so that a media clock that
+        /// steps back later cannot silence the slot.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_slot_forgets_its_switch_after_a_while() {
+            let tx =
+                Device::start(config("fresh-tx", 24740), ovsc_clock::system_clock()).await.unwrap();
+            let directory = StaticDirectory::new();
+            for entry in tx.directory_entries() {
+                directory.insert(entry);
+            }
+            let rx_config = config("fresh-rx", 24750);
+            let mut mgr = manager(&rx_config, Interface::find("127.0.0.1").unwrap(), directory);
+            subscribe(&mgr, 0, "01", "fresh-tx");
+            drive(&mut mgr, |m| m.flows.len() == 1 && m.flows[0].routes.feeds(0)).await;
+            // What the flow came with needs no holding back.
+            assert!(mgr.flows[0].routes.fresh_from.iter().all(|&f| f == 0));
+            assert!(mgr.flows[0].switched_at.iter().all(Option::is_none));
+
+            // A second channel in a free slot of the flow.
+            subscribe(&mgr, 1, "02", "fresh-tx");
+            drive(&mut mgr, |m| m.flows[0].routes.feeds(1)).await;
+            let flow = &mgr.flows[0];
+            let at = flow.switched_at[1].expect("slot 1 switched");
+            assert!(flow.routes.fresh_from[1] > 0);
+            let table = flow.routing.load_full();
+            mgr.housekeeping(at + FRESH_HOLD - Duration::from_millis(1));
+            assert!(Arc::ptr_eq(&table, &mgr.flows[0].routing.load_full()));
+
+            mgr.housekeeping(at + FRESH_HOLD);
+            let flow = &mgr.flows[0];
+            let now = flow.routing.load_full();
+            assert!(!Arc::ptr_eq(&table, &now), "a new table");
+            assert!(Arc::ptr_eq(&flow.routes, &now));
+            assert!(now.fresh_from.iter().all(|&f| f == 0), "{:?}", now.fresh_from);
+            assert_eq!(now.slots, table.slots);
+            assert!(flow.switched_at.iter().all(Option::is_none));
+            // Once.
+            mgr.housekeeping(at + FRESH_HOLD * 2);
+            assert!(Arc::ptr_eq(&now, &mgr.flows[0].routing.load_full()));
             mgr.stop_all().await;
             tx.shutdown().await;
         }
