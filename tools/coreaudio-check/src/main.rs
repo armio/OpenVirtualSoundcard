@@ -16,7 +16,8 @@
 //! coreaudio-check loopback <uid> [--seconds N] [--rate HZ] [--buffer FRAMES]
 //!                 [--channels N] [--max-bad N] [--max-slips N] [--max-jumps N]
 //!                 [--expect-device-delay D] [--expect-rate-ppm X] [--rate-tol-ppm T]
-//!                 [--allow-outage SECS] [--expect-silent-input] [--snapshot-prop FOURCC]
+//!                 [--allow-outage SECS] [--allow-missing N] [--expect-silent-input]
+//!                 [--snapshot-prop FOURCC]
 //! ```
 //!
 //! `loopback` plays a distinct pseudo-random signal on each output channel

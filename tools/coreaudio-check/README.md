@@ -18,7 +18,7 @@ coreaudio-check walk <uid>                 # every object and property must be s
 coreaudio-check loopback <uid> [--seconds N] [--rate HZ] [--buffer FRAMES] [--channels N]
                 [--max-bad N] [--max-slips N] [--max-jumps N] [--expect-device-delay D]
                 [--expect-rate-ppm X] [--rate-tol-ppm T] [--allow-outage SECS]
-                [--expect-silent-input] [--snapshot-prop FOURCC]
+                [--allow-missing N] [--expect-silent-input] [--snapshot-prop FOURCC]
 ```
 
 `loopback` plays a different pseudo-random signal on each output channel and
@@ -36,10 +36,20 @@ is meant for scripts.
 It exits 0 only if every channel locked and stayed within `--max-bad` and
 `--max-slips` (both 0 by default). When Core Audio itself skips IO (an
 overload, visible as a jump in the device's timeline, common on loaded CI
-machines) it also allows 4 IO buffers of bad frames and 2 slips per jump,
-for at most `--max-jumps` jumps (3 by default). `--allow-outage SECS`
-accepts one run of bad frames up to that long (a daemon restart, say);
-`--expect-silent-input` instead requires the inputs to be exactly silent.
+machines) it also allows 4 IO buffers of bad frames per jump, for at most
+`--max-jumps` jumps (3 by default). A skip changes the delay in captured
+frames up to three times without moving any frame in device time, and
+where Core Audio wrote no output the device plays what its IO buffer held
+a lap earlier, whole zero time stamp periods late: none of that is a slip
+or a misplaced frame. A slip is any other change of the device-time delay,
+and with `--expect-device-delay` every other frame must come back at that
+device delay. `--allow-outage SECS` accepts one run of bad frames up to
+that long (a daemon restart, say) and two more slips. `--allow-missing N`
+accepts N more bad frames per channel if every bad frame is silence and the
+device counted at least as many input frames missing over the run
+(OpenVirtualSoundcard's `in_missing`, read before and after): input that
+arrived too late, by the device's own count. `--expect-silent-input`
+instead requires the inputs to be exactly silent.
 
 `check` prints the properties a host relies on (rates, channel counts,
 latencies and safety offsets, buffer size range, element names) and exits 1

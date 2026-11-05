@@ -1227,8 +1227,8 @@ and the device is always selected by its UID.
 | S1 | Load | `coreaudio-check wait org.openvirtualsoundcard.vsc 60`; the helper process runs; the daemon logged `hal: plug-in attached`. |
 | S2 | Properties | `check --rate 48000 --inputs 8 --outputs 8 --zts-period 16384 --input-safety 216 --output-safety 55 --output-latency 192 --clock-algorithm raww --element-names 01,02,03,04,05,06,07,08`, then `walk` finds every property consistent. |
 | S3 | Self-test | `sudo target/release/ovsc-hal-selftest --clock-timeout 60` passes: welcome, region size and header, heartbeat, clock, engine, and a TX pattern back on RX through the daemon alone, without Core Audio. |
-| S4 | Network clock, bit-exact loop | `wait-status ... clock=following 60`; the status's `ppm` within 2 of +50 for 8 s running, within 120 s; then a 20 s `loopback` on 8 channels with a 512-frame buffer: every channel bit-exact at device delay 0, rate +50 ± 3 ppm; `absorbs`, `seed`, `late_out`, `early_in`, `far_out`, `far_in` and `tx_underruns` unchanged between the 25 % and 75 % snapshots; no `coreaudiod` re-anchoring lines. Prints the io_trace. |
-| S5 | Buffer sizes | 5 s loopbacks at 32, 128, 1024 and 4096 frames, device delay 0. At 32 and 128 frames, up to 2400 frames and 20 slips per channel may be lost to the runner's scheduling stalls. |
+| S4 | Network clock, bit-exact loop | `wait-status ... clock=following 60`; the status's `ppm` within 2 of +50 for 8 s running, within 120 s; then a 20 s `loopback` on 8 channels with a 512-frame buffer: every channel bit-exact at device delay 0, rate +50 ± 3 ppm; `absorbs`, `seed`, `late_out`, `early_in`, `far_out`, `far_in` and `tx_underruns` unchanged between the 25 % and 75 % snapshots, except that each Core Audio skip the loopback saw may add one `late_out` and the `tx_underruns` of the frames it skipped; no `coreaudiod` re-anchoring lines. Prints the io_trace. On GitHub's hosted runners, whose VM can stall the daemon past the 4 ms latency, up to 2400 frames per channel may be lost, only as silence the driver counted as missing input (`in_missing`). |
+| S5 | Buffer sizes | 5 s loopbacks at 32, 128, 1024 and 4096 frames, device delay 0, no slip. At 32 and 128 frames, up to 2400 frames per channel may be lost to the runner's scheduling stalls, and Core Audio may skip 10 and 3 IO cycles; on GitHub's hosted runners, which make it skip at those sizes whatever the device does, one cycle in 20 (375 and 93). |
 | S6 | Daemon restart under IO | 40 s loopback; `sudo launchctl kickstart -k system/org.openvirtualsoundcard.daemon` at 10 s. One outage of at most 15 s, then bit-exact again at device delay 0, allowing two Core Audio overload skips and 2400 more frames lost to stalls; no timeline jump: `seed` unchanged and no `coreaudiod` re-anchoring lines; `attach` + 1. |
 | S7 | Core Audio restart | `sudo killall coreaudiod`; the device returns within 60 s, a new driver instance attaches, a 10 s loopback passes (480 frames may be lost to stalls), the rate is still 48000. |
 | S8 | Channel change | Install `e2e-4ch.toml` and restart the daemon: 4 × 4 within 30 s without a `coreaudiod` restart; once the gate is open again, a 5 s loopback (480 frames may be lost to stalls). |
@@ -1241,9 +1241,12 @@ outlast the 4 ms network latency or a Core Audio cycle; the daemon then logs
 late packets and the driver `late_out`, or Core Audio skips IO. The loss
 allowances above cover only that, around daemon and Core Audio restarts and
 at tiny buffers. Audio that arrives must always be at device delay 0; the one
-exception is data exactly a zero time stamp period old while Core Audio skips
-IO, which is its own IO buffer left from an earlier lap, not a misplaced
-ring. On real hardware none of this should happen.
+exception is data whole zero time stamp periods old that the device played
+where Core Audio skipped IO and wrote no output, which is its own IO buffer
+left from an earlier lap, not a misplaced ring. A skip also changes the
+delay in captured frames, up to three times, without moving any frame in
+device time: `coreaudio-check` does not count those changes as slips. On
+real hardware none of this should happen.
 
 Each scenario prints PASS or FAIL in its own `::group::`, and the last line is
 `E2E-SUMMARY os=<version> arch=<arch> S1=PASS ...`. The `e2e` job runs only

@@ -35,8 +35,18 @@ RATE_PPM=50
 # logs late packets, the driver late_out, and Core Audio skips IO. Where a
 # scenario restarts the daemon or runs tiny buffers, it may lose this many
 # frames per channel to that (10 ms at 48 kHz). S4's steady state may lose
-# none, and audio that does arrive must always be in its place.
+# none on a Mac of your own, and audio that does arrive must always be in
+# its place.
 STALL_FRAMES=480
+# GitHub's hosted runners (RUNNER_ENVIRONMENT=github-hosted) stall in two
+# ways that real hardware does not, and S4 and S5 allow for them there only,
+# so a Mac of your own (e2e-local.sh) is held to what real hardware meets:
+# the VM can stall the daemon past the network latency in S4's steady state
+# (silence the driver counts as missing input), and Core Audio skips IO
+# cycles at 32- and 128-frame buffers whatever the device does (40 to 72
+# skips in 5 s at 32 frames, up to 10 at 128).
+HOSTED=0
+[ "${RUNNER_ENVIRONMENT:-}" = github-hosted ] && HOSTED=1
 mkdir -p "$WORK"
 
 SCENARIOS=("$@")
@@ -95,12 +105,26 @@ wait_rate_settled() {
 # The coreaudio-check snapshot lines of a run log, by label.
 snapshot_line() { sed -n "s/^snapshot $2 'ovst': //p" "$1" | tail -1; }
 
-# Fails if any of the counters moved between two status lines.
+# same_counters A B [JUMPS SKIPPED]: fails if any of the counters moved
+# between two status lines. Two of them also count Core Audio's own
+# lateness, and may move as far as the skips a loopback saw explain (JUMPS
+# skips, SKIPPED frames in all): late_out by the one cycle written late as
+# Core Audio fell behind, per skip, and tx_underruns by the packets without
+# the audio it never wrote, at most one per frame skipped and one per skip.
 same_counters() {
-    local a=$1 b=$2 ok=0 k
+    local a=$1 b=$2 jumps=${3:-0} skipped=${4:-0} ok=0 k x y max
     for k in absorbs seed late_out early_in far_out far_in tx_underruns; do
-        if [ "$(kv "$a" "$k")" != "$(kv "$b" "$k")" ]; then
-            echo "counter $k changed: $(kv "$a" "$k") -> $(kv "$b" "$k")"
+        x=$(kv "$a" "$k") y=$(kv "$b" "$k")
+        [ "$x" = "$y" ] && continue
+        case $k in
+            late_out) max=$jumps ;;
+            tx_underruns) max=$((skipped + jumps)) ;;
+            *) max=0 ;;
+        esac
+        if [ -n "$x" ] && [ -n "$y" ] && [ "$y" -gt "$x" ] && [ $((y - x)) -le "$max" ]; then
+            echo "counter $k changed: $x -> $y, as Core Audio skipped $skipped frames in $jumps skips"
+        else
+            echo "counter $k changed: $x -> $y"
             ok=1
         fi
     done
@@ -112,13 +136,14 @@ loopback() {
     local name=$1; shift
     limit 180 "$CHECK" loopback "$DEV" "$@" >"$WORK/$name.log" 2>&1
     local rc=$?
-    grep -vE '^(cycle [0-9]|input stream|output stream)' "$WORK/$name.log" | tail -40
+    grep -vE '^(cycle [0-9]|input stream|output stream)' "$WORK/$name.log" | tail -60
     return "$rc"
 }
 
 setup() {
     group "Setup: system"
     sw_vers; uname -m; csrutil status
+    echo "runner: ${RUNNER_ENVIRONMENT:-none} (hosted limits: $HOSTED)"
     echo "coreaudiod pid $(coreaudiod_pid)"
     endgroup
 
@@ -175,16 +200,22 @@ s3() {
 s4() {
     limit 70 "$CHECK" wait-status "$DEV" clock=following 60 || return 1
     wait_rate_settled 120 2 || return 1
-    local t0 rc a b
+    local t0 rc a b res missing=0
+    # On the hosted runners the VM can stall the daemon past the 4 ms
+    # latency: the driver then reads silence where the input has not
+    # arrived, and counts it (in_missing). There S4 may lose 50 ms per
+    # channel to that, as silence the device counted; on a real Mac, none.
+    [ "$HOSTED" = 1 ] && missing=$((5 * STALL_FRAMES))
     t0=$(now)
     loopback s4 --seconds 20 --channels 8 --rate 48000 --buffer 512 --expect-device-delay 0 \
-        --expect-rate-ppm "$RATE_PPM" --rate-tol-ppm 3 --snapshot-prop ovst
+        --expect-rate-ppm "$RATE_PPM" --rate-tol-ppm 3 --snapshot-prop ovst --allow-missing "$missing"
     rc=$?
     a=$(snapshot_line "$WORK/s4.log" 'at 25%')
     b=$(snapshot_line "$WORK/s4.log" 'at 75%')
     echo "ovst at 25%: $a"
     echo "ovst at 75%: $b"
-    same_counters "$a" "$b" || rc=1
+    res=$(grep '^CA-RESULT' "$WORK/s4.log" | tail -1)
+    same_counters "$a" "$b" "$(kv "$res" jumps)" "$(kv "$res" skipped)" || rc=1
     local n
     n=$(reanchors_since "$t0")
     echo "coreaudiod re-anchor lines during the run: $n"
@@ -195,15 +226,22 @@ s4() {
 }
 
 s5() {
-    local rc=0 n jumps bad slips
+    local rc=0 n jumps bad
     for n in 32 128 1024 4096; do
-        jumps=3 bad=0 slips=0
+        jumps=3 bad=0
         [ "$n" = 32 ] && jumps=10
         # Cycles of 0.7 and 2.7 ms leave the least room for stalls.
-        if [ "$n" -le 128 ]; then bad=$((5 * STALL_FRAMES)) slips=20; fi
+        if [ "$n" -le 128 ]; then
+            bad=$((5 * STALL_FRAMES))
+            # The 32- and 128-frame cases run on the hosted runners too, but
+            # may skip one cycle in 20 (375 and 93 skips) there, not 10 and
+            # 3: every frame must still come back in its place, and a device
+            # that makes Core Audio skip all the time still fails.
+            [ "$HOSTED" = 1 ] && jumps=$((5 * 48000 / n / 20))
+        fi
         echo "--- buffer $n ---"
         loopback "s5-$n" --seconds 5 --channels 8 --buffer "$n" --expect-device-delay 0 \
-            --max-jumps "$jumps" --max-bad "$bad" --max-slips "$slips" || rc=1
+            --max-jumps "$jumps" --max-bad "$bad" || rc=1
         echo "ovst: $(ovst)"
     done
     return "$rc"
@@ -218,7 +256,7 @@ s6() {
     # skips ahead, which the jump allowance covers). The device's own
     # timeline must not jump: no re-anchors, and the seed stays the same.
     limit 120 "$CHECK" loopback "$DEV" --seconds 40 --channels 8 --buffer 512 --allow-outage 15 \
-        --expect-device-delay 0 --max-jumps 2 --max-bad $((5 * STALL_FRAMES)) --max-slips 4 \
+        --expect-device-delay 0 --max-jumps 2 --max-bad $((5 * STALL_FRAMES)) \
         >"$WORK/s6.log" 2>&1 &
     local pid=$!
     sleep 10

@@ -6,7 +6,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::analysis::{self, ChannelReport, CycleMap};
+use crate::analysis::{self, ChannelReport, CycleMap, DeviceTime, Placement};
 use crate::ca::*;
 use crate::cli::Args;
 use crate::commands::{device, fmt_err, info, status_string};
@@ -23,6 +23,7 @@ pub const OPTIONS: &[&str] = &[
     "--expect-rate-ppm",
     "--rate-tol-ppm",
     "--allow-outage",
+    "--allow-missing",
     "--expect-silent-input",
     "--snapshot-prop",
 ];
@@ -39,6 +40,9 @@ struct Options {
     expect_rate_ppm: Option<f64>,
     rate_tol_ppm: f64,
     allow_outage: Option<f64>,
+    /// More bad frames per channel, if they are silence the device itself
+    /// counted as missing input (OpenVirtualSoundcard's `in_missing`).
+    allow_missing: u64,
     expect_silent_input: bool,
     snapshot_prop: Option<u32>,
 }
@@ -62,6 +66,7 @@ impl Options {
             expect_rate_ppm: a.get("--expect-rate-ppm")?,
             rate_tol_ppm: a.get("--rate-tol-ppm")?.unwrap_or(5.0),
             allow_outage: a.get("--allow-outage")?,
+            allow_missing: a.get("--allow-missing")?.unwrap_or(0),
             expect_silent_input: a.switch("--expect-silent-input"),
             snapshot_prop,
         })
@@ -262,6 +267,16 @@ pub fn run(a: &Args) -> Result<i32, String> {
         n_cycles: AtomicUsize::new(0),
     });
 
+    // The input frames the device had no sample for, by its own count, which
+    // --allow-missing needs before and after the run.
+    let in_missing = || analysis::status_counter(&status_string(d), "in_missing");
+    let missing_before = if o.allow_missing > 0 { in_missing() } else { None };
+    if o.allow_missing > 0 && missing_before.is_none() {
+        println!(
+            "--allow-missing: the device's status has no in_missing count, so it allows nothing"
+        );
+    }
+
     let mut proc_id: AudioDeviceIOProcID = None;
     let client = &mut *session as *mut Session as *mut c_void;
     let s = unsafe { AudioDeviceCreateIOProcID(d, io_proc, client, &mut proc_id) };
@@ -295,6 +310,7 @@ pub fn run(a: &Args) -> Result<i32, String> {
     if let Some(prop) = o.snapshot_prop {
         snapshot(d, prop, "at end");
     }
+    let missing_counted = missing_before.and_then(|before| in_missing()?.checked_sub(before));
     let wall = started.elapsed().as_secs_f64();
     let captured = session.captured.load(Ordering::Acquire);
     let n_cycles = session.n_cycles.load(Ordering::Acquire);
@@ -329,11 +345,14 @@ pub fn run(a: &Args) -> Result<i32, String> {
         );
     }
 
-    // Discontinuities in input sample time are overloads or resyncs.
-    let mut jumps = 0u64;
+    // Discontinuities in input sample time are overloads or resyncs; the
+    // frames they skip went through no IO cycle of this client.
+    let (mut jumps, mut skipped) = (0u64, 0.0f64);
     for w in cycles.windows(2) {
-        if w[1].in_sample != w[0].in_sample + w[0].in_frames as f64 {
+        let end = w[0].in_sample + w[0].in_frames as f64;
+        if w[1].in_sample != end {
             jumps += 1;
+            skipped += (w[1].in_sample - end).max(0.0);
             if jumps <= 10 {
                 println!(
                     "timeline jump: input sample time {} -> {} after {} frames",
@@ -342,8 +361,9 @@ pub fn run(a: &Args) -> Result<i32, String> {
             }
         }
     }
-    println!("timeline jumps: {jumps}");
+    println!("timeline jumps: {jumps} ({skipped} frames skipped)");
     result.insert("jumps", jumps.to_string());
+    result.insert("skipped", format!("{skipped:.0}"));
     if jumps > o.max_jumps {
         failures.push(format!("{jumps} timeline jumps (max {})", o.max_jumps));
     }
@@ -411,23 +431,45 @@ pub fn run(a: &Args) -> Result<i32, String> {
         let cycle_frames = cycles.iter().map(|c| c.in_frames as u64).max().unwrap_or(0);
         let allowed_bad = o.max_bad + jumps * 4 * cycle_frames;
         let outage_frames = o.allow_outage.map(|s| (s * rate) as u64);
-        let allowed_slips = o.max_slips + 2 * jumps + if outage_frames.is_some() { 2 } else { 0 };
+        // Jumps need no slips: the delay changes a skip makes are told apart
+        // in device time and not counted (DeviceTime::split_changes).
+        let allowed_slips = o.max_slips + if outage_frames.is_some() { 2 } else { 0 };
         if jumps > 0 {
+            println!("allowing for the jumps: up to {allowed_bad} bad frames per channel");
+        }
+        if let Some(counted) = missing_counted.filter(|_| o.allow_missing > 0) {
             println!(
-                "allowing for the jumps: up to {allowed_bad} bad frames and {allowed_slips} slips per channel"
+                "allowing up to {} more bad frames per channel as silence the device counted \
+                 missing: it counted {counted} input frames missing over the run",
+                o.allow_missing
             );
         }
+        let period = i64::from(zts_period);
         let mut reports: Vec<ChannelReport> = Vec::new();
         let mut device_hist: BTreeMap<i64, u64> = BTreeMap::new();
+        let (mut stale_frames, mut misplaced_frames) = (0, 0);
+        let (mut slips, mut host_changes) = (0, 0);
+        // Bad frames beyond the other allowances that the device counted
+        // missing, over all channels.
+        let mut excused = 0;
         for c in 0..channels {
             let r = analysis::analyze(c, c, send_frames, &received(c));
             let hist = analysis::device_delays(&r.samples, &in_map, &out_map);
             for (k, v) in &hist {
                 *device_hist.entry(*k).or_insert(0) += v;
             }
+            // Without an expected device delay, the one most frames came at.
+            let want = o
+                .expect_device_delay
+                .or_else(|| hist.iter().max_by_key(|(_, v)| **v).map(|(k, _)| *k))
+                .unwrap_or_default();
+            let time = DeviceTime { input: &in_map, output: &out_map, want, period };
+            let changes = time.split_changes(&r.locks);
+            slips += changes.slips;
+            host_changes += changes.host;
             let longest = r.bad_runs.iter().copied().max_by_key(|run| run.len).unwrap_or_default();
             println!(
-                "input {c} <- output {}: lead-in {} frames, delay {} (device time {:?}), matched {}, bad {} ({} zero) in {} runs (longest {}), slips {}",
+                "input {c} <- output {}: lead-in {} frames, delay {} (device time {:?}), matched {}, bad {} ({} zero) in {} runs (longest {}), slips {} (and {} delay changes from skipped host IO)",
                 r.output,
                 r.lead_in,
                 r.delay.map_or("none".into(), |d| d.to_string()),
@@ -437,7 +479,8 @@ pub fn run(a: &Args) -> Result<i32, String> {
                 r.zeros,
                 r.bad_runs.len(),
                 longest.len,
-                r.delay_changes
+                changes.slips,
+                changes.host
             );
             if !r.bad_runs.is_empty() {
                 let runs: Vec<String> = r
@@ -450,17 +493,34 @@ pub fn run(a: &Args) -> Result<i32, String> {
                 let more = if more > 0 { format!(" and {more} more") } else { String::new() };
                 println!("  input {c} bad runs at {}{more}", runs.join(", "));
             }
-            if let (0, Some(want)) = (c, o.expect_device_delay) {
-                let off = r.samples.iter().filter_map(|&(i, n)| {
-                    let (ti, to) = (in_map.time_of(i as u64)?, out_map.time_of(n)?);
-                    ((ti - to).round() as i64 != want).then_some((i, n, ti, to))
-                });
-                for (i, n, ti, to) in off.take(5) {
+            if o.expect_device_delay.is_some() {
+                let (stale, misplaced) = time.split_samples(&r.samples);
+                stale_frames += stale;
+                misplaced_frames += misplaced;
+            }
+            if let (0, Some(_)) = (c, o.expect_device_delay) {
+                let mut off: Vec<_> = r
+                    .samples
+                    .iter()
+                    .filter_map(|&(i, n)| {
+                        let (ti, to) = (in_map.time_of(i as u64)?, out_map.time_of(n)?);
+                        let place = time.place(i, n);
+                        (place != Placement::InPlace).then_some((place, i, n, ti, to))
+                    })
+                    .collect();
+                // The misplaced ones first: they fail the run.
+                off.sort_by_key(|f| f.0 != Placement::Misplaced);
+                for (place, i, n, ti, to) in off.into_iter().take(5) {
                     println!(
                         "  input 0 frame {i} (input time {ti}, cycle {:?}) was sent as frame {n} \
-                         (output time {to}, cycle {:?})",
+                         (output time {to}, cycle {:?}): {}",
                         in_map.cycle_of(i as u64),
-                        out_map.cycle_of(n)
+                        out_map.cycle_of(n),
+                        if place == Placement::Stale {
+                            "stale, played where the host wrote no output"
+                        } else {
+                            "misplaced"
+                        }
                     );
                 }
             }
@@ -482,13 +542,30 @@ pub fn run(a: &Args) -> Result<i32, String> {
                     }
                 }
                 if bad > allowed_bad {
-                    failures.push(format!("input {c}: {bad} bad frames (max {allowed_bad})"));
+                    // Silence where the device had no sample to read: input
+                    // that arrived too late, by its own count, rather than
+                    // audio it lost or misplaced. The counts are checked
+                    // against each other below.
+                    let excess = bad - allowed_bad;
+                    if missing_counted.is_some()
+                        && excess <= o.allow_missing
+                        && r.zeros == r.mismatched
+                    {
+                        excused += excess;
+                    } else if o.allow_missing > 0 {
+                        failures.push(format!(
+                            "input {c}: {bad} bad frames (max {allowed_bad}, or {} if all are \
+                             silence the device counted missing; {} are silence)",
+                            allowed_bad + o.allow_missing,
+                            r.zeros
+                        ));
+                    } else {
+                        failures.push(format!("input {c}: {bad} bad frames (max {allowed_bad})"));
+                    }
                 }
-                if r.delay_changes > allowed_slips {
-                    failures.push(format!(
-                        "input {c}: {} slips (max {allowed_slips})",
-                        r.delay_changes
-                    ));
+                if changes.slips > allowed_slips {
+                    failures
+                        .push(format!("input {c}: {} slips (max {allowed_slips})", changes.slips));
                 }
                 if r.analyzed() < send_frames / 2 {
                     failures.push(format!("input {c}: only {} frames compared", r.analyzed()));
@@ -500,25 +577,38 @@ pub fn run(a: &Args) -> Result<i32, String> {
         if outage_frames.is_none() && delays.windows(2).any(|w| w[0] != w[1]) {
             failures.push(format!("channels came back with different delays: {delays:?}"));
         }
+        if excused > 0 {
+            let counted = missing_counted.unwrap_or(0);
+            println!(
+                "{excused} bad frames beyond the other allowances, all silence, against \
+                 {counted} input frames the device counted missing"
+            );
+            if excused > counted {
+                failures.push(format!(
+                    "{excused} silent bad frames beyond the other allowances, but the device \
+                     counted only {counted} input frames missing"
+                ));
+            }
+        }
         println!("device-time delay over all channels: {device_hist:?}");
         if let Some(want) = o.expect_device_delay {
-            // When the host skips IO it can hand over its IO buffer where
-            // nobody wrote this lap: data exactly a zero time stamp period
-            // (the buffer's length) old. That is loss on the host's side,
-            // covered by the jump allowance, not a misplaced ring.
-            let (stale_frames, wrong) =
-                analysis::split_delays(&device_hist, want, i64::from(zts_period), jumps > 0);
+            // Where the host skipped IO it wrote no output, and the device
+            // played what the host's IO buffer held there a lap earlier: data
+            // whole zero time stamp periods (the buffer's length) old. That
+            // is loss on the host's side, covered by the jump allowance, not
+            // a misplaced ring. Anywhere else, such data is misplaced too.
             if stale_frames > 0 {
                 println!(
-                    "{stale_frames} sampled frames came back whole zero time stamp periods late: \
-                     host buffer data left from an earlier lap while the host skipped IO"
+                    "{stale_frames} sampled frames came back whole zero time stamp periods late, \
+                     played where the host skipped IO: its buffer's earlier lap"
                 );
             }
             if device_hist.is_empty() {
                 failures.push("no matched frames to measure the device-time delay".into());
-            } else if wrong > 0 {
+            } else if misplaced_frames > 0 {
                 failures.push(format!(
-                    "device-time delay {device_hist:?}, want {want} for every frame"
+                    "device-time delay {device_hist:?}, want {want} for every frame not stale \
+                     ({misplaced_frames} sampled frames misplaced)"
                 ));
             }
         }
@@ -528,8 +618,12 @@ pub fn run(a: &Args) -> Result<i32, String> {
         result.insert("capture_delay", format!("{:?}", delays.first().copied().flatten()));
         result.insert("matched", reports.iter().map(|r| r.matched).sum::<u64>().to_string());
         result.insert("bad", reports.iter().map(|r| r.mismatched).sum::<u64>().to_string());
-        result.insert("slips", reports.iter().map(|r| r.delay_changes).sum::<u64>().to_string());
+        result.insert("slips", slips.to_string());
+        result.insert("host_changes", host_changes.to_string());
         result.insert("runs", reports.iter().map(|r| r.bad_runs.len()).sum::<usize>().to_string());
+        if let Some(counted) = missing_counted {
+            result.insert("in_missing", counted.to_string());
+        }
     }
 
     let pass = failures.is_empty();

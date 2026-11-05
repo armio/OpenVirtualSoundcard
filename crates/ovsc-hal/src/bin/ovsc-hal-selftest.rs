@@ -8,8 +8,10 @@
 //!
 //! 1. a welcome arrives;
 //! 2. the region is `REGION_SIZE` bytes and its header valid;
-//! 3. the daemon's heartbeat advances within 1 s and lies within 10 ms of
-//!    this process's `CLOCK_UPTIME_RAW`;
+//! 3. the daemon's heartbeat advances within 1 s, and its stamp lies within
+//!    10 ms of the polls around its store (the last that read the old beat
+//!    and the first that read the new one), by this process's
+//!    `CLOCK_UPTIME_RAW`;
 //! 4. the clock block is valid and Locked or FreeRunning within
 //!    `--clock-timeout` seconds;
 //! 5. the engine runs, at the configuration's sample rate;
@@ -22,6 +24,48 @@
 //! `SELFTEST-SUMMARY`; the exit status is 0 only if every check passed. The
 //! daemon must accept this process's user (CI runs it as root, with uid 0
 //! allowed).
+
+/// How far the heartbeat's stamp may lie outside the polls around its store
+/// (check 3).
+const HEARTBEAT_TOLERANCE_NS: u64 = 10_000_000;
+
+/// Check 3's verdict on a beat seen by polling: the heartbeat went from
+/// `first` to `beat` after this process's clock read `since` and before it
+/// read `now`, around the last poll that read `first` and the first that
+/// read `beat`. The daemon stamps each beat from its clock as it stores it,
+/// so if the two clocks are one, the stamp lies between `since` and `now`;
+/// more than `HEARTBEAT_TOLERANCE_NS` outside, they are not. A poller that
+/// was descheduled between the two polls, as on a loaded CI machine, only
+/// widens the window: it does not count against the daemon.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn judge_beat(first: u64, beat: u64, since: u64, now: u64) -> Result<String, String> {
+    let ms = |ns: i128| ns as f64 / 1e6;
+    let (beat, since, now) = (i128::from(beat), i128::from(since), i128::from(now));
+    let detail = format!(
+        "advanced by {:.1} ms; stored between two polls {:.3} ms apart",
+        ms(beat - i128::from(first)),
+        ms(now - since)
+    );
+    let tolerance = i128::from(HEARTBEAT_TOLERANCE_NS);
+    let off = tolerance as f64 / 1e6;
+    if beat < since - tolerance {
+        Err(format!(
+            "{detail}, but stamped {:.3} ms before the first, more than {off} ms off",
+            ms(since - beat)
+        ))
+    } else if beat > now + tolerance {
+        Err(format!(
+            "{detail}, but stamped {:.3} ms after the second, more than {off} ms off",
+            ms(beat - now)
+        ))
+    } else {
+        Ok(format!(
+            "{detail}, stamped {:.3} ms after the first and {:.3} ms before the second",
+            ms(beat - since),
+            ms(now - beat)
+        ))
+    }
+}
 
 #[cfg(target_os = "macos")]
 mod selftest {
@@ -47,9 +91,8 @@ mod selftest {
 
     /// How long to wait for the welcome.
     const WELCOME_TIMEOUT: Duration = Duration::from_secs(10);
-    /// The heartbeat's limits (check 3).
+    /// How long the heartbeat may take to advance (check 3).
     const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(1);
-    const HEARTBEAT_TOLERANCE_NS: u64 = 10_000_000;
     /// The pattern's place and length (check 6), and how long it may take.
     const PATTERN_LEAD_MS: u64 = 20;
     const PATTERN_MS: u64 = 100;
@@ -273,25 +316,21 @@ mod selftest {
     }
 
     fn heartbeat(view: RegionRef<'_>) -> Result<String, String> {
+        use std::sync::atomic::Ordering::Acquire;
         let d = view.daemon();
-        let first = d.heartbeat_ns.load(std::sync::atomic::Ordering::Acquire);
+        // Each clock reading comes before a load that still reads the old
+        // beat, so the new one is stored after the last such reading.
+        let mut since = host_now_ns();
+        let first = d.heartbeat_ns.load(Acquire);
         let end = Instant::now() + HEARTBEAT_TIMEOUT;
         loop {
-            let beat = d.heartbeat_ns.load(std::sync::atomic::Ordering::Acquire);
+            let before = host_now_ns();
+            let beat = d.heartbeat_ns.load(Acquire);
             let now = host_now_ns();
             if beat != first {
-                let behind = i128::from(now) - i128::from(beat);
-                let detail = format!(
-                    "advanced by {:.1} ms; {:.3} ms behind CLOCK_UPTIME_RAW",
-                    beat.wrapping_sub(first) as f64 / 1e6,
-                    behind as f64 / 1e6
-                );
-                return if behind.unsigned_abs() <= u128::from(HEARTBEAT_TOLERANCE_NS) {
-                    Ok(detail)
-                } else {
-                    Err(format!("{detail}, more than 10 ms off"))
-                };
+                return super::judge_beat(first, beat, since, now);
             }
+            since = before;
             if Instant::now() >= end {
                 return Err(format!("stuck at {first} for {} s", HEARTBEAT_TIMEOUT.as_secs()));
             }
@@ -500,5 +539,48 @@ fn main() {
     {
         eprintln!("ovsc-hal-selftest: macOS only");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::judge_beat;
+
+    const MS: u64 = 1_000_000;
+
+    #[test]
+    fn a_beat_stored_between_the_polls_passes() {
+        let r = judge_beat(900 * MS, 1_000 * MS + MS / 2, 1_000 * MS, 1_001 * MS);
+        assert_eq!(
+            r,
+            Ok("advanced by 100.5 ms; stored between two polls 1.000 ms apart, stamped 0.500 ms \
+                after the first and 0.500 ms before the second"
+                .to_owned())
+        );
+    }
+
+    #[test]
+    fn a_poller_descheduled_between_the_polls_passes() {
+        // On a hosted runner the poll that saw the new beat came 30 ms after
+        // the one before it, and 29 ms after the beat: no fault of the daemon.
+        assert!(judge_beat(900 * MS, 1_001 * MS, 1_000 * MS, 1_030 * MS).is_ok());
+    }
+
+    #[test]
+    fn a_daemon_on_another_clock_fails() {
+        // 20 ms behind this process's clock, then 20 ms ahead of it.
+        let behind = judge_beat(880 * MS, 980 * MS, 1_000 * MS, 1_001 * MS).unwrap_err();
+        assert!(behind.ends_with("stamped 20.000 ms before the first, more than 10 ms off"));
+        let ahead = judge_beat(920 * MS, 1_021 * MS, 1_000 * MS, 1_001 * MS).unwrap_err();
+        assert!(ahead.ends_with("stamped 20.000 ms after the second, more than 10 ms off"));
+    }
+
+    #[test]
+    fn the_tolerance_is_10_ms_either_side() {
+        let (since, now) = (1_000 * MS, 1_001 * MS);
+        assert!(judge_beat(0, since - 10 * MS, since, now).is_ok());
+        assert!(judge_beat(0, since - 10 * MS - 1, since, now).is_err());
+        assert!(judge_beat(0, now + 10 * MS, since, now).is_ok());
+        assert!(judge_beat(0, now + 10 * MS + 1, since, now).is_err());
     }
 }
