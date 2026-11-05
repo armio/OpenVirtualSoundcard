@@ -103,16 +103,46 @@ pub struct Counters {
     /// audio any more, and flow requests are refused until the device
     /// restarts.
     pub tx_engine_failed: AtomicBool,
+    /// Packets missing from received flows: gaps in their timestamps.
+    pub rx_lost_packets: AtomicU64,
+    /// Received packets stamped ahead of our clock by more than a packet,
+    /// a sign that the transmitter's clock disagrees with ours.
+    pub rx_early_packets: AtomicU64,
+    /// Datagrams dropped by receive flows: not from the flow's transmitter,
+    /// or not the size of the flow's packets.
+    pub rx_rejected_packets: AtomicU64,
 }
 
-/// When one receive flow's packets arrive, written by its receive thread.
+/// What one receive flow's packets look like, written by its receive thread
+/// (and [`FlowStats::degraded`] by the subscription manager).
 #[derive(Debug, Default)]
 pub struct FlowStats {
     /// The longest a packet took, from its timestamp to its arrival, in
     /// samples, since the heartbeat last took it.
     pub max_arrival: AtomicU32,
-    /// Packets that arrived later than the receive latency.
+    /// Packets that arrived later than the flow's latency.
     pub late_packets: AtomicU64,
+    /// Packets accepted and written into the rings.
+    pub packets: AtomicU64,
+    /// Packets missing from the timestamp sequence.
+    pub lost_packets: AtomicU64,
+    /// Timestamp jumps too large to be packet loss (a transmitter restart,
+    /// a clock step).
+    pub discontinuities: AtomicU64,
+    /// Packets stamped more than a packet ahead of our clock.
+    pub early_packets: AtomicU64,
+    /// The furthest ahead of our clock a packet was stamped, in samples,
+    /// since someone last took it.
+    pub max_early: AtomicU32,
+    /// Datagrams dropped: from another address or source port than the
+    /// flow's transmitter, or not the flow's packet size.
+    pub rejected_packets: AtomicU64,
+    /// The last dropped datagram, for diagnostics: source IPv4 address
+    /// (high 32 bits), source port (next 16) and length (low 16).
+    pub last_rejected: AtomicU64,
+    /// Set while the flow recently lost packets or received them too late
+    /// to play: audible trouble, though the flow still counts as receiving.
+    pub degraded: AtomicBool,
 }
 
 /// A sample rate or bit depth that a controller asked for, applied when the
