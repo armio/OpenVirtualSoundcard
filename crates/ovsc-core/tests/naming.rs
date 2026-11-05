@@ -1,15 +1,20 @@
 //! Device names on a network: unique defaults, names another device already
-//! uses, and subscriptions to a name two devices share.
+//! uses, names kept through restarts, and subscriptions to a name two
+//! devices share.
 
 use std::future::Future;
 use std::net::Ipv4Addr;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ovsc_clock::system_clock;
 use ovsc_core::directory::StaticDirectory;
 use ovsc_core::mdns::{self, Advertisement, MDNS_GROUP, MDNS_PORT, Mdns};
 use ovsc_core::net::{Interface, bind_multicast, into_tokio};
-use ovsc_core::{Channels, Device, DeviceConfig, DeviceInfo, NameConflict, Ports, StartOptions};
+use ovsc_core::{
+    Channels, Device, DeviceConfig, DeviceInfo, NameConflict, Ports, SavedClaim, SavedState,
+    StartOptions,
+};
 use ovsc_proto::discovery::ChannelTxt;
 use ovsc_proto::dns::{Message, Record};
 
@@ -254,6 +259,106 @@ async fn a_restarted_device_keeps_its_name_through_a_live_conflict() {
     eventually("a rename", || (dev.name() == taken).then_some(())).await;
     soon(dev.shutdown()).await;
     twin.stop();
+}
+
+/// A fresh directory for a test's state file.
+fn state_dir(test: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("ovsc-naming-{test}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Waits until the state file at `path` holds a claim of `name`.
+async fn saved_claim(path: &Path, name: &str) -> SavedClaim {
+    eventually(&format!("a saved claim of {name}"), || {
+        SavedState::load(path).and_then(|s| s.claim).filter(|c| c.name == name)
+    })
+    .await
+}
+
+/// A new process on the same computer (the daemon started again after a
+/// crash, or at a reboot) starts the device from its state file alone. The
+/// file holds the device's claim of its name, made on this interface (the
+/// same MAC address), so the device keeps the name while another device
+/// announces it too, as a device restarted within its process does: it
+/// announces the name again without probing for it, which the other device
+/// would answer, and reports the conflict. It never renames itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_process_keeps_the_name_it_claimed_through_a_live_conflict() {
+    let name = unique("claim");
+    let dir = state_dir("claim");
+    let state_file = dir.join("state.toml");
+    let mut cfg = config(&name, 25700, 47);
+    cfg.discovery = true;
+    cfg.state_file = Some(state_file.clone());
+    let dev = Device::start(cfg.clone(), system_clock()).await.unwrap();
+    announced(&name).await;
+    // Saved once claimed, while the device runs: a crash saves nothing more.
+    let claim = saved_claim(&state_file, &name).await;
+
+    // Another device announces the name too, and answers for it, as a
+    // second Mac given the same name would.
+    let twin = Mdns::start(Ipv4Addr::LOCALHOST).unwrap();
+    twin.set_records(twin_records(&name)).await;
+    let live = NameConflict { name: name.clone(), peer: Ipv4Addr::LOCALHOST, renamed_to: None };
+    assert_eq!(eventually("the conflict", || dev.name_conflict()).await, live);
+
+    // The process ends, and a new one starts the device with nothing handed
+    // on but the state file.
+    soon(dev.shutdown()).await;
+    let dev = Device::start(cfg, system_clock()).await.unwrap();
+    assert_eq!(eventually("the conflict again", || dev.name_conflict()).await, live);
+    // Longer than a probe takes: the name stays, also in what is saved.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(dev.name(), name);
+    assert_eq!(dev.announced_name().as_deref(), Some(name.as_str()));
+    assert_eq!(dev.name_conflict(), Some(live));
+    let saved = SavedState::load(&state_file).unwrap();
+    assert_eq!((saved.name.as_deref(), saved.claim), (Some(name.as_str()), Some(claim)));
+    soon(dev.shutdown()).await;
+    twin.stop();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A disk cloned from another computer holds that computer's state file,
+/// with its device's claim of the name, made on that computer's interface.
+/// Here the MAC address differs, so the device probes for the name as at a
+/// first start: while the other computer's device has the name, this one
+/// takes the next free one, and saves its own claim of that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cloned_state_file_probes_and_takes_another_name() {
+    let name = unique("clone");
+    let dir = state_dir("clone");
+    let state_file = dir.join("state.toml");
+    let copied = SavedClaim { name: name.clone(), mac: "00:1d:c1:52:79:b6".into() };
+    SavedState::update(&state_file, |s| {
+        s.name = Some(name.clone());
+        s.claim = Some(copied.clone());
+    })
+    .unwrap();
+    // The other computer's device, which has the name.
+    let original = Mdns::start(Ipv4Addr::LOCALHOST).unwrap();
+    original.set_records(twin_records(&name)).await;
+
+    let mut cfg = config(&name, 25710, 48);
+    cfg.discovery = true;
+    cfg.state_file = Some(state_file.clone());
+    let dev = Device::start(cfg, system_clock()).await.unwrap();
+    let taken = format!("{name}-2");
+    eventually("the device to rename itself", || (dev.name() == taken).then_some(())).await;
+    let conflict = eventually("the rename to be reported", || dev.name_conflict()).await;
+    let renamed = Some(taken.clone());
+    assert_eq!(conflict, NameConflict { name, peer: Ipv4Addr::LOCALHOST, renamed_to: renamed });
+    // Its own claim, of the name it took, replaces the copied one: a new
+    // process on this computer keeps that name.
+    let claim = saved_claim(&state_file, &taken).await;
+    assert_ne!(claim.mac, copied.mac);
+    let saved = SavedState::load(&state_file).unwrap();
+    assert_eq!(saved.claimed_name(&dev.info().iface), Some(taken.as_str()));
+    soon(dev.shutdown()).await;
+    original.stop();
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 /// A subscription to a channel of our own name goes to another device that
