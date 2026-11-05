@@ -24,9 +24,12 @@ pub const SOCKET_PATH: &str = "/var/run/ovsc/control.sock";
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Receive latencies offered for selection, in milliseconds. Any value in
-/// [`LATENCY_MIN_MS`]..=[`LATENCY_MAX_MS`] is accepted.
+/// [`LATENCY_MIN_MS`]..=[`LATENCY_MAX_MS`] is accepted that is also at
+/// least the device's transmit guard (`tx_guard_us`, 500 µs by default)
+/// plus 500 µs: the device's packets leave that guard after their
+/// timestamps.
 pub const LATENCY_CHOICES_MS: &[f64] = &[1.0, 2.0, 4.0, 5.0, 6.0, 10.0, 20.0, 40.0];
-pub const LATENCY_MIN_MS: f64 = 0.25;
+pub const LATENCY_MIN_MS: f64 = 1.0;
 pub const LATENCY_MAX_MS: f64 = 40.0;
 
 /// Sample rates the device can run at.
