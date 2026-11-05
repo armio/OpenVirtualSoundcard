@@ -528,8 +528,8 @@ impl Health {
             && now.saturating_duration_since(since) >= GATE_GRACE
         {
             let why = match engine {
-                None => "The network engine is not running; it retries on its own (see why \
-                         above)."
+                None => "The network engine is not running; it retries on its own, and its \
+                         last error says why."
                     .to_owned(),
                 Some(e)
                     if e.clock.state != ClockState::Locked
@@ -580,7 +580,11 @@ impl Health {
                     "{what} The application misses its deadlines: raise its buffer size, lower \
                      its load, or raise `[coreaudio] output_margin_us`."
                 ),
-                short: format!("{late} late output cycles"),
+                short: if late > 0 {
+                    format!("{late} late output cycles")
+                } else {
+                    "output margin ran out".to_owned()
+                },
             });
         }
         let early = self.rise(|a, b| self.driver_pair(a, b), |c| c.early_in);
@@ -604,7 +608,11 @@ impl Health {
                 urgent: false,
                 audible: early > 0,
                 text: format!("{what} Raise the latency, or `[coreaudio] input_margin_us`."),
-                short: format!("{early} early input cycles"),
+                short: if early > 0 {
+                    format!("{early} early input cycles")
+                } else {
+                    "input margin ran out".to_owned()
+                },
             });
         }
         let silenced = self.rise(|a, b| self.driver_pair(a, b), |c| c.silenced);
@@ -815,18 +823,36 @@ impl Health {
         let skipped = self.rise(|a, b| self.engine_pair(a, b), |c| c.tx_skipped);
         let resyncs = self.rise(|a, b| self.engine_pair(a, b), |c| c.tx_resyncs);
         if skipped > 0 || resyncs > 0 {
+            // A flow's timeline can restart without a packet skipped (the
+            // clock went back): say only what happened.
+            let (what, short) = if skipped > 0 {
+                (
+                    format!(
+                        "The transmit thread fell behind in the last {window} s: {} to other \
+                         devices never sent, {} of a flow's timing",
+                        count(skipped, "packet", "packets"),
+                        count(resyncs, "restart", "restarts")
+                    ),
+                    format!("{skipped} packets skipped"),
+                )
+            } else {
+                (
+                    format!(
+                        "The transmit thread restarted a flow's timing {} in the last {window} s",
+                        count(resyncs, "time", "times")
+                    ),
+                    format!("{resyncs} transmit restarts"),
+                )
+            };
             out.push(Warning {
                 kind: Kind::TxSkipped,
                 urgent: false,
                 audible: true,
                 text: format!(
-                    "The transmit thread fell behind in the last {window} s: {} to other \
-                     devices never sent, {} of a flow's timing: a dropout on the returns. This \
-                     computer was too busy for a moment, or the clock jumped.",
-                    count(skipped, "packet", "packets"),
-                    count(resyncs, "restart", "restarts")
+                    "{what}: a dropout on the returns. This computer was too busy for a \
+                     moment, or the clock jumped."
                 ),
-                short: format!("{skipped} packets skipped"),
+                short,
             });
         }
         let tx_late = self.rise(|a, b| self.engine_pair(a, b), |c| c.tx_late);
@@ -1386,6 +1412,8 @@ mod tests {
         assert!(w.text.starts_with("Output from the application ran out of margin"), "{}", w.text);
         assert!(w.text.contains("(worst margin since IO started: 0 frames)"), "{}", w.text);
         assert!(!w.audible);
+        // The status line does not count zero late cycles.
+        assert_eq!(h.summary(), "warnings: output margin ran out");
     }
 
     #[test]
@@ -1545,6 +1573,23 @@ mod tests {
         r.engine.as_mut().unwrap().stopped_part = Some("rx manager");
         let a = h.observe(c.at(7.0), &r);
         assert!(a.warnings[0].text.starts_with("The device's rx manager has stopped"));
+
+        // A flow's timing restarted without a packet skipped: no "0
+        // packets" in the words.
+        let mut h = Health::new();
+        let resync = |s: u32| {
+            let mut e = engine();
+            e.stats.tx_resyncs = u64::from(s >= 5) * 2;
+            reading(hal(true), e)
+        };
+        let a = feed(&mut h, &c, 0, 5, resync);
+        let w = find(&a, Kind::TxSkipped);
+        assert!(
+            w.text.starts_with("The transmit thread restarted a flow's timing 2 times in the last"),
+            "{}",
+            w.text
+        );
+        assert_eq!(w.short, "2 transmit restarts");
     }
 
     #[test]
