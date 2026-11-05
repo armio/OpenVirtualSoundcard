@@ -50,7 +50,9 @@ use ovsc_proto::discovery::ChannelTxt;
 use crate::buffer::TimedRing;
 use crate::client;
 use crate::directory::{Directory, ResolvedChannel};
-use crate::info::{FPP_MAX, FPP_MIN, MAX_CHANNELS_PER_TX_FLOW, MAX_RX_FLOWS, PCM_TYPE};
+use crate::info::{
+    FPP_MAX, FPP_MIN, MAX_CHANNELS_PER_TX_FLOW, MAX_RX_FLOWS, PCM_TYPE, RX_FPP_LIMIT,
+};
 use crate::net::bind_udp;
 use crate::state::{Counters, FlowStats, Notify, Shared};
 use crate::{Error, Result};
@@ -1720,9 +1722,10 @@ impl FlowParams {
 /// within an Ethernet frame.
 const RECV_BUFFER: usize = 2048;
 
-/// The most frames a received packet can carry for a flow.
+/// The most frames a received packet may carry for a flow: what fits the
+/// receive buffer, and at most [`RX_FPP_LIMIT`].
 fn max_frames(params: &FlowParams) -> usize {
-    ((RECV_BUFFER - audio::HEADER_LEN) / params.stride()).max(1)
+    ((RECV_BUFFER - audio::HEADER_LEN) / params.stride()).clamp(1, RX_FPP_LIMIT)
 }
 
 /// Receives one flow's packets into the rings and keeps the flow alive.
@@ -1855,13 +1858,15 @@ impl Receiver {
     /// created by a retried request) would be mixed into this flow's
     /// channels, or decoded with the wrong layout.
     ///
-    /// The frame count is not checked against the fpp we asked for:
-    /// receivers derive it from the length (PROTOCOL.md §8.2), so a
-    /// transmitter that picks another fpp still plays rather than going
-    /// silent for good.
+    /// The frame count is not checked against the fpp we asked for, only
+    /// against [`RX_FPP_LIMIT`]: receivers derive it from the length
+    /// (PROTOCOL.md §8.2), so a transmitter that picks another fpp still
+    /// plays rather than going silent for good.
     fn accept(&mut self, len: usize, from: SocketAddr, now_ns: u64) -> bool {
         let payload = len.saturating_sub(audio::HEADER_LEN);
-        let whole = len > audio::HEADER_LEN && payload % self.params.stride() == 0;
+        let stride = self.params.stride();
+        let frames = payload / stride;
+        let whole = payload % stride == 0 && (1..=self.samples.len()).contains(&frames);
         if from.ip() != IpAddr::V4(self.params.tx_ip) || !whole {
             return false;
         }
@@ -2137,13 +2142,23 @@ mod tests {
         // One packet of 16 frames is missing, not two of the 12 asked for.
         assert_eq!(get(&t.stats.lost_packets), 1);
 
-        // The largest packet that fits the receive buffer is read whole.
+        // The largest packet accepted is read whole; one frame more is not
+        // accepted.
         let big = max_frames(&t.rx.params);
         let at = ts + 4 * 16;
         let data = packet(at, 2, big, 7);
         assert!(data.len() <= RECV_BUFFER);
         t.rx.datagram(&data, src, 2_000, &t.clock);
         assert_eq!(t.rings[0].read_one(at + big as u64 - 1), Some(7 << 8));
+        let mut one = test_rx(1, 12, 0);
+        let src = from(TX, 5000);
+        let too_big = packet(one.now(), 1, RX_FPP_LIMIT + 1, 1);
+        assert!(too_big.len() <= RECV_BUFFER);
+        one.rx.datagram(&too_big, src, 1_000, &one.clock);
+        assert_eq!(get(&one.stats.rejected_packets), 1);
+        let largest = packet(one.now(), 1, RX_FPP_LIMIT, 1);
+        one.rx.datagram(&largest, src, 2_000, &one.clock);
+        assert_eq!(get(&one.stats.packets), 1);
     }
 
     #[test]

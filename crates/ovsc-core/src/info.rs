@@ -29,6 +29,10 @@ pub const MAX_CHANNELS_PER_TX_FLOW: u16 = 8;
 /// flow requests.
 pub const FPP_MAX: u16 = 32;
 pub const FPP_MIN: u16 = 2;
+/// The most frames a received packet may carry: the frame count is read
+/// from a packet's length (PROTOCOL.md §8.2), and the macOS driver's ring
+/// span assumes no more (`ovsc_hal_server::config::RX_FPP_LIMIT`).
+pub const RX_FPP_LIMIT: usize = 256;
 /// PCM type of current Dante devices.
 pub const PCM_TYPE: u8 = 0x0e;
 

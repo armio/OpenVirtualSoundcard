@@ -14,7 +14,7 @@ use ovsc_shm::time::ns_to_samples;
 
 /// ovsc-core's `FPP_MAX`: the most frames per packet the device sends.
 pub const FPP_MAX: u32 = 32;
-/// ovsc-core's `FPP_LIMIT`: the most frames per packet of any flow the
+/// ovsc-core's `RX_FPP_LIMIT`: the most frames per packet of any flow the
 /// device receives.
 pub const RX_FPP_LIMIT: u32 = 256;
 /// The user ID of Core Audio's driver helper (`_coreaudiod`).
