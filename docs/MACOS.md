@@ -188,14 +188,19 @@ needs a name of its own.
   device takes the name <name>-2`. The device that had the name keeps it,
   and neither changes name at its next start. Receivers' subscriptions to
   `<name>` reach the device that kept it: re-patch the ones meant for this
-  one before the show.
+  one before the show. When the daemon restarts its network engine (for a
+  new latency, or when the network interface changes), the device keeps
+  the name it announced without asking again.
 * If another device starts announcing the name while this one runs (one
   that does not probe, or two devices started at the same instant), this
   device keeps its name, since renaming it mid-show would break every
-  subscription to it. It logs `the device at <address> also announces
+  subscription to it, also through the daemon's restarts of its network
+  engine. It logs `the device at <address> also announces
   <name>...: Rename one of them.`, announces its records again, and keeps
   reporting the conflict until the other device withdraws the name or its
-  records expire. Meanwhile a subscription on this device to
+  records expire. A new daemon process (launchd starting one after a
+  crash, a reboot) asks the network again, and takes `<name>-2` if the other
+  device still announces the name. Meanwhile a subscription on this device to
   `<channel>@<name>` that is made (or that reconnects) goes to the other
   device if that one has the channel, rather than looping back to this one,
   and logs a warning. Subscriptions already receiving stay where they are.
@@ -242,7 +247,10 @@ Both latencies must also be at least `tx_guard_us` (500 µs by default) plus
 0.5 ms: the device sends a packet `tx_guard_us` after its first frame's
 timestamp, so a latency of `tx_guard_us` or less would make every packet
 late, and the 0.5 ms leaves room for the send's wake-up and the network.
-With the default guard, 1 ms is the least.
+With the default guard, 1 ms is the least. A configuration file with less
+(earlier versions took down to 0.25 ms) is raised to the least as the
+daemon reads it, with a warning in the log naming the file, the value and
+the least; a latency above 40 ms is still refused.
 
 A new rate, channel count or latency reaches Core Audio as a device
 configuration change: applications that use the device see it reconfigure.

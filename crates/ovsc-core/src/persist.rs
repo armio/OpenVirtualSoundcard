@@ -216,6 +216,19 @@ impl SavedState {
         }
     }
 
+    /// The receive and transmit channel names of a device whose own ones
+    /// are `rx` and `tx` that starts from this state: each saved name that
+    /// is not empty, else the device's own.
+    pub fn channel_names(&self, rx: &[String], tx: &[String]) -> (Vec<String>, Vec<String>) {
+        let pick = |saved: &[String], own: &[String]| -> Vec<String> {
+            own.iter()
+                .enumerate()
+                .map(|(i, o)| saved.get(i).filter(|s| !s.is_empty()).unwrap_or(o).clone())
+                .collect()
+        };
+        (pick(&self.rx_names, rx), pick(&self.tx_names, tx))
+    }
+
     /// Changes the state saved at `path` with `f`, for a device that is
     /// not running (a running one saves its own: change it instead).
     pub fn update(path: &Path, f: impl FnOnce(&mut SavedState)) -> io::Result<()> {
@@ -429,6 +442,22 @@ mod tests {
         // Nothing but the file: no temporary files left behind.
         assert_eq!(files(&dir, ""), ["state.toml"]);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn saved_channel_names_replace_the_devices_own() {
+        let saved = SavedState {
+            rx_names: vec!["Vox".into(), String::new()],
+            tx_names: vec!["L".into(), "R".into(), "gone".into()],
+            ..Default::default()
+        };
+        let own = |n: u16| (1..=n).map(|i| format!("{i:02}")).collect::<Vec<_>>();
+        let (rx, tx) = saved.channel_names(&own(3), &own(2));
+        assert_eq!(
+            (rx, tx),
+            (vec!["Vox".into(), "02".into(), "03".into()], vec!["L".into(), "R".into()])
+        );
+        assert_eq!(SavedState::default().channel_names(&own(2), &own(1)), (own(2), own(1)));
     }
 
     #[test]

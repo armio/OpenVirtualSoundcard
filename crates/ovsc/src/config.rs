@@ -5,8 +5,10 @@ use std::time::Duration;
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use ovsc_core::DeviceConfig;
+use ovsc_core::config::{MAX_LATENCY_MS, min_latency_ms};
 use ovsc_hal_server::config::HELPER_UID;
 use ovsc_hal_server::{EngineInfo, HalOptions, driver_config};
 use ovsc_ipc::protocol::{
@@ -245,10 +247,52 @@ pub fn channel_map(list: &Option<Vec<u16>>) -> Option<Vec<Option<usize>>> {
 }
 
 impl AppConfig {
+    /// Reads the configuration file at `path`. A latency below the least
+    /// the transmit guard allows is raised to it, with a warning (see
+    /// [`AppConfig::raise_low_latencies`]).
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+        let mut cfg: AppConfig =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        for raised in cfg.raise_low_latencies() {
+            warn!("{}: {raised}", path.display());
+        }
+        Ok(cfg)
+    }
+
+    /// Raises `[device] latency_ms` and `tx_latency_ms` where they are
+    /// below [`min_latency_ms`] to that least, and says what it raised.
+    ///
+    /// Earlier versions took latencies down to 0.25 ms, and an upgrade
+    /// keeps the configuration file. Refused, such a latency would stop
+    /// the daemon at every start, launchd restarting it in a loop, and
+    /// leave the device without an engine until someone edits the file.
+    /// Like a latency in the state file that the device cannot run at, it
+    /// gets a warning and a latency the device can run at instead. A
+    /// latency above the most, or not a number, is still refused.
+    pub fn raise_low_latencies(&mut self) -> Vec<String> {
+        let d = &mut self.device;
+        let min = min_latency_ms(d.tx_guard_us);
+        let mut raised = Vec::new();
+        if min > MAX_LATENCY_MS {
+            // A guard that leaves no latency: validate() says so.
+            return raised;
+        }
+        if d.latency_ms < min {
+            raised.push(format!(
+                "latency_ms {} is below the minimum of {min} ms; using {min} ms",
+                d.latency_ms
+            ));
+            d.latency_ms = min;
+        }
+        if let Some(ms) = d.tx_latency_ms.filter(|&ms| ms < min) {
+            raised.push(format!(
+                "tx_latency_ms {ms} is below the minimum of {min} ms; using {min} ms"
+            ));
+            d.tx_latency_ms = Some(min);
+        }
+        raised
     }
 
     /// Checks the configuration before `ovsc run` uses it on this host.
@@ -588,6 +632,55 @@ mod tests {
         assert!(e.contains("tx_latency_ms must be between 1 and 40 ms"), "{e}");
         let e = error(&coreaudio("[device]\nlatency_ms = 0.5"));
         assert!(e.contains("latency_ms must be between 1 and 40 ms"), "{e}");
+    }
+
+    /// A latency an earlier version took (down to 0.25 ms) and an upgrade
+    /// kept is raised to the least the transmit guard allows, rather than
+    /// stop the daemon at every start.
+    #[test]
+    fn a_latency_below_the_minimum_is_raised_at_load() {
+        let dir = std::env::temp_dir().join(format!("ovsc-config-low-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ovsc.toml");
+        let load = |toml: &str| {
+            std::fs::write(&path, toml).unwrap();
+            AppConfig::load(&path).unwrap()
+        };
+        let low = "[device]\nlatency_ms = 0.5\ntx_latency_ms = 0.25\n";
+        let cfg = load(&format!("{low}[audio]\nbackend = \"coreaudio\"\n"));
+        assert_eq!((cfg.device.latency_ms, cfg.device.tx_latency_ms), (1.0, Some(1.0)));
+        cfg.validate_for(true).unwrap();
+        // A longer guard raises them further.
+        let cfg = load("[device]\nlatency_ms = 1.0\ntx_latency_ms = 1.2\ntx_guard_us = 800\n");
+        assert_eq!((cfg.device.latency_ms, cfg.device.tx_latency_ms), (1.3, Some(1.3)));
+        cfg.validate_for(false).unwrap();
+        // Latencies it can run at stay as they are.
+        let cfg = load("[device]\nlatency_ms = 2.0\ntx_latency_ms = 1.0\n");
+        assert_eq!((cfg.device.latency_ms, cfg.device.tx_latency_ms), (2.0, Some(1.0)));
+        // Above the most, or not a number: still refused.
+        for bad in ["80.0", "nan"] {
+            let cfg = load(&format!("[device]\nlatency_ms = {bad}\n"));
+            assert!(cfg.validate_for(false).is_err(), "{bad}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.device.latency_ms = 0.5;
+        cfg.device.tx_latency_ms = Some(0.75);
+        assert_eq!(
+            cfg.raise_low_latencies(),
+            [
+                "latency_ms 0.5 is below the minimum of 1 ms; using 1 ms",
+                "tx_latency_ms 0.75 is below the minimum of 1 ms; using 1 ms",
+            ]
+        );
+        assert!(cfg.raise_low_latencies().is_empty());
+        // A guard that leaves no latency is the error validate() reports.
+        cfg.device.tx_guard_us = 40_000;
+        cfg.device.latency_ms = 0.5;
+        assert!(cfg.raise_low_latencies().is_empty());
+        assert!(format!("{:#}", cfg.validate_for(false).unwrap_err()).contains("tx_guard_us"));
     }
 
     #[test]

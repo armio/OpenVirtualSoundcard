@@ -717,7 +717,10 @@ fn edit_config(text: &str, change: &SettingsChange) -> anyhow::Result<Option<Str
     if new == text {
         return Ok(None);
     }
-    let cfg: AppConfig = toml::from_str(&new).context("the changed configuration")?;
+    let mut cfg: AppConfig = toml::from_str(&new).context("the changed configuration")?;
+    // Checked as the daemon will read it: a latency below the least (an
+    // earlier version's) is raised then, not refused.
+    cfg.raise_low_latencies();
     cfg.validate_for(true)?;
     Ok(Some(new))
 }
@@ -779,6 +782,19 @@ backend = "coreaudio"
         assert!(edit_config(CONFIG, &bad).is_err());
         let none = SettingsChange { rx_channels: Some(0), ..Default::default() };
         assert!(edit_config(CONFIG, &none).is_err());
+    }
+
+    /// A latency below the least, which the daemon raises as it reads the
+    /// file, does not stop the app changing the host settings either.
+    #[test]
+    fn config_edits_keep_a_latency_the_daemon_raises() {
+        let old = CONFIG.replace("latency_ms = 4.0", "latency_ms = 0.5");
+        let change = SettingsChange { sample_rate: Some(96_000), ..Default::default() };
+        let new = edit_config(&old, &change).unwrap().unwrap();
+        assert!(new.contains("sample_rate = 96000") && new.contains("latency_ms = 0.5"), "{new}");
+        // Above the most it is still refused.
+        let high = CONFIG.replace("latency_ms = 4.0", "latency_ms = 80.0");
+        assert!(edit_config(&high, &change).is_err());
     }
 
     #[test]

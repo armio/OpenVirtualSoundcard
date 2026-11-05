@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use ovsc_proto::{arc, cmc, conmon, dbcp, discovery};
 
+use crate::persist::SavedState;
 use crate::{Error, Result};
 
 /// The receive and transmit latencies a device may run at, ms. 1 ms is the
@@ -22,9 +23,16 @@ pub const MAX_LATENCY_MS: f64 = 40.0;
 /// wake-up delay plus the network's transit. A receiver plays frame `t` at
 /// `t + latency` (docs/PROTOCOL.md 8.4), so a latency of `tx_guard` or less
 /// makes every packet late. This is the room left for the wake-up and the
-/// network. It applies to the receive latency too: another device of ours
-/// sends with the same guard, and our receiver does not raise its latency
-/// to a transmitter's `latency_ns`.
+/// network.
+///
+/// It bounds the receive latency too, though not for OVSC peers: they
+/// advertise a transmit latency (TXT `latency_ns`) of at least their guard
+/// plus this headroom, and our receiver plays each flow at the larger of
+/// its own latency and the one its transmitter advertises (docs/PROTOCOL.md
+/// 2.2 and 8.4; `flow_latency` in `rx.rs`). The floor on our own receive
+/// latency guards our transmit latency while `tx_latency_ms` is unset (it
+/// is the receive latency then), and flows from transmitters that send
+/// later than they advertise.
 pub const LATENCY_HEADROOM_US: u32 = 500;
 
 /// UDP ports of the device's services.
@@ -237,6 +245,31 @@ impl DeviceConfig {
     pub fn tx_latency_ns(&self) -> u32 {
         ms_to_ns(self.tx_latency_ms.unwrap_or(self.latency_ms))
     }
+
+    /// This configuration with what a controller or the app saved applied,
+    /// as a device started from `saved` runs it: the receive latency and
+    /// the device name, each only if valid (an invalid one is ignored, and
+    /// the configured one used). Channel names stay the configured ones,
+    /// which are the device's own; the device shows the saved ones (see
+    /// [`SavedState::channel_names`]).
+    ///
+    /// The daemon of the macOS driver offers the driver this before the
+    /// device runs, so that the device's start changes nothing Core Audio
+    /// sees.
+    pub fn with_saved(mut self, saved: &SavedState) -> DeviceConfig {
+        if let Some(ns) = saved.latency_ns {
+            let ms = ns as f64 / 1e6;
+            if check_latency_ms("latency", ms, self.tx_guard_us).is_ok() {
+                self.latency_ms = ms;
+            }
+        }
+        if let Some(name) = &saved.name {
+            if discovery::validate_device_name(name).is_ok() {
+                self.name = name.clone();
+            }
+        }
+        self
+    }
 }
 
 fn ms_to_samples(ms: f64, rate: u32) -> u64 {
@@ -373,6 +406,33 @@ mod tests {
         let c: DeviceConfig = toml::from_str("latency_ms = 2.0").unwrap();
         assert_eq!(c.tx_latency_ms, None);
         assert_eq!(c.tx_latency_ns(), 2_000_000);
+    }
+
+    #[test]
+    fn saved_settings_apply_where_valid() {
+        let c = DeviceConfig { name: "studio".into(), latency_ms: 4.0, ..Default::default() };
+        let saved = SavedState {
+            name: Some("vocal-fx".into()),
+            latency_ns: Some(2_000_000),
+            rx_names: vec!["Vox".into()],
+            ..Default::default()
+        };
+        let s = c.clone().with_saved(&saved);
+        assert_eq!((s.name.as_str(), s.latency_ms, s.latency_ns()), ("vocal-fx", 2.0, 2_000_000));
+        // The rest, the channel names included, is the configuration's.
+        assert_eq!(DeviceConfig { name: "studio".into(), latency_ms: 4.0, ..s }, c);
+        // Nothing saved, or nothing valid: the configuration as it is.
+        assert_eq!(c.clone().with_saved(&SavedState::default()), c);
+        let bad = SavedState {
+            name: Some("not a name".into()),
+            latency_ns: Some(500_000),
+            ..Default::default()
+        };
+        assert_eq!(c.clone().with_saved(&bad), c);
+        // The least latency follows the guard here too.
+        let guarded = DeviceConfig { tx_guard_us: 800, ..c.clone() };
+        let saved = SavedState { latency_ns: Some(1_200_000), ..Default::default() };
+        assert_eq!(guarded.clone().with_saved(&saved), guarded);
     }
 
     #[test]

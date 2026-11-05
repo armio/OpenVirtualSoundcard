@@ -9,7 +9,7 @@ use ovsc_clock::system_clock;
 use ovsc_core::directory::StaticDirectory;
 use ovsc_core::mdns::{self, Advertisement, MDNS_GROUP, MDNS_PORT, Mdns};
 use ovsc_core::net::{Interface, bind_multicast, into_tokio};
-use ovsc_core::{Channels, Device, DeviceConfig, DeviceInfo, NameConflict, Ports};
+use ovsc_core::{Channels, Device, DeviceConfig, DeviceInfo, NameConflict, Ports, StartOptions};
 use ovsc_proto::discovery::ChannelTxt;
 use ovsc_proto::dns::{Message, Record};
 
@@ -143,6 +143,24 @@ fn txt(id: u16) -> ChannelTxt {
     }
 }
 
+/// The mDNS records of another device called `name`.
+fn twin_records(name: &str) -> Vec<Record> {
+    mdns::device_records(&Advertisement {
+        name,
+        host: &unique("twin-host"),
+        ip: Ipv4Addr::LOCALHOST,
+        arc_port: 4440,
+        cmc_port: 8800,
+        flow_control_port: 4455,
+        device_id: &[0, 0, 127, 0, 0, 1, 0, 99],
+        process_id: 99,
+        manufacturer: "Someone",
+        board_name: "Something",
+        model: "_000000000000000b",
+        tx_channels: vec![("01", "01", txt(1))],
+    })
+}
+
 /// Another device announcing a running device's name, as one that does
 /// not probe would: reported while it lasts, and the name stays.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -156,20 +174,7 @@ async fn a_device_announcing_our_name_is_reported() {
     announced(&name).await;
     assert_eq!(dev.name_conflict(), None);
 
-    let twin = mdns::device_records(&Advertisement {
-        name: &name,
-        host: &unique("twin-host"),
-        ip: Ipv4Addr::LOCALHOST,
-        arc_port: 4440,
-        cmc_port: 8800,
-        flow_control_port: 4455,
-        device_id: &[0, 0, 127, 0, 0, 1, 0, 99],
-        process_id: 99,
-        manufacturer: "Someone",
-        board_name: "Something",
-        model: "_000000000000000b",
-        tx_channels: vec![("01", "01", txt(1))],
-    });
+    let twin = twin_records(&name);
     let announcer =
         into_tokio(bind_multicast(MDNS_GROUP, MDNS_PORT, Ipv4Addr::LOCALHOST).unwrap()).unwrap();
     let announce = |records: Vec<Record>| {
@@ -197,6 +202,58 @@ async fn a_device_announcing_our_name_is_reported() {
     eventually("the conflict to end", || dev.name_conflict().is_none().then_some(())).await;
     assert_eq!(dev.name(), name);
     soon(dev.shutdown()).await;
+}
+
+/// A device that the daemons restart in their process (for a new latency,
+/// or on a new address) keeps the name it announced, also while another
+/// device announces that name too: it announces it again without probing,
+/// which the other device would answer, and reports the conflict as it did
+/// before the restart. It never renames itself mid-show. Another name is
+/// probed for, as at a first start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_device_keeps_its_name_through_a_live_conflict() {
+    let name = unique("keep");
+    let mut cfg = config(&name, 25690, 46);
+    cfg.discovery = true;
+    let dev = Device::start(cfg.clone(), system_clock()).await.unwrap();
+    announced(&name).await;
+    assert_eq!(dev.announced_name().as_deref(), Some(name.as_str()));
+
+    // Another device announces the name too, and answers for it, as a
+    // second Mac given the same name would.
+    let twin = Mdns::start(Ipv4Addr::LOCALHOST).unwrap();
+    twin.set_records(twin_records(&name)).await;
+    let live = NameConflict { name: name.clone(), peer: Ipv4Addr::LOCALHOST, renamed_to: None };
+    assert_eq!(eventually("the conflict", || dev.name_conflict()).await, live);
+
+    // Restarted as the daemons do, handing on its state and the name it
+    // announced.
+    let restart = |dev: &Device| StartOptions {
+        state: Some(dev.saved_state()),
+        announced: dev.announced_name(),
+        ..Default::default()
+    };
+    let options = restart(&dev);
+    soon(dev.shutdown()).await;
+    let dev = Device::start_with_options(cfg.clone(), system_clock(), options).await.unwrap();
+    assert_eq!(eventually("the conflict again", || dev.name_conflict()).await, live);
+    // Longer than a probe takes: the name stays, also in what is saved.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(dev.name(), name);
+    assert_eq!(dev.saved_state().name.as_deref(), Some(name.as_str()));
+    assert_eq!(dev.announced_name().as_deref(), Some(name.as_str()));
+    assert_eq!(dev.name_conflict(), Some(live));
+
+    // A name other than the announced one is probed for: taken, it gives
+    // way.
+    let mut options = restart(&dev);
+    options.announced = Some(unique("other"));
+    soon(dev.shutdown()).await;
+    let dev = Device::start_with_options(cfg, system_clock(), options).await.unwrap();
+    let taken = format!("{name}-2");
+    eventually("a rename", || (dev.name() == taken).then_some(())).await;
+    soon(dev.shutdown()).await;
+    twin.stop();
 }
 
 /// A subscription to a channel of our own name goes to another device that

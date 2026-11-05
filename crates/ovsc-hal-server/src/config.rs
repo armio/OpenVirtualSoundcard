@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use ovsc_core::{Device, DeviceConfig};
+use ovsc_core::{Device, DeviceConfig, SavedState};
 use ovsc_ipc::protocol::{
     self, CLOCK_ALGORITHM_RAW, DriverConfig, InputLatencyMode, MAX_NAME_BYTES, OffsetInputs,
     SERVICE_NAME, compute_offsets,
@@ -102,9 +102,23 @@ impl EngineInfo {
         }
     }
 
-    /// The facts a device started with `c` will have, before it runs. The
-    /// names are the configured ones; a device restores renamed channels
-    /// from its state file only when it starts.
+    /// The facts a device started with `c` from the saved state `saved`
+    /// will have, before it runs: its latency and names as the device
+    /// takes them from `saved` ([`DeviceConfig::with_saved`],
+    /// [`SavedState::channel_names`]). Offered to the driver until the
+    /// device runs, the device's start then changes nothing the driver
+    /// needs a new configuration for: a daemon that starts again on a
+    /// state file with another latency than the configuration's does not
+    /// reconfigure Core Audio twice.
+    pub fn from_saved(c: &DeviceConfig, saved: &SavedState) -> Result<Self, ConfigError> {
+        let mut e = Self::from_config(&c.clone().with_saved(saved))?;
+        (e.rx_names, e.tx_names) = saved.channel_names(&e.rx_names, &e.tx_names);
+        Ok(e)
+    }
+
+    /// The facts a device started with `c` will have, before it runs, if
+    /// nothing was saved: the configured names and latency (see
+    /// [`EngineInfo::from_saved`]).
     pub fn from_config(c: &DeviceConfig) -> Result<Self, ConfigError> {
         c.validate().map_err(|e| ConfigError::Device(e.to_string()))?;
         let device_name =
@@ -304,6 +318,76 @@ mod tests {
         // Too large for the driver: refused by validate().
         let o = HalOptions { output_latency_ms: Some(1000.0), ..Default::default() };
         assert!(matches!(driver_config(&engine(48_000, 4.0), 1, &o), Err(ConfigError::Driver(_))));
+    }
+
+    #[test]
+    fn the_offer_follows_the_saved_state() {
+        let c = DeviceConfig {
+            name: "studio".into(),
+            latency_ms: 4.0,
+            tx_channels: Channels::Count(2),
+            rx_channels: Channels::Count(2),
+            ..Default::default()
+        };
+        let saved = SavedState {
+            name: Some("vocal-fx".into()),
+            latency_ns: Some(2_000_000),
+            rx_names: vec!["Vox".into()],
+            ..Default::default()
+        };
+        let e = EngineInfo::from_saved(&c, &saved).unwrap();
+        // 2 ms at 48 kHz, also the transmit latency: it follows the receive one.
+        assert_eq!((e.latency_samples, e.tx_latency_samples), (96, 96));
+        assert_eq!(e.device_name, "vocal-fx");
+        assert_eq!(
+            (e.rx_names, e.tx_names),
+            (vec!["Vox".into(), "02".into()], c.tx_channels.names())
+        );
+        assert_eq!(EngineInfo::from_saved(&c, &SavedState::default()), EngineInfo::from_config(&c));
+    }
+
+    /// What the daemon offers the driver before the device runs is what
+    /// the device publishes once it runs from the same saved state: its
+    /// start reconfigures nothing.
+    #[tokio::test]
+    async fn a_device_runs_as_offered() {
+        let dir = std::env::temp_dir().join(format!("ovsc-hal-offer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = dir.join("state.toml");
+        SavedState::update(&state, |s| {
+            s.latency_ns = Some(2_000_000);
+            s.name = Some("vocal-fx".into());
+            s.tx_names = vec![String::new(), "Vox FX".into()];
+        })
+        .unwrap();
+        let c = DeviceConfig {
+            name: "studio".into(),
+            interface: "127.0.0.1".into(),
+            latency_ms: 4.0,
+            tx_channels: Channels::Count(2),
+            rx_channels: Channels::Count(2),
+            ports: ovsc_core::Ports {
+                arc: 24996,
+                cmc: 24997,
+                flow_control: 24998,
+                settings: 24999,
+            },
+            discovery: false,
+            process_id: 51,
+            state_file: Some(state.clone()),
+            ..Default::default()
+        };
+        let o = HalOptions::default();
+        let saved = SavedState::load(&state).unwrap();
+        let offered = driver_config(&EngineInfo::from_saved(&c, &saved).unwrap(), 1, &o).unwrap();
+        let device = Device::start(c.clone(), ovsc_clock::system_clock()).await.unwrap();
+        let runs = driver_config(&EngineInfo::from_device(&device), 1, &o).unwrap();
+        device.shutdown().await;
+        assert_eq!(offered, runs);
+        // Offered from the configuration alone, the latency differs.
+        let configured = driver_config(&EngineInfo::from_config(&c).unwrap(), 1, &o).unwrap();
+        assert!(!configured.structural_eq(&runs));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

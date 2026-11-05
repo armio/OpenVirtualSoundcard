@@ -30,15 +30,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
+use tokio::sync::oneshot;
 use tokio::time::{Instant, Interval, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
 
 use ovsc_clock::ptp::{PtpConfig, PtpFollower};
 use ovsc_clock::{MediaClock, free_running_clock_with_rate};
-use ovsc_control::{Restart, SettingsChange};
+use ovsc_control::{Request, Response, Restart, SettingsChange};
 use ovsc_core::net::Interface;
 use ovsc_core::{Device, FormatRequest, RemoteChanges, SavedState, StartOptions};
-use ovsc_hal_server::{EngineInfo, HalRegion, HalServer, ShmClockMirror};
+use ovsc_hal_server::{
+    EngineInfo, HalOptions, HalRegion, HalServer, ShmClockMirror, driver_config,
+};
 use ovsc_ipc::transport::ServerTransport;
 
 use crate::config::{self, AppConfig, ClockSource};
@@ -147,7 +150,7 @@ async fn serve(
             opts.debug_zts_jitter_ns
         );
     }
-    let initial = EngineInfo::from_config(&cfg.device)?;
+    let initial = initial_engine(&cfg, &opts)?;
     let region =
         HalRegion::create(VERSION).context("creating the region shared with the driver")?;
     let server = HalServer::start(opts, region.clone(), service.transport, initial)
@@ -242,6 +245,22 @@ async fn serve(
     result
 }
 
+/// The engine offered to the driver until one runs: as the device will
+/// start, with the latency and names saved in the state file, so that its
+/// start does not reconfigure Core Audio a second time. Without them if
+/// the driver cannot take them (a long saved latency with a wide
+/// `input_margin_us`, say): the configuration alone was checked at load,
+/// and the daemon must not exit over a saved setting.
+fn initial_engine(cfg: &AppConfig, opts: &HalOptions) -> anyhow::Result<EngineInfo> {
+    let d = &cfg.device;
+    let configured = EngineInfo::from_config(d)?;
+    let saved = d.state_file.as_deref().and_then(SavedState::load).unwrap_or_default();
+    Ok(match EngineInfo::from_saved(d, &saved) {
+        Ok(e) if driver_config(&e, 1, opts).is_ok() => e,
+        _ => configured,
+    })
+}
+
 fn log_next(next: &Next) {
     match next {
         Next::Stop(why) => info!("{why}: shutting down"),
@@ -316,6 +335,31 @@ impl Ctx<'_> {
         control::answer(call, &self.view(engine, Some(error))) == control::After::RestartDaemon
     }
 
+    /// Answers a control call while no engine runs, the last start having
+    /// failed with `error`; whether the daemon must restart. A change the
+    /// app applies meanwhile, saved in the state file, also goes into
+    /// `carry`, the state the next device starts from (see
+    /// [`Carry::take_app_change`]).
+    fn answer_idle(&self, mut call: control::Call, error: &str, carry: Option<&mut Carry>) -> bool {
+        let (Request::Apply { change }, Some(carry), Some(path)) =
+            (&call.request, carry, self.cfg.device.state_file.as_deref())
+        else {
+            return self.answer(call, None, error);
+        };
+        let change = change.clone();
+        // The answer passes through here, to see whether it was applied.
+        let (reply, mut answer) = oneshot::channel();
+        let app = std::mem::replace(&mut call.reply, reply);
+        let restart = self.answer(call, None, error);
+        if let Ok(response) = answer.try_recv() {
+            if matches!(response, Response::Applied { .. }) {
+                carry.take_app_change(&change, path);
+            }
+            let _ = app.send(response);
+        }
+        restart
+    }
+
     /// Saves a sample rate or bit depth that a controller asked for;
     /// whether the daemon must restart to apply it.
     fn apply_format(&self, engine: &Engine, request: FormatRequest) -> bool {
@@ -346,9 +390,15 @@ impl Ctx<'_> {
 /// Starts the engine, retrying until it runs, or returns why it stopped
 /// trying first. While it waits, the status line carries the driver's
 /// status and the last failure, and the app's calls are answered.
+///
+/// The app's changes of the name, latency and show lock go to the state
+/// file meanwhile, since no device runs to take them, and into `carry`
+/// too (see [`Ctx::answer_idle`]): a device started from `carry` does not
+/// read the state file, and would run without them and save the carried
+/// state over them.
 async fn start_engine(
     ctx: &mut Ctx<'_>,
-    carry: Option<Carry>,
+    mut carry: Option<Carry>,
     stop: &mut impl Stop,
 ) -> anyhow::Result<Result<Engine, Next>> {
     let mut delay = RETRY_FIRST;
@@ -395,7 +445,7 @@ async fn start_engine(
                     );
                 }
                 call = ctx.control.next() => {
-                    if ctx.answer(call, None, &last_error) {
+                    if ctx.answer_idle(call, &last_error, carry.as_mut()) {
                         return Ok(Err(Next::RestartDaemon));
                     }
                 }
@@ -513,17 +563,44 @@ struct Engine {
 
 /// What a device hands on to the one that replaces it, so that a restart
 /// keeps the names, subscriptions, latency and show lock set since the
-/// start even without a state file, and still lists the controllers'
-/// changes that explain the restart.
+/// start even without a state file, still lists the controllers' changes
+/// that explain the restart, and keeps the name it announced without
+/// probing for it again (see [`StartOptions::announced`]).
 #[derive(Clone)]
 struct Carry {
     state: SavedState,
     remote_changes: RemoteChanges,
+    announced: Option<String>,
 }
 
 impl From<&Device> for Carry {
     fn from(device: &Device) -> Self {
-        Carry { state: device.saved_state(), remote_changes: device.remote_changes() }
+        Carry {
+            state: device.saved_state(),
+            remote_changes: device.remote_changes(),
+            announced: device.announced_name(),
+        }
+    }
+}
+
+impl Carry {
+    /// Takes in `change`, which the app applied while no engine ran:
+    /// [`control::apply`] saved its name, latency and show lock in the
+    /// state file at `path` then, and they are read back from there, as
+    /// saved. Only what `change` set: the rest stays the carried state,
+    /// which holds even if the last save of the device that stopped
+    /// failed.
+    fn take_app_change(&mut self, change: &SettingsChange, path: &Path) {
+        let Some(saved) = SavedState::load(path) else { return };
+        if change.name.is_some() {
+            self.state.name = saved.name;
+        }
+        if change.latency_ms.is_some() {
+            self.state.latency_ns = saved.latency_ns;
+        }
+        if change.lock_remote_settings.is_some() {
+            self.state.lock_remote_settings = saved.lock_remote_settings;
+        }
     }
 }
 
@@ -588,15 +665,16 @@ impl Engine {
         // Controllers may change the sample rate and the bit depth: the
         // daemon applies them (run_engine), unless the show lock
         // (`[device] lock_remote_settings`, or the app) refuses them.
-        let (state, remote_changes) = match carry {
-            Some(c) => (Some(c.state), Some(c.remote_changes)),
-            None => (None, None),
+        let (state, remote_changes, announced) = match carry {
+            Some(c) => (Some(c.state), Some(c.remote_changes), c.announced),
+            None => (None, None, None),
         };
         let options = StartOptions {
             rings: Some(rings),
             format_configurable: true,
             remote_changes,
             state,
+            announced,
             ..Default::default()
         };
         Ok(Device::start_with_options(d.clone(), clock.clone(), options).await?)
@@ -1182,6 +1260,226 @@ mod tests {
         assert!(engine.device.remote_settings_locked());
         assert_eq!(engine.device.saved_state().subscriptions.len(), 1);
         engine.shutdown().await;
+    }
+
+    /// While the engine cannot start again after a restart, the app's
+    /// changes go to the state file. The device that starts at last takes
+    /// them in, rather than run on the carried state and save it over them,
+    /// and still has what only the carry holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_apps_changes_while_the_engine_restarts_are_kept() {
+        const PORT: u16 = 24946;
+        let dir = std::env::temp_dir().join(format!("ovsc-ca-carry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let socket = dir.join("control.sock");
+        let state = dir.join("state.toml");
+        let mut cfg = app_config("127.0.0.1", PORT);
+        cfg.coreaudio.control_socket = socket.to_str().unwrap().into();
+        cfg.device.state_file = Some(state.clone());
+        cfg.device.latency_ms = 4.0;
+        let region = HalRegion::create(VERSION).unwrap();
+        let registry = MemRegistry::new();
+        let initial = EngineInfo::from_config(&cfg.device).unwrap();
+        let transport = Box::new(registry.bind(SERVICE));
+        let server =
+            HalServer::start(cfg.coreaudio.hal_options(), region.clone(), transport, initial)
+                .unwrap();
+
+        // The engine ran, with a subscription and a new name, and stopped:
+        // the interface changed under it, say.
+        let engine = Engine::start(&cfg, &region, None).await.unwrap();
+        engine.device.subscribe(1, "01", "console").unwrap();
+        engine.device.rename("stage-left").unwrap();
+        let carry = Carry::from(&engine.device);
+        engine.shutdown().await;
+        // As if its last save had failed: the file holds an older name.
+        SavedState::update(&state, |s| s.name = Some("older".into())).unwrap();
+        // Something holds the device's ARC port: it cannot start yet.
+        let blocker = std::net::UdpSocket::bind(("127.0.0.1", PORT)).unwrap();
+
+        let mut listener =
+            ListenerCheck { invalid: Box::new(|| false), service: SERVICE.into(), reported: false };
+        let mut status = StatusTimer::new(Duration::ZERO);
+        let mut control = Control::listen(&cfg.coreaudio.control_socket);
+        let health = Mutex::new(Health::new());
+        let mut ctx = Ctx {
+            cfg: &cfg,
+            config_path: None,
+            region: &region,
+            server: &server,
+            listener: &mut listener,
+            status: &mut status,
+            control: &mut control,
+            health: &health,
+            sup: quiet(),
+        };
+        let (_stop_tx, mut stop) = mpsc::unbounded_channel();
+        let restart = start_engine(&mut ctx, Some(carry), &mut stop);
+        let app = async {
+            // Refused: nothing changes.
+            let change = SettingsChange {
+                latency_ms: Some(80.0),
+                name: Some("refused".into()),
+                ..Default::default()
+            };
+            let refused = ask(&socket, Request::Apply { change }).await;
+            assert!(matches!(refused, Response::Error { .. }), "{refused:?}");
+            // Meanwhile the operator turns the show lock on and sets 2 ms:
+            // saved in the state file, as the app is told.
+            let change = SettingsChange {
+                lock_remote_settings: Some(true),
+                latency_ms: Some(2.0),
+                ..Default::default()
+            };
+            assert_eq!(apply(&socket, change).await, Restart::None);
+            let saved = SavedState::load(&state).unwrap();
+            assert_eq!(
+                (saved.lock_remote_settings, saved.latency_ns),
+                (Some(true), Some(2_000_000))
+            );
+            // The network is back: the next attempt starts the engine.
+            drop(blocker);
+        };
+        let (started, ()) = tokio::join!(restart, app);
+        let Ok(Ok(engine)) = started else { panic!("the engine did not start") };
+        assert!(engine.device.remote_settings_locked());
+        assert_eq!(engine.device.info().latency_ns, 2_000_000);
+        // What the app did not change is the carried state's.
+        assert_eq!(engine.device.name(), "stage-left");
+        assert_eq!(engine.device.saved_state().subscriptions.len(), 1);
+        // The state file keeps all of it.
+        engine.shutdown().await;
+        let saved = SavedState::load(&state).unwrap();
+        assert_eq!((saved.lock_remote_settings, saved.latency_ns), (Some(true), Some(2_000_000)));
+        assert_eq!(saved.name.as_deref(), Some("stage-left"));
+        assert_eq!(saved.subscriptions.len(), 1);
+        server.shutdown().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A daemon that starts again (launchd starts a new one after a panic)
+    /// offers the driver the latency and names saved in the state file at
+    /// once, as the device will run with them: the device's start then
+    /// changes nothing, and Core Audio is not reconfigured a second time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_first_offer_has_the_saved_latency_and_names() {
+        let dir = std::env::temp_dir().join(format!("ovsc-ca-offer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = dir.join("state.toml");
+        // Set from the app: 2 ms, while the configuration says 4.
+        SavedState::update(&state, |s| {
+            s.latency_ns = Some(2_000_000);
+            s.name = Some("vocal-fx".into());
+            s.rx_names = vec!["Vox".into()];
+        })
+        .unwrap();
+        let mut cfg = app_config("127.0.0.1", 24956);
+        cfg.device.state_file = Some(state);
+        cfg.device.latency_ms = 4.0;
+        let registry = MemRegistry::new();
+        let (stop_tx, mut stop) = mpsc::unbounded_channel();
+        let daemon = serve(cfg, None, service(&registry), quiet(), &mut stop);
+        let driver = async {
+            let (_client, received, w) = attach(&registry).await;
+            let (_mapped, view) = map(&w);
+            let d = view.daemon();
+            wait_for("the engine", || d.flags.load(Ordering::Acquire) & DAEMON_ENGINE_RUNNING != 0)
+                .await;
+            // Asked again with the engine running: the same configuration,
+            // never replaced since the first.
+            let (_again, _, now) = attach(&registry).await;
+            assert_eq!(now.config, w.config);
+            assert_eq!(now.config.config_gen, 1);
+            assert!(!received.0.lock().unwrap().iter().any(|m| matches!(m, ToPlugin::Config(_))));
+            // 2 ms at 48 kHz, reported as the output latency.
+            assert_eq!(w.config.output_latency, 96);
+            assert_eq!(w.config.device_name, "vocal-fx");
+            assert_eq!(w.config.input_names, ["Vox", "02", "03"]);
+            stop_tx.send("test").unwrap();
+            wait_for("the bye", || received.got_bye()).await;
+        };
+        let (result, ()) = tokio::join!(daemon, driver);
+        result.unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A saved latency the driver cannot take with these options is left
+    /// out of the first offer, rather than stop the daemon: the device
+    /// then reports it when it runs.
+    #[test]
+    fn the_first_offer_leaves_out_a_saved_latency_the_driver_cannot_take() {
+        let dir = std::env::temp_dir().join(format!("ovsc-ca-wide-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = dir.join("state.toml");
+        let mut cfg = app_config("127.0.0.1", 24966);
+        cfg.device.sample_rate = 192_000;
+        cfg.device.state_file = Some(state.clone());
+        // Valid at the configured 4 ms; at 40 ms it spans the rings.
+        cfg.coreaudio.input_margin_us = 44_000;
+        cfg.validate_for(true).unwrap();
+        let opts = cfg.coreaudio.hal_options();
+        assert_eq!(initial_engine(&cfg, &opts).unwrap().latency_samples, 768);
+        SavedState::update(&state, |s| s.latency_ns = Some(2_000_000)).unwrap();
+        assert_eq!(initial_engine(&cfg, &opts).unwrap().latency_samples, 384);
+        SavedState::update(&state, |s| s.latency_ns = Some(40_000_000)).unwrap();
+        assert_eq!(initial_engine(&cfg, &opts).unwrap().latency_samples, 768);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Another device that announces `name` and answers for it, without
+    /// having probed for it: as two Macs given one name that started
+    /// together would.
+    async fn name_holder(name: &str, base: u16) -> Device {
+        let cfg = DeviceConfig {
+            name: name.into(),
+            interface: "127.0.0.1".into(),
+            ports: Ports { arc: base, cmc: base + 1, flow_control: base + 2, settings: base + 3 },
+            process_id: 99,
+            ..Default::default()
+        };
+        let options = StartOptions { announced: Some(name.into()), ..Default::default() };
+        Device::start_with_options(cfg, ovsc_clock::system_clock(), options).await.unwrap()
+    }
+
+    /// A restart for a new latency, and one of the whole engine, keep the
+    /// name the device announced while another device announces it too:
+    /// it is handed on, not probed for again, so the device never renames
+    /// itself mid-show. The conflict is reported.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restarts_keep_the_announced_name_through_a_live_conflict() {
+        let name = format!("ca-keep{}", std::process::id());
+        let mut cfg = app_config("127.0.0.1", 24976);
+        cfg.device.name = name.clone();
+        cfg.device.discovery = true;
+        let region = HalRegion::create(VERSION).unwrap();
+        let engine = Engine::start(&cfg, &region, None).await.unwrap();
+        wait_for("the name", || engine.device.announced_name().is_some()).await;
+        let holder = name_holder(&name, 24986).await;
+        wait_for("the conflict", || engine_conflict(&engine)).await;
+
+        engine.device.request_latency(2_000_000).unwrap();
+        let engine = engine.restart_device(&cfg, &region).await.unwrap();
+        wait_for("the conflict after the restart", || engine_conflict(&engine)).await;
+        // Longer than a probe takes.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(engine.device.name(), name);
+        assert!(engine_conflict(&engine));
+
+        let carry = Carry::from(&engine.device);
+        engine.shutdown().await;
+        let engine = Engine::start(&cfg, &region, Some(carry)).await.unwrap();
+        wait_for("the conflict after the engine restart", || engine_conflict(&engine)).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(engine.device.name(), name);
+        assert_eq!(engine.device.saved_state().name.as_deref(), Some(name.as_str()));
+        engine.shutdown().await;
+        holder.shutdown().await;
+    }
+
+    /// Whether `engine`'s device reports another device announcing its
+    /// name, without having renamed itself.
+    fn engine_conflict(engine: &Engine) -> bool {
+        engine.device.name_conflict().is_some_and(|c| c.renamed_to.is_none())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

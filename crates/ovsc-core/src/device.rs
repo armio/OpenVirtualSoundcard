@@ -2,7 +2,7 @@
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot, watch};
@@ -51,6 +51,8 @@ pub struct Device {
     state_file: Option<std::path::PathBuf>,
     /// Why the saved state could not be used, if it could not.
     state_problem: Option<String>,
+    /// The device name [`advertise`] announces, once it has claimed it.
+    announced: Arc<Mutex<Option<String>>>,
 }
 
 /// Status of a receive channel.
@@ -99,6 +101,16 @@ pub struct StartOptions {
     /// restart keeps the names and subscriptions made since the start
     /// even without a state file. It is saved to the state file, if any.
     pub state: Option<SavedState>,
+    /// The name the device this one replaces in this process announced
+    /// ([`Device::announced_name`]). Starting with that name, the device
+    /// announces it again without probing for it first: the name is
+    /// already its own on the network, and a probe would be answered by
+    /// any other device that announces it too (two devices given the same
+    /// name, say), which would rename this one mid-show, breaking every
+    /// subscription to it. That conflict is reported instead
+    /// ([`Device::name_conflict`], `renamed_to: None`). Any other name is
+    /// probed for, as at a first start.
+    pub announced: Option<String>,
 }
 
 /// Packet counters since the device started.
@@ -185,7 +197,15 @@ impl Device {
         let state_problem = recovered
             .problem
             .or_else(|| config.state_file.as_deref().and_then(persist::problem_at_start));
-        let config = with_saved_latency(config, &saved);
+        let config = config.with_saved(&saved);
+        if let Some(ns) = saved.latency_ns {
+            let ms = ns as f64 / 1e6;
+            if config.latency_ns() == ns {
+                info!("receive latency {ms} ms, as set by a controller or the app");
+            } else {
+                warn!("ignoring the saved latency of {ms} ms");
+            }
+        }
         let iface = Interface::find(&config.interface)?;
         let info = DeviceInfo::new(&config, iface)?;
         let state = initial_state(&config, &info, saved);
@@ -267,8 +287,11 @@ impl Device {
         let rx = RxManager::new(shared.clone(), directory, rx_threads_tx);
         tasks.push(("receive manager", tokio::spawn(rx.run(rx_shutdown_rx))));
 
+        let announced = Arc::new(Mutex::new(None));
         if let Some(m) = &mdns {
-            tasks.push(("mDNS advertiser", tokio::spawn(advertise(shared.clone(), m.clone()))));
+            let claimed = options.announced;
+            let advertiser = advertise(shared.clone(), m.clone(), claimed, announced.clone());
+            tasks.push(("mDNS advertiser", tokio::spawn(advertiser)));
         }
         if let Some(path) = config.state_file.clone() {
             tasks.push(("state saver", tokio::spawn(persist::run(shared.clone(), path, on_disk))));
@@ -296,7 +319,17 @@ impl Device {
             sweeper,
             state_file: config.state_file,
             state_problem,
+            announced,
         })
+    }
+
+    /// The device name this device announces on the network, once it has
+    /// claimed it (probed for it, RFC 6762 §8.1, or taken it over from the
+    /// device it replaces); `None` before that, and without discovery. A
+    /// device that replaces this one in the same process takes it over
+    /// through [`StartOptions::announced`].
+    pub fn announced_name(&self) -> Option<String> {
+        self.announced.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
     /// The names, subscriptions and latency a controller or the app set,
@@ -632,36 +665,11 @@ fn stats(shared: &Shared) -> DeviceStats {
     }
 }
 
-/// `config` with the receive latency a controller or the app saved, if it
-/// is valid.
-fn with_saved_latency(mut config: DeviceConfig, saved: &SavedState) -> DeviceConfig {
-    if let Some(ns) = saved.latency_ns {
-        let ms = ns as f64 / 1e6;
-        if crate::config::check_latency_ms("latency", ms, config.tx_guard_us).is_ok() {
-            info!("receive latency {ms} ms, as set by a controller or the app");
-            config.latency_ms = ms;
-        } else {
-            warn!("ignoring the saved latency of {ms} ms");
-        }
-    }
-    config
-}
-
+/// The state a device starts in. `config` already holds the saved name and
+/// latency ([`DeviceConfig::with_saved`]).
 fn initial_state(config: &DeviceConfig, info: &DeviceInfo, saved: SavedState) -> State {
-    let pick = |saved: &[String], factory: &[String]| -> Vec<String> {
-        factory
-            .iter()
-            .enumerate()
-            .map(|(i, f)| saved.get(i).filter(|s| !s.is_empty()).unwrap_or(f).clone())
-            .collect()
-    };
-    let name = saved
-        .name
-        .clone()
-        .filter(|n| ovsc_proto::discovery::validate_device_name(n).is_ok())
-        .unwrap_or_else(|| {
-            if config.name.is_empty() { info.factory_name.clone() } else { config.name.clone() }
-        });
+    let name = if config.name.is_empty() { info.factory_name.clone() } else { config.name.clone() };
+    let (rx_names, tx_names) = saved.channel_names(&info.rx_channels, &info.tx_channels);
     let mut subscriptions = vec![None; info.rx_channels.len()];
     let initial = config.subscriptions.iter().map(|s| (s.rx_channel, &s.tx_channel, &s.tx_device));
     let restored = saved.subscriptions.iter().map(|s| (s.rx_channel, &s.tx_channel, &s.tx_device));
@@ -680,8 +688,8 @@ fn initial_state(config: &DeviceConfig, info: &DeviceInfo, saved: SavedState) ->
     State {
         name,
         name_conflict: None,
-        tx_names: pick(&saved.tx_names, &info.tx_channels),
-        rx_names: pick(&saved.rx_names, &info.rx_channels),
+        tx_names,
+        rx_names,
         subscriptions,
         tx_flows: Vec::new(),
         rx_flows: Vec::new(),
@@ -718,11 +726,22 @@ struct Renaming {
 /// rename from a controller, so the device that held the name first keeps
 /// it, and neither changes name at its next start. A conflict that only
 /// shows once a name is announced renames nothing (see [`crate::mdns`]).
-async fn advertise(shared: Arc<Shared>, mdns: Mdns) {
+///
+/// `claimed` is the name the device this one replaces in this process
+/// announced ([`StartOptions::announced`]): already this device's on the
+/// network, it is announced again without a probe, which another device
+/// announcing it too would answer. Such a device is a conflict reported
+/// with `renamed_to: None`, as one that appears while the name is
+/// announced. The device name whose records are announced goes to
+/// `announced` ([`Device::announced_name`]).
+async fn advertise(
+    shared: Arc<Shared>,
+    mdns: Mdns,
+    mut claimed: Option<String>,
+    announced: Arc<Mutex<Option<String>>>,
+) {
     let mut watch = shared.watch();
     let mut conflicts = mdns.conflicts();
-    // The device name whose records we announce.
-    let mut claimed: Option<String> = None;
     let mut renaming: Option<Renaming> = None;
     let mut last = None;
     loop {
@@ -771,6 +790,7 @@ async fn advertise(shared: Arc<Shared>, mdns: Mdns) {
         if last.as_ref() != Some(&records) {
             mdns.set_records(records.clone()).await;
             last = Some(records);
+            *announced.lock().unwrap_or_else(PoisonError::into_inner) = claimed.clone();
         }
         report_name_conflict(&shared, renaming.as_ref(), &conflicts.borrow_and_update());
         tokio::select! {

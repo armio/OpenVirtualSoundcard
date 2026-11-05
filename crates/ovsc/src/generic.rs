@@ -68,12 +68,12 @@ pub async fn run(cfg: AppConfig, sup: Supervision, stop: &mut impl Stop) -> anyh
                     "restarting the device for a receive latency of {} ms",
                     engine.device.configured_latency_ns() as f64 / 1e6
                 );
-                let state = engine.device.saved_state();
+                let carry = Carry::from(&engine.device);
                 match engine.restart_device(&cfg).await {
                     Ok(engine) => engine,
                     Err(e) => {
                         warn!("cannot restart the device: {e:#}; restarting the engine");
-                        match start_engine(&cfg, Some(state), sup, stop).await? {
+                        match start_engine(&cfg, Some(carry), sup, stop).await? {
                             Some(engine) => engine,
                             None => return Ok(()),
                         }
@@ -81,9 +81,9 @@ pub async fn run(cfg: AppConfig, sup: Supervision, stop: &mut impl Stop) -> anyh
                 }
             }
             Next::RestartEngine => {
-                let state = engine.device.saved_state();
+                let carry = Carry::from(&engine.device);
                 engine.shutdown().await;
-                match start_engine(&cfg, Some(state), sup, stop).await? {
+                match start_engine(&cfg, Some(carry), sup, stop).await? {
                     Some(engine) => engine,
                     None => return Ok(()),
                 }
@@ -181,11 +181,11 @@ async fn run_engine(
 }
 
 /// Starts the engine, retrying until it runs (the network may come up
-/// late), with the names and subscriptions `carried` over from the engine
-/// it replaces. `None` if a stop came first.
+/// late), from what the engine it replaces `carried` over. `None` if a stop
+/// came first.
 async fn start_engine(
     cfg: &AppConfig,
-    carried: Option<SavedState>,
+    carried: Option<Carry>,
     sup: Supervision,
     stop: &mut impl Stop,
 ) -> anyhow::Result<Option<Engine>> {
@@ -227,6 +227,22 @@ async fn start_engine(
     }
 }
 
+/// What a device hands on to the one that replaces it: the names and
+/// subscriptions set since the start, kept even without a state file, and
+/// the name it announced, kept without probing for it again (see
+/// [`StartOptions::announced`]).
+#[derive(Clone)]
+struct Carry {
+    state: SavedState,
+    announced: Option<String>,
+}
+
+impl From<&Device> for Carry {
+    fn from(device: &Device) -> Self {
+        Carry { state: device.saved_state(), announced: device.announced_name() }
+    }
+}
+
 /// The device and its clock.
 struct Engine {
     device: Device,
@@ -236,7 +252,7 @@ struct Engine {
 }
 
 impl Engine {
-    async fn start(cfg: &AppConfig, carried: Option<SavedState>) -> anyhow::Result<Engine> {
+    async fn start(cfg: &AppConfig, carried: Option<Carry>) -> anyhow::Result<Engine> {
         let iface = Interface::find(&cfg.device.interface)?;
         let (clock, follower) = match cfg.clock.source {
             ClockSource::System => {
@@ -275,9 +291,9 @@ impl Engine {
         let Engine { device, clock, follower } = self;
         let mut cfg = cfg.clone();
         cfg.device.latency_ms = device.configured_latency_ns() as f64 / 1e6;
-        let state = device.saved_state();
+        let carry = Carry::from(&device);
         device.shutdown().await;
-        match start_device(&cfg, &clock, Some(state)).await {
+        match start_device(&cfg, &clock, Some(carry)).await {
             Ok(device) => Ok(Engine { device, clock, follower }),
             Err(e) => {
                 if let Some(f) = follower {
@@ -299,9 +315,13 @@ impl Engine {
 async fn start_device(
     cfg: &AppConfig,
     clock: &MediaClock,
-    state: Option<SavedState>,
+    carry: Option<Carry>,
 ) -> anyhow::Result<Device> {
-    let options = StartOptions { state, ..Default::default() };
+    let (state, announced) = match carry {
+        Some(c) => (Some(c.state), c.announced),
+        None => (None, None),
+    };
+    let options = StartOptions { state, announced, ..Default::default() };
     Ok(Device::start_with_options(cfg.device.clone(), clock.clone(), options).await?)
 }
 
@@ -701,6 +721,57 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// Whether `engine`'s device reports another device announcing its
+    /// name, without having renamed itself.
+    fn live_conflict(engine: &Engine) -> bool {
+        engine.device.name_conflict().is_some_and(|c| c.renamed_to.is_none())
+    }
+
+    /// A restart for a new latency, and one of the whole engine, keep the
+    /// name the device announced while another device announces it too:
+    /// it is handed on, not probed for again, so the device never renames
+    /// itself mid-show. The conflict is reported.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restarts_keep_the_announced_name_through_a_live_conflict() {
+        let name = format!("gen-keep{}", std::process::id());
+        let mut cfg = app_config(26150);
+        cfg.device.name = name.clone();
+        cfg.device.discovery = true;
+        let engine = Engine::start(&cfg, None).await.unwrap();
+        eventually("the name", || engine.device.announced_name().is_some()).await;
+        // Another device that announces the name and answers for it,
+        // without having probed for it: as two machines given one name
+        // that started together would.
+        let holder_cfg = DeviceConfig {
+            name: name.clone(),
+            interface: "127.0.0.1".into(),
+            ports: Ports { arc: 26160, cmc: 26161, flow_control: 26162, settings: 26163 },
+            process_id: 99,
+            ..Default::default()
+        };
+        let options = StartOptions { announced: Some(name.clone()), ..Default::default() };
+        let holder = Device::start_with_options(holder_cfg, system_clock(), options).await.unwrap();
+        eventually("the conflict", || live_conflict(&engine)).await;
+
+        engine.device.request_latency(2_000_000).unwrap();
+        let engine = engine.restart_device(&cfg).await.unwrap();
+        eventually("the conflict after the restart", || live_conflict(&engine)).await;
+        // Longer than a probe takes.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(engine.device.name(), name);
+        assert!(live_conflict(&engine));
+
+        let carry = Carry::from(&engine.device);
+        engine.shutdown().await;
+        let engine = Engine::start(&cfg, Some(carry)).await.unwrap();
+        eventually("the conflict after the engine restart", || live_conflict(&engine)).await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(engine.device.name(), name);
+        assert_eq!(engine.device.saved_state().name.as_deref(), Some(name.as_str()));
+        engine.shutdown().await;
+        holder.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
