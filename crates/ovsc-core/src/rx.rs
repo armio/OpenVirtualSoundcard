@@ -2879,6 +2879,44 @@ mod tests {
             tx.shutdown().await;
         }
 
+        /// A flow from a transmitter with two addresses (a computer on
+        /// Wi-Fi and Ethernet) is requested again for a new latency with
+        /// both: it still takes audio from either. Requested again with the
+        /// one it was requested from alone, it would drop audio the
+        /// transmitter sends from its other interface.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_new_latency_keeps_every_address_of_the_transmitter() {
+            let tx = Device::start(config("relat-multi-tx", 25190), ovsc_clock::system_clock())
+                .await
+                .unwrap();
+            let directory = StaticDirectory::new();
+            // Its Wi-Fi address (TEST-NET-1), after the one it is reached at.
+            let wifi = Ipv4Addr::new(192, 0, 2, 7);
+            for mut entry in tx.directory_entries() {
+                entry.addrs.push(wifi);
+                directory.insert(entry);
+            }
+            let iface = Interface::find("127.0.0.1").unwrap();
+            let mut mgr = manager(&config("relat-multi-rx", 25200), iface, directory);
+            subscribe(&mgr, 0, "01", "relat-multi-tx");
+            drive(&mut mgr, |m| m.flows.len() == 1 && m.flows[0].routes.feeds(0)).await;
+            let both = [Ipv4Addr::LOCALHOST, wifi];
+            assert_eq!(mgr.flows[0].worker.params.tx.as_slice(), both);
+
+            let old = mgr.flows[0].handle;
+            mgr.shared.request_latency(20_000_000).unwrap();
+            assert!(mgr.shared.restart_rx());
+            drive(&mut mgr, |m| {
+                m.flows.len() == 1 && m.flows[0].handle != old && m.flows[0].routes.feeds(0)
+            })
+            .await;
+            let flow = &mgr.flows[0];
+            assert_eq!(flow.own, 960);
+            assert_eq!(flow.worker.params.tx.as_slice(), both);
+            mgr.stop_all().await;
+            tx.shutdown().await;
+        }
+
         /// A flow takes audio from every address its transmitter has, the
         /// one it was requested from first: a computer on Wi-Fi and Ethernet
         /// may send from either.
