@@ -135,6 +135,13 @@ pub struct DeviceStats {
     /// The transmit thread has stopped: no flow sends audio until the
     /// device restarts.
     pub tx_engine_failed: bool,
+    /// Packets missing from received flows: gaps in their timestamps.
+    pub rx_lost_packets: u64,
+    /// Received packets stamped ahead of our clock by more than a packet.
+    pub rx_early_packets: u64,
+    /// Datagrams receive flows dropped: from another sender than the
+    /// flow's transmitter, or not whole frames of the flow's slots.
+    pub rx_rejected_packets: u64,
 }
 
 impl Device {
@@ -615,6 +622,9 @@ fn stats(shared: &Shared) -> DeviceStats {
         tx_expired_flows: c.tx_expired_flows.load(Ordering::Relaxed),
         tx_not_realtime: c.tx_not_realtime.load(Ordering::Relaxed),
         tx_engine_failed: c.tx_engine_failed.load(Ordering::Relaxed),
+        rx_lost_packets: c.rx_lost_packets.load(Ordering::Relaxed),
+        rx_early_packets: c.rx_early_packets.load(Ordering::Relaxed),
+        rx_rejected_packets: c.rx_rejected_packets.load(Ordering::Relaxed),
     }
 }
 

@@ -188,11 +188,7 @@ impl App {
         let driver = &status.driver;
         let (driver_light, driver_word) = logic::driver_light(driver);
         let (audio_light, audio_word) = logic::audio_light(driver);
-        let audio_hover = if driver.io_running {
-            "An application is playing or recording through OpenVirtualSoundcard."
-        } else {
-            "No application is using OpenVirtualSoundcard right now."
-        };
+        let audio_hover = logic::audio_hover(driver);
         [
             (
                 "Clock",
@@ -200,7 +196,7 @@ impl App {
                 format!("Source: {}", logic::clock_source_label(&status.clock.source)),
             ),
             ("Driver", (driver_light, driver_word.to_owned()), driver.detail.clone()),
-            ("Audio", (audio_light, audio_word.to_owned()), audio_hover.to_owned()),
+            ("Audio", (audio_light, audio_word.to_owned()), audio_hover),
         ]
     }
 
@@ -253,9 +249,26 @@ impl App {
 
     fn status_tab(&self, ui: &mut Ui) {
         let Connection::Up(status) = &self.connection else { return };
-        if !status.warnings.is_empty() {
+        // Audio down now first, in red; then what is worth a look.
+        let (urgent, other) = logic::split_warnings(status);
+        if !urgent.is_empty() {
+            notice(ui, Light::Red, |ui| {
+                for warning in urgent {
+                    ui.label(RichText::new(format!("⚠ {warning}")).strong());
+                }
+                if status.driver.faulted {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(logic::RESTART_CORE_AUDIO).monospace());
+                        if ui.small_button("Copy").clicked() {
+                            ui.ctx().copy_text(logic::RESTART_CORE_AUDIO.to_owned());
+                        }
+                    });
+                }
+            });
+        }
+        if !other.is_empty() {
             notice(ui, Light::Amber, |ui| {
-                for warning in &status.warnings {
+                for warning in other {
                     ui.label(RichText::new(format!("⚠ {warning}")).strong());
                 }
             });
@@ -305,6 +318,7 @@ impl App {
                             ("Sent without audio", logic::count_label(p.tx_underruns)),
                             ("Received", logic::count_label(p.rx)),
                             ("Arrived too late", logic::count_label(p.rx_late)),
+                            ("Lost", logic::count_label(p.rx_lost)),
                         ],
                     );
                 });
@@ -312,6 +326,13 @@ impl App {
             });
         } else {
             section(ui, "Core Audio driver", |ui| driver_rows(ui, status));
+        }
+        if !status.earlier.is_empty() {
+            section(ui, "Earlier", |ui| {
+                for news in &status.earlier {
+                    ui.add(egui::Label::new(RichText::new(news).weak()).wrap());
+                }
+            });
         }
     }
 

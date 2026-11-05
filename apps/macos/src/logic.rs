@@ -330,21 +330,63 @@ pub fn clock_source_label(source: &str) -> String {
     }
 }
 
-/// The driver's light and word.
+/// The command that brings a failed driver back.
+pub const RESTART_CORE_AUDIO: &str = "sudo killall coreaudiod";
+
+/// The driver's light and word: red when missing or failed.
 pub fn driver_light(driver: &DriverInfo) -> (Light, &'static str) {
-    if driver.connected { (Light::Green, "Connected") } else { (Light::Red, "Not connected") }
+    if driver.faulted {
+        (Light::Red, "Failed")
+    } else if driver.connected {
+        (Light::Green, "Connected")
+    } else {
+        (Light::Red, "Not connected")
+    }
 }
 
-/// The audio's light and word: amber while the driver is there but holds
-/// the audio back.
+/// The audio's light and word: red when a failed driver silences it, amber
+/// when it flows with recent dropouts, or while the driver is there but
+/// holds the audio back.
 pub fn audio_light(driver: &DriverInfo) -> (Light, &'static str) {
-    if driver.audio_flowing {
+    if driver.faulted {
+        (Light::Red, "Silent")
+    } else if driver.audio_flowing && driver.audio_trouble {
+        (Light::Amber, "Dropouts")
+    } else if driver.audio_flowing {
         (Light::Green, "Flowing")
     } else if driver.connected {
         (Light::Amber, "Stopped")
     } else {
         (Light::Grey, "Stopped")
     }
+}
+
+/// What the audio light means now, for its hover.
+pub fn audio_hover(driver: &DriverInfo) -> String {
+    if driver.faulted {
+        format!(
+            "The driver has failed: every input and return is silent. Restart Core Audio with \
+             {RESTART_CORE_AUDIO} in Terminal."
+        )
+    } else if driver.audio_flowing && driver.audio_trouble {
+        "Audio flows, but with dropouts or other problems in the last 30 seconds: see the \
+         warnings."
+            .to_owned()
+    } else if driver.io_running && !driver.audio_flowing {
+        "An application is using OpenVirtualSoundcard, but the driver holds the audio back: \
+         inputs and returns are silent. See the warnings."
+            .to_owned()
+    } else if driver.io_running {
+        "An application is playing or recording through OpenVirtualSoundcard.".to_owned()
+    } else {
+        "No application is using OpenVirtualSoundcard right now.".to_owned()
+    }
+}
+
+/// The status's warnings, as the urgent ones (audio is down now: shown in
+/// red) and the others. A daemon before the split marks none urgent.
+pub fn split_warnings(status: &Status) -> (&[String], &[String]) {
+    status.warnings.split_at(status.urgent_warnings.min(status.warnings.len()))
 }
 
 /// Nanoseconds in microseconds: `-1.2 µs`.
@@ -756,6 +798,8 @@ mod tests {
             connected,
             io_running: false,
             audio_flowing,
+            faulted: false,
+            audio_trouble: false,
             detail: String::new(),
         };
         assert_eq!(driver_light(&driver(true, false)).0, Light::Green);
@@ -763,6 +807,47 @@ mod tests {
         assert_eq!(audio_light(&driver(true, true)), (Light::Green, "Flowing"));
         assert_eq!(audio_light(&driver(true, false)), (Light::Amber, "Stopped"));
         assert_eq!(audio_light(&driver(false, false)), (Light::Grey, "Stopped"));
+
+        // A failed driver is red, with the way back on hover.
+        let failed = DriverInfo { faulted: true, ..driver(true, false) };
+        assert_eq!(driver_light(&failed), (Light::Red, "Failed"));
+        assert_eq!(audio_light(&failed), (Light::Red, "Silent"));
+        assert!(audio_hover(&failed).contains(RESTART_CORE_AUDIO));
+        // Audio that flows with recent problems is amber.
+        let troubled = DriverInfo { audio_trouble: true, io_running: true, ..driver(true, true) };
+        assert_eq!(audio_light(&troubled), (Light::Amber, "Dropouts"));
+        assert!(audio_hover(&troubled).contains("dropouts"));
+        // Held back while an application plays: amber, and said so.
+        let held = DriverInfo { io_running: true, ..driver(true, false) };
+        assert_eq!(audio_light(&held), (Light::Amber, "Stopped"));
+        assert!(audio_hover(&held).contains("holds the audio back"));
+        assert!(audio_hover(&driver(true, true)).starts_with("No application"));
+        let playing = DriverInfo { io_running: true, ..driver(true, true) };
+        assert!(audio_hover(&playing).starts_with("An application is playing"));
+    }
+
+    #[test]
+    fn urgent_warnings_come_apart() {
+        let line = r#"{"result":"status","protocol":1,"version":"0.1.0","engine_running":true,
+            "engine_error":null,"device":null,
+            "clock":{"source":"ptp","state":"Locked","locked":true,"leader":null,
+                "offset_ns":0,"path_delay_ns":0,"freq_offset_ppm":0.0},
+            "driver":{"connected":true,"io_running":true,"audio_flowing":false,"faulted":true,
+                "audio_trouble":false,"detail":""},
+            "warnings":["down","late"],"urgent_warnings":1,"earlier":["old"]}"#
+            .replace('\n', " ");
+        let Response::Status(mut status) = decode_line(&line).unwrap() else {
+            panic!("not a status");
+        };
+        assert_eq!(split_warnings(&status), (&["down".to_owned()][..], &["late".to_owned()][..]));
+        assert_eq!(audio_light(&status.driver).0, Light::Red);
+        assert_eq!(status.earlier, ["old"]);
+        // A count beyond the list (a confused daemon) takes the list.
+        status.urgent_warnings = 5;
+        assert_eq!(split_warnings(&status).0.len(), 2);
+        // A daemon before the split: all amber.
+        status.urgent_warnings = 0;
+        assert!(split_warnings(&status).0.is_empty());
     }
 
     #[test]

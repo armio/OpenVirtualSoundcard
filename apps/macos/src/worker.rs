@@ -305,9 +305,13 @@ mod tests {
                 connected: true,
                 io_running: false,
                 audio_flowing: true,
+                faulted: false,
+                audio_trouble: false,
                 detail: String::new(),
             },
             warnings: vec![],
+            urgent_warnings: 0,
+            earlier: vec![],
         }
     }
 
