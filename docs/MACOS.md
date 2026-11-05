@@ -375,16 +375,20 @@ The daemon's clock is in one of these states:
 
 | State | Meaning |
 |---|---|
-| Unlocked | No master heard yet, or the master went silent. After losing a master the clock keeps running on its last frequency for 30 s (holdover), then becomes invalid. |
-| Locking | A master was found; the servo is converging. |
+| Unlocked | No master heard yet, or the master went silent. After losing a master the clock keeps running on its frequency estimate for 30 s (holdover), then becomes invalid. |
+| Locking | A master was found and the servo is converging; or a locked clock is slewing back after its error stayed above 250 µs (an unlock), or checking its time against a new master. |
 | Locked | Following the master. |
 | FreeRunning | `clock.source = "free"`. |
 
-The driver keeps its own continuous timeline for Core Audio and follows the
-daemon's clock when it is Locked or FreeRunning ([Device timeline](#device-timeline)).
-The status shows the driver's side as `clock=synthetic` (it has not followed
-a daemon clock yet), `clock=following` or `clock=holdover` (it lost the
-daemon's clock and keeps going at the last rate).
+The driver keeps its own continuous timeline for Core Audio
+([Device timeline](#device-timeline)). It starts following a daemon clock
+once that clock is Locked or FreeRunning, and from then on keeps following
+it in any state for as long as its `step_gen` stays the same: the daemon
+bumps `step_gen` on every jump of its clock, so a clock with the same
+`step_gen` is continuous with what the driver plays. The status shows the
+driver's side as `clock=synthetic` (it has not followed a daemon clock yet),
+`clock=following` or `clock=holdover` (it lost the daemon's clock and keeps
+going at the last rate).
 
 Audio flows only while the driver's **gate** is open (`gate=1`). The gate is
 open when all of these hold:
@@ -394,25 +398,46 @@ open when all of these hold:
   less than 1 s old;
 * the daemon's clock is valid and within 1000 ppm of nominal;
 * the driver's timeline follows this clock, or continues it in holdover: a
-  new daemon's clock, or the same clock after a step, is shut out until the
-  timeline follows it (so never while `clock=synthetic`);
+  new daemon's clock, or the same clock after a step, is shut out until it
+  has locked and the timeline follows it (so never while
+  `clock=synthetic`);
 * the daemon's clock agrees with the driver's timeline to within 250 µs.
 
 Otherwise the inputs read silence and the outputs are dropped. So:
 
 * before the daemon's clock first locks, the device is silent;
+* when Syncs are delayed for a few seconds (a network without
+  strict-priority QoS for PTP, a loaded 100 Mbit link), the daemon's clock
+  may unlock: it keeps its frequency estimate and slews back gently, by at
+  most 100 ppm, and the driver keeps following it. Audio keeps flowing and
+  nothing slips;
 * when the master goes away (no Sync for 5 s), the daemon's clock holds over
-  for 30 s on its last mapping, and audio keeps flowing on it while the two
-  clocks agree. When a master is heard again the daemon locks to it and the
-  driver realigns once; if the holdover runs out first, the device is silent
-  until then;
-* when the clock steps, the driver realigns once: the audio slips once, but
-  the timeline Core Audio sees stays continuous. A new master silences the
-  device until the daemon's clock has locked to it, then the driver realigns
-  the same way;
-* when the daemon restarts, audio stops until the new daemon's clock locks.
+  for 30 s on its frequency estimate, and the driver follows it. When the
+  same or a new master is heard, the daemon checks it against its running
+  clock: within 250 µs it slews on and audio keeps flowing; beyond, it steps
+  (see the next point). If the holdover runs out first, the device is silent
+  until the daemon's clock locks again;
+* a new leader that was synchronised to the old one, the normal Dante leader
+  change (the leader reboots, Preferred Leader is moved, a better device
+  joins), agrees with the running clock to within microseconds: the clock
+  stays continuous, `step_gen` does not change, and audio keeps flowing.
+  If the old leader just went silent, the switch comes after the 5 s
+  master timeout, during which the clock runs on;
+* when the clock steps (the master's time jumped by more than 2 ms, or a new
+  master's time differs from the running clock by more than 250 µs), the
+  device is silent until the daemon's clock has locked again, then the
+  driver realigns once: the audio slips once, but the timeline Core Audio
+  sees stays continuous. For a new master 10 ms off, the replay test
+  measures 1.6 s of silence at the median and 5.5 s at worst;
+* when the daemon restarts, audio stops until the new daemon's clock locks
+  (3.6 s at the median and about 7.6 s at worst in the servo simulation).
   Core Audio sees no change: no reconfiguration, no new timeline;
 * when the daemon is stopped, the device stays present and silent.
+
+The daemon's clock status counts unlocks, steps (with the size of the last
+one), master changes and master losses, and reports the masters heard
+besides the one followed, the time of the last Sync and when a holdover
+runs out, so that it can warn before a problem is heard.
 
 ## Status
 
@@ -726,9 +751,9 @@ synchronously on every clock change. The driver reads it with a bounded
 number of tries and keeps its last good record, so a daemon that dies in the
 middle of a write cannot make the IO thread spin. The mirror counts
 discontinuities in `step_gen`: a jump of the media time by more than 1 µs, the
-clock becoming valid, a grandmaster other than the last one, or a change into
-Locked or FreeRunning. Losing the master is not one: the clock holds over on
-the same mapping.
+clock becoming valid, or a change into FreeRunning. A change of master or of
+lock state is not one by itself, and neither is losing the master: the
+mapping says whether the time moved.
 
 ## Device timeline
 
@@ -750,9 +775,11 @@ T(h) = t_whole + t_frac + (h − h_a) × rho        device frame t lives at ring
   timeline does not move.
 * Only a rate jump beyond 200 ppm, a reset (a new sample rate) or an IO stall
   of more than 4 periods gives Core Audio a new timeline (a new seed).
-* The timeline follows the daemon's clock only while it is valid, Locked or
-  FreeRunning and within 1000 ppm, the daemon's engine runs at the device's
-  rate, and its heartbeat is under 1 s old. Otherwise it holds over at its
+* The timeline follows the daemon's clock only while it is valid and within
+  1000 ppm, the daemon's engine runs at the device's rate, and its heartbeat
+  is under 1 s old; and only once it is Locked or FreeRunning, unless it is
+  the clock (daemon generation and `step_gen`) the timeline already
+  follows, which it follows in any state. Otherwise it holds over at its
   current rate.
 
 The audio passes the network unchanged: the driver writes output frame `t` at

@@ -82,16 +82,47 @@ pub struct MasterInfo {
 }
 
 /// Diagnostic information about the clock.
+///
+/// The counters cover the life of the clock (one PTP follower) and let a
+/// supervisor warn before a problem is heard: repeated unlocks mean Syncs
+/// are being delayed (missing QoS for PTP, an overloaded link), steps and
+/// master changes are moments the audio may have slipped, and other
+/// masters are competing leaders.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ClockStatus {
     pub state: ClockState,
     pub master: Option<MasterInfo>,
     /// Last measured offset from the master (master minus us), nanoseconds.
+    /// This is the servo's filtered error against its own estimate of the
+    /// master's time.
     pub offset_ns: i64,
     /// Last measured mean path delay to the master, nanoseconds.
     pub mean_path_delay_ns: i64,
-    /// Current frequency correction relative to the local clock, ppb.
+    /// Frequency estimate relative to the local clock, ppb: what holdover
+    /// runs at. The published rate also carries the phase loop's
+    /// correction.
     pub freq_offset_ppb: f64,
+    /// Times a locked clock lost lock without stepping: its error stayed
+    /// above 250 µs for several Syncs.
+    pub unlocks: u32,
+    /// Steps of the clock after its first acquisition (a jump of the
+    /// master's time, or a new master whose time differs).
+    pub steps: u32,
+    /// Size of the last of those steps (master minus us), nanoseconds.
+    pub last_step_ns: i64,
+    /// Changes from one master to another.
+    pub master_changes: u32,
+    /// Times the master went silent with no other to take over.
+    pub master_losses: u32,
+    /// Masters currently heard besides the one followed.
+    pub other_masters: u32,
+    /// Local time ([`local_now_ns`]) of the last Sync used from the master
+    /// followed, 0 if none yet.
+    pub last_sync_ns: u64,
+    /// While the clock runs on without a master's Syncs (holdover, or a new
+    /// master not heard yet): the local time at which it will be
+    /// invalidated unless they arrive.
+    pub holdover_until_ns: Option<u64>,
 }
 
 /// Receives every change of a [`MediaClock`], for example to copy it into

@@ -78,6 +78,18 @@ struct OutstandingDelayReq {
     sync: SyncTimes,
 }
 
+/// Events counted for [`ClockStatus`].
+#[derive(Clone, Copy, Debug, Default)]
+struct Counters {
+    unlocks: u32,
+    steps: u32,
+    last_step_ns: i64,
+    master_changes: u32,
+    master_losses: u32,
+    /// Local time of the last Sync used, kept when the master goes away.
+    last_sync_ns: u64,
+}
+
 /// The follower's protocol engine.
 pub(crate) struct Core {
     config: CoreConfig,
@@ -101,6 +113,7 @@ pub(crate) struct Core {
     /// fresh one replaces it first.
     holdover_deadline_ns: Option<u64>,
     last_state: ClockState,
+    counters: Counters,
 }
 
 impl Core {
@@ -119,6 +132,7 @@ impl Core {
             next_delay_req_ns: None,
             holdover_deadline_ns: None,
             last_state: ClockState::Unlocked,
+            counters: Counters::default(),
             config,
         }
     }
@@ -220,9 +234,12 @@ impl Core {
     fn complete_sync(&mut self, t1: u64, t2: u64, now: u64, out: &mut Vec<Output>) {
         let sync = SyncTimes { t1, t2 };
         self.last_sync = Some(sync);
+        self.counters.last_sync_ns = t2;
         // Measure the path delay as soon as there is a Sync to pair with.
         self.next_delay_req_ns.get_or_insert(now);
 
+        let was_locked = self.servo.state() == ServoState::Locked;
+        let rejoining = self.servo.is_rejoining();
         let event = self.servo.sync(t1, t2, now);
         trace!(t1, t2, ?event, "sync");
         let publish = match event {
@@ -236,13 +253,33 @@ impl Core {
                 true
             }
             ServoEvent::Stepped { offset_ns: Some(e) } => {
-                warn!(
-                    offset_ns = e,
-                    "PTP clock error above step threshold; stepping the media clock"
-                );
+                self.counters.steps = self.counters.steps.saturating_add(1);
+                self.counters.last_step_ns = e;
+                if rejoining {
+                    warn!(
+                        offset_ns = e,
+                        "PTP master's time differs from the running clock; stepping the media clock"
+                    );
+                } else {
+                    warn!(
+                        offset_ns = e,
+                        "PTP clock error above step threshold; stepping the media clock"
+                    );
+                }
                 true
             }
-            ServoEvent::Slewed { .. } => true,
+            ServoEvent::Slewed { offset_ns } => {
+                if was_locked && self.servo.state() != ServoState::Locked {
+                    self.counters.unlocks = self.counters.unlocks.saturating_add(1);
+                    warn!(
+                        offset_ns,
+                        unlocks = self.counters.unlocks,
+                        "PTP clock lost lock (Syncs delayed, or the master's time moved); \
+                         slewing back"
+                    );
+                }
+                true
+            }
         };
         if publish {
             if let Some(snap) = self.servo.snapshot() {
@@ -289,10 +326,21 @@ impl Core {
                     "following PTP master"
                 );
                 if self.servo_master != Some(id) {
-                    // A different clock: start over, but keep showing the old
-                    // time until the new master has been acquired.
-                    self.begin_holdover(now, out);
-                    self.servo.reset();
+                    if self.servo_master.is_some() {
+                        self.counters.master_changes =
+                            self.counters.master_changes.saturating_add(1);
+                    }
+                    // A different clock. A Dante leader change hands over to
+                    // a device that was synchronised to the old leader, so
+                    // the running clock keeps going and the new master's
+                    // Syncs are checked against it: the clock stays
+                    // continuous and audio keeps flowing, unless the new
+                    // master's time really differs, which steps it once
+                    // (servo::Servo::change_master). Without a clock yet,
+                    // the servo starts over.
+                    if let Some(snap) = self.servo.change_master(now) {
+                        self.coast(snap, now, out);
+                    }
                     self.servo_master = Some(id);
                 }
             }
@@ -302,18 +350,21 @@ impl Core {
                     holdover = ?self.config.holdover,
                     "lost PTP master; media clock in holdover"
                 );
-                self.begin_holdover(now, out);
+                self.counters.master_losses = self.counters.master_losses.saturating_add(1);
+                if let Some(snap) = self.servo.enter_holdover(now) {
+                    self.coast(snap, now, out);
+                }
             }
         }
         self.push_status(out);
     }
 
-    fn begin_holdover(&mut self, now: u64, out: &mut Vec<Output>) {
-        if let Some(snap) = self.servo.enter_holdover(now) {
-            out.push(Output::Publish(snap));
-            self.holdover_deadline_ns
-                .get_or_insert(now.saturating_add(duration_ns(self.config.holdover)));
-        }
+    /// Publishes `snap`, which runs on without a master's Syncs until the
+    /// servo publishes again or the holdover expires.
+    fn coast(&mut self, snap: ClockSnapshot, now: u64, out: &mut Vec<Output>) {
+        out.push(Output::Publish(snap));
+        self.holdover_deadline_ns
+            .get_or_insert(now.saturating_add(duration_ns(self.config.holdover)));
     }
 
     /// Runs timers: master timeout and holdover expiry.
@@ -409,6 +460,21 @@ impl Core {
             offset_ns: self.servo.offset_ns(),
             mean_path_delay_ns: self.servo.path_delay_ns().unwrap_or(0),
             freq_offset_ppb: self.servo.freq_offset_ppb(),
+            unlocks: self.counters.unlocks,
+            steps: self.counters.steps,
+            last_step_ns: self.counters.last_step_ns,
+            master_changes: self.counters.master_changes,
+            master_losses: self.counters.master_losses,
+            other_masters: self
+                .selector
+                .masters()
+                .iter()
+                .filter(|m| Some(m.dataset.source) != master.map(|c| c.dataset.source))
+                .count()
+                .try_into()
+                .unwrap_or(u32::MAX),
+            last_sync_ns: self.counters.last_sync_ns,
+            holdover_until_ns: self.holdover_deadline_ns,
         }
     }
 
@@ -770,5 +836,161 @@ mod tests {
         core.poll(lost + 30_000 * MS, &mut out);
         assert!(out.contains(&Output::Invalidate));
         assert!(core.servo.snapshot().is_none());
+    }
+
+    /// Locks `core` to `MASTER` with one-step Syncs every 250 ms from 1 s
+    /// until `until`; returns the time of the last one.
+    fn lock_to_master(core: &mut Core, out: &mut Vec<Output>, until: u64) -> u64 {
+        let mut t2 = 0;
+        let mut i = 0u64;
+        while 1_000 * MS + i * 250 * MS < until {
+            t2 = 1_000 * MS + i * 250 * MS;
+            let p = packet(MASTER, i as u16, Flags::empty(), Body::Sync(sync_body(MEDIA0 + t2)));
+            core.handle_packet(&p, master_addr(), t2, out);
+            i += 1;
+        }
+        assert_eq!(last_status(out).state, ClockState::Locked);
+        t2
+    }
+
+    /// Asserts that consecutive published mappings agree to within 1 us
+    /// (the shared-memory mirror's step threshold), starting from `prev`.
+    fn assert_continuous(mut prev: ClockSnapshot, out: &[Output]) {
+        for o in out {
+            assert_ne!(*o, Output::Invalidate);
+            if let Output::Publish(s) = o {
+                let jump = s.media_ref_ns.abs_diff(prev.media_ns_at(s.local_ref_ns));
+                assert!(jump <= 1_000, "the clock jumped {jump} ns: {prev:?} -> {s:?}");
+                prev = *s;
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_leader_in_step_with_the_old_one_keeps_the_clock_running() {
+        let mut core = core();
+        let mut out = Vec::new();
+        let t = lock_to_master(&mut core, &mut out, 20_000 * MS);
+        let before = core.servo.snapshot().unwrap();
+        assert_eq!(last_status(&out).master_changes, 0);
+
+        // Another device, synchronised to MASTER to 1 us, becomes the
+        // preferred leader; MASTER stops sending a little later.
+        let leader = PortIdentity { uuid: [0, 0x1d, 0xc1, 4, 5, 6], port_id: 1 };
+        let leader_sync = |seq: u16, t1: u64| {
+            let body = SyncBody {
+                grandmaster_clock_uuid: leader.uuid,
+                grandmaster_preferred: true,
+                parent_uuid: leader.uuid,
+                ..sync_body(t1)
+            };
+            packet(leader, seq, Flags::empty(), Body::Sync(body))
+        };
+        let addr: SocketAddr = "192.168.1.11:319".parse().unwrap();
+        out.clear();
+        let mut switched = None;
+        for i in 1..=40u64 {
+            let t2 = t + i * 250 * MS;
+            core.handle_packet(&leader_sync(i as u16, MEDIA0 + t2 + 1_000), addr, t2, &mut out);
+            if i <= 2 {
+                let p = packet(
+                    MASTER,
+                    100 + i as u16,
+                    Flags::empty(),
+                    Body::Sync(sync_body(MEDIA0 + t2)),
+                );
+                core.handle_packet(&p, master_addr(), t2 + 1_000, &mut out);
+            }
+            let st = last_status(&out);
+            if st.master.is_some_and(|m| m.uuid == leader.uuid) && switched.is_none() {
+                switched = Some(i);
+                // Coasting until the new leader's next Sync is used.
+                assert_eq!(st.state, ClockState::Locking);
+                assert_eq!((st.master_changes, st.other_masters), (1, 1));
+            }
+            core.poll(t2 + 1_000, &mut out);
+        }
+        assert_eq!(switched, Some(2), "a preferred leader takes over after two Syncs");
+        assert_continuous(before, &out);
+        assert!(!out.iter().any(|o| matches!(o, Output::Status(s) if s.steps > 0)));
+        let st = last_status(&out);
+        assert_eq!(st.state, ClockState::Locked);
+        assert_eq!(st.master.unwrap().uuid, leader.uuid);
+        assert_eq!((st.master_changes, st.steps, st.unlocks), (1, 0, 0));
+        assert_eq!(st.holdover_until_ns, None);
+        // MASTER fell silent more than the timeout ago.
+        assert_eq!(st.other_masters, 0);
+        assert_eq!(st.last_sync_ns, t + 40 * 250 * MS);
+    }
+
+    #[test]
+    fn a_new_leader_whose_time_differs_steps_the_clock_once() {
+        let mut core = core();
+        let mut out = Vec::new();
+        let t = lock_to_master(&mut core, &mut out, 20_000 * MS);
+        // MASTER goes away; after the timeout another master, 50 ms off,
+        // is the only one left.
+        let other = PortIdentity { uuid: [0, 0x1d, 0xc1, 7, 8, 9], port_id: 1 };
+        let addr: SocketAddr = "192.168.1.12:319".parse().unwrap();
+        out.clear();
+        for i in 1..=60u64 {
+            let t2 = t + i * 250 * MS;
+            let body =
+                SyncBody { grandmaster_clock_uuid: other.uuid, ..sync_body(MEDIA0 + t2 + 50 * MS) };
+            core.handle_packet(
+                &packet(other, i as u16, Flags::empty(), Body::Sync(body)),
+                addr,
+                t2,
+                &mut out,
+            );
+            core.poll(t2 + 1_000, &mut out);
+        }
+        assert!(!out.contains(&Output::Invalidate));
+        let steps: Vec<ClockStatus> = out
+            .iter()
+            .filter_map(|o| if let Output::Status(s) = o { Some(*s) } else { None })
+            .filter(|s| s.steps > 0)
+            .collect();
+        let st = steps.first().expect("no step");
+        assert_eq!((st.steps, st.master_changes), (1, 1));
+        assert!((st.last_step_ns - 50_000_000).abs() < 100_000, "{}", st.last_step_ns);
+        let st = last_status(&out);
+        assert_eq!((st.state, st.steps), (ClockState::Locked, 1));
+    }
+
+    #[test]
+    fn delayed_syncs_count_an_unlock_and_master_loss_counts_holdover() {
+        let mut core = core();
+        let mut out = Vec::new();
+        let t = lock_to_master(&mut core, &mut out, 40_000 * MS);
+        out.clear();
+        // Every Sync queued 400 us longer for 4 s, then back to normal.
+        let mut t2 = t;
+        for i in 1..=60u64 {
+            let sent = t + i * 250 * MS;
+            let late = if i <= 16 { 400_000 } else { 0 };
+            t2 = sent + late;
+            let p = packet(
+                MASTER,
+                200 + i as u16,
+                Flags::empty(),
+                Body::Sync(sync_body(MEDIA0 + sent)),
+            );
+            core.handle_packet(&p, master_addr(), t2, &mut out);
+        }
+        let st = last_status(&out);
+        assert_eq!((st.state, st.unlocks, st.steps), (ClockState::Locked, 1, 0));
+        assert!(
+            out.iter().any(|o| matches!(o, Output::Status(s) if s.state == ClockState::Locking))
+        );
+
+        // Silence: after the timeout the clock holds over for 30 s.
+        out.clear();
+        let lost = t2 + 5_001 * MS;
+        core.poll(lost, &mut out);
+        let st = last_status(&out);
+        assert_eq!((st.state, st.master_losses), (ClockState::Unlocked, 1));
+        assert_eq!(st.holdover_until_ns, Some(lost + 30_000 * MS));
+        assert_eq!(st.last_sync_ns, t2);
     }
 }

@@ -87,6 +87,33 @@
 //! The servo reports Locked once `|e|` has stayed below
 //! [`ServoConfig::lock_threshold_ns`] for [`ServoConfig::lock_samples`]
 //! updates.
+//!
+//! # Continuity
+//!
+//! The macOS driver follows the published clock with a device timeline
+//! whose rate moves by at most 200 ppm/s and which stops passing audio when
+//! the two disagree by more than 250 µs (docs/MACOS.md, "Device timeline").
+//! Once the clock has locked, only a step is a discontinuity, so everything
+//! short of one has to stay gentle enough for the driver to follow:
+//!
+//! * The proportional correction is capped at
+//!   [`ServoConfig::max_correction`].
+//! * Losing lock (the error stayed above the unlock threshold, typically
+//!   Sync messages queued behind traffic) keeps the frequency estimate and
+//!   the controller. The servo reports Locking until the error is small
+//!   again; it does not start a new frequency fit from the disturbed
+//!   samples.
+//! * Holdover runs at the frequency estimate, from the time the clock
+//!   shows. In simulation (`tests/servo_sim.rs`, `holdover_sweep`) that
+//!   stays closer to the master than any average of the published rate,
+//!   whose phase corrections are not frequency. The driver follows the
+//!   daemon's holdover, so the two never drift apart.
+//! * A new master ([`Servo::change_master`]) and a master heard again after
+//!   holdover are checked against the running clock rather than acquired
+//!   from scratch. Until the servo locks again, an error beyond
+//!   [`ServoConfig::rejoin_step_threshold_ns`] is stepped (the master's time
+//!   really differs, and one realignment beats a long slew); anything
+//!   smaller is slewed and the clock stays continuous.
 
 use std::collections::VecDeque;
 
@@ -115,6 +142,15 @@ pub struct ServoConfig {
     /// Errors larger than this are corrected by stepping the clock instead
     /// of slewing it.
     pub step_threshold_ns: i64,
+    /// The step threshold after the clock ran without a master (holdover)
+    /// or the master changed, until the servo locks again. It matches the
+    /// driver's 250 µs coherence window: a master that disagrees with the
+    /// running clock by more has a different time, and one step (one
+    /// realignment of the driver) replaces seconds of slewing. A steady
+    /// lock keeps the wider [`step_threshold_ns`](Self::step_threshold_ns),
+    /// so that Syncs queued for a few seconds are ridden out, not stepped
+    /// twice.
+    pub rejoin_step_threshold_ns: i64,
     /// How many consecutive updates must exceed the step threshold before
     /// the clock is stepped (guards against a single bad sample).
     pub step_confirmations: u32,
@@ -128,6 +164,12 @@ pub struct ServoConfig {
     pub unlock_samples: u32,
     /// Largest allowed `|rate - 1|`. Real oscillators are within ±100 ppm.
     pub max_freq_offset: f64,
+    /// Largest proportional correction `|kp * e|` (a fraction, like
+    /// `max_freq_offset`). The driver's timeline follows the clock's rate at
+    /// up to 200 ppm/s, so a sudden correction `c` leaves it about
+    /// `c² / 400 ppm/s` behind: 25 µs at 100 ppm, comfortably inside its
+    /// 250 µs coherence window. Larger errors take longer to slew instead.
+    pub max_correction: f64,
     /// Minimum number of Sync samples before the initial step.
     pub acquire_min_samples: usize,
     /// Minimum time spanned by those samples, so the initial frequency
@@ -174,12 +216,14 @@ impl Default for ServoConfig {
     fn default() -> Self {
         ServoConfig {
             step_threshold_ns: 2_000_000,
+            rejoin_step_threshold_ns: 250_000,
             step_confirmations: 2,
             lock_threshold_ns: 50_000,
             lock_samples: 8,
             unlock_threshold_ns: 250_000,
             unlock_samples: 4,
             max_freq_offset: 500e-6,
+            max_correction: 100e-6,
             acquire_min_samples: 4,
             acquire_min_span_ns: 2_000_000_000,
             acquire_min_delay_samples: 2,
@@ -270,10 +314,16 @@ pub struct Servo {
     window: VecDeque<Sample>,
     /// Recent delay exchanges and the raw path delay computed from each.
     delays: VecDeque<(DelayExchange, i64)>,
+    /// The previous master's filtered path delay, used after a change of
+    /// master until the new one has been measured.
+    delay_fallback_ns: Option<i64>,
     /// The clock being published.
     snapshot: Option<ClockSnapshot>,
     /// Frequency estimate: media nanoseconds per local nanosecond.
     freq: f64,
+    /// The clock ran without a master, or the master changed, and the servo
+    /// has not locked since: the rejoin step threshold applies.
+    rejoining: bool,
     /// Local time of the last controller update.
     last_update_ns: u64,
     /// Last filtered error.
@@ -295,8 +345,10 @@ impl Servo {
             fit: VecDeque::new(),
             window: VecDeque::new(),
             delays: VecDeque::new(),
+            delay_fallback_ns: None,
             snapshot: None,
             freq: 1.0,
+            rejoining: false,
             last_update_ns: 0,
             offset_ns: 0,
             good_samples: 0,
@@ -309,7 +361,7 @@ impl Servo {
         &self.config
     }
 
-    /// Forgets everything, e.g. because the master changed.
+    /// Forgets everything, e.g. because there is no clock to keep.
     pub fn reset(&mut self) {
         *self = Servo::new(self.config.clone());
     }
@@ -335,14 +387,22 @@ impl Servo {
         (self.freq - 1.0) * 1e9
     }
 
+    /// Whether the servo is checking its running clock against a master
+    /// heard again after holdover, or a new one, and has not locked yet.
+    pub fn is_rejoining(&self) -> bool {
+        self.rejoining
+    }
+
     /// Last filtered error (master minus us), nanoseconds.
     pub fn offset_ns(&self) -> i64 {
         self.offset_ns
     }
 
-    /// Filtered one-way path delay, once measured.
+    /// Filtered one-way path delay, once measured. After a change of master
+    /// that is the previous master's until the new one has been measured.
     pub fn path_delay_ns(&self) -> Option<i64> {
-        self.delays.iter().map(|&(_, d)| d).min().map(|d| d.max(0))
+        let measured = self.delays.iter().map(|&(_, d)| d).min().map(|d| d.max(0));
+        self.delay_fallback_ns.or(measured)
     }
 
     /// Number of path delay measurements currently in the filter window.
@@ -384,6 +444,13 @@ impl Servo {
             self.delays.push_back((exchange, raw));
             while self.delays.len() > self.config.delay_window.max(1) {
                 self.delays.pop_front();
+            }
+            // The previous master's delay is a minimum over a full window,
+            // and on one network close to the new master's; a minimum over
+            // a couple of new measurements can be off by their jitter. So
+            // it stands in until the fast requests have done their job.
+            if self.delays.len() >= self.config.fast_delay_samples.max(1) {
+                self.delay_fallback_ns = None;
             }
         }
         raw
@@ -433,15 +500,48 @@ impl Servo {
     }
 
     /// Prepares for running without a master: the proportional correction
-    /// is dropped so the clock free-runs at the best frequency estimate.
-    /// Returns the snapshot to publish, if there is a clock.
+    /// is dropped so the clock free-runs, from the time it shows now, at
+    /// the frequency estimate. Returns the snapshot to publish, if there is
+    /// a clock.
+    ///
+    /// The frequency estimate and the controller are kept. When the master
+    /// is heard again its time is checked against the running clock: a
+    /// small error is slewed away, one beyond
+    /// [`ServoConfig::rejoin_step_threshold_ns`] is stepped.
     pub fn enter_holdover(&mut self, now_ns: u64) -> Option<ClockSnapshot> {
         let snap = self.snapshot?;
         let media = snap.media_ns_at(now_ns);
         self.set_snapshot(now_ns, media, self.freq);
-        // When the master comes back, re-converge from the current estimate.
-        self.restart_locking(now_ns);
+        self.state = ServoState::Locking;
+        self.rejoining = true;
+        self.last_update_ns = now_ns;
+        self.good_samples = 0;
+        self.bad_samples = 0;
+        self.step_samples = 0;
         self.snapshot
+    }
+
+    /// The master changed. Without a clock yet, starts over and returns
+    /// `None`. Otherwise the clock keeps running as in
+    /// [`enter_holdover`](Self::enter_holdover), with its frequency
+    /// estimate, and the new master's first Syncs are checked against it:
+    /// a new master that was itself synchronised to the old one (a Dante
+    /// leader change) agrees to within microseconds, and the clock stays
+    /// continuous. One whose time differs by more than
+    /// [`ServoConfig::rejoin_step_threshold_ns`] is stepped to.
+    ///
+    /// The old master's Syncs and delay measurements are dropped; its
+    /// filtered path delay stands in until the new one has been measured.
+    /// Returns the snapshot to publish.
+    pub fn change_master(&mut self, now_ns: u64) -> Option<ClockSnapshot> {
+        if self.snapshot.is_none() {
+            self.reset();
+            return None;
+        }
+        self.delay_fallback_ns = self.path_delay_ns();
+        self.delays.clear();
+        self.window.clear();
+        self.enter_holdover(now_ns)
     }
 
     fn acquire_sample(&mut self, sample: Sample, now_ns: u64) -> ServoEvent {
@@ -488,7 +588,12 @@ impl Servo {
         let e = clamp_i64(estimate - snapshot.media_ns_at(sample.t2) as i128);
         self.offset_ns = e;
 
-        if e.abs() > self.config.step_threshold_ns {
+        let step_threshold = if self.rejoining {
+            self.config.rejoin_step_threshold_ns.min(self.config.step_threshold_ns)
+        } else {
+            self.config.step_threshold_ns
+        };
+        if e.abs() > step_threshold {
             self.step_samples += 1;
             if self.step_samples < self.config.step_confirmations {
                 return ServoEvent::Held { offset_ns: e };
@@ -526,17 +631,18 @@ impl Servo {
             }
             self.config.locked_gains.kp
         };
-        let rate = self.clamp_freq(self.freq + kp * e_s);
+        let max_correction = self.config.max_correction.abs();
+        let rate = self.clamp_freq(self.freq + (kp * e_s).clamp(-max_correction, max_correction));
         // Re-anchor at `now` on the media time already being shown, so the
         // published clock never jumps.
         self.set_snapshot(now_ns, snapshot.media_ns_at(now_ns), rate);
         self.last_update_ns = now_ns;
 
-        self.update_lock_state(e, now_ns);
+        self.update_lock_state(e);
         ServoEvent::Slewed { offset_ns: e }
     }
 
-    fn update_lock_state(&mut self, e: i64, now_ns: u64) {
+    fn update_lock_state(&mut self, e: i64) {
         let e = e.abs();
         match self.state {
             ServoState::Locking => {
@@ -547,6 +653,7 @@ impl Servo {
                         // is long enough to hand over to the PI controller.
                         self.state = ServoState::Locked;
                         self.bad_samples = 0;
+                        self.rejoining = false;
                     }
                 } else {
                     self.good_samples = 0;
@@ -556,7 +663,16 @@ impl Servo {
                 if e > self.config.unlock_threshold_ns {
                     self.bad_samples += 1;
                     if self.bad_samples >= self.config.unlock_samples {
-                        self.restart_locking(now_ns);
+                        // Usually Syncs queued behind traffic for a few
+                        // seconds, which says nothing about the master's
+                        // frequency: keep the estimate and the controller,
+                        // and keep slewing gently (the published clock is
+                        // continuous, and the driver keeps following it).
+                        // A frequency fit restarted here would be fitted to
+                        // the disturbance.
+                        self.state = ServoState::Locking;
+                        self.good_samples = 0;
+                        self.bad_samples = 0;
                     }
                 } else {
                     self.bad_samples = 0;
@@ -566,10 +682,11 @@ impl Servo {
         }
     }
 
-    /// Enters the locking state with a fresh frequency fit (old samples may
-    /// reflect a master that has since changed).
+    /// Enters the locking state with a fresh frequency fit, after a step
+    /// (old samples may reflect a master that has since changed).
     fn restart_locking(&mut self, now_ns: u64) {
         self.state = ServoState::Locking;
+        self.rejoining = false;
         self.fll = true;
         self.fit.clear();
         self.last_update_ns = now_ns;
@@ -817,6 +934,139 @@ mod tests {
         let later = t + 10_000 * MS;
         let err = snap.media_ns_at(later) as i64 - m.media_at(later) as i64;
         assert!(err.abs() < 10_000, "holdover error {err} ns");
+    }
+
+    /// Feeds `m`'s Syncs every 250 ms from `from` to `until`, with a delay
+    /// exchange after each, and checks every event with `check`.
+    fn run_checked(
+        servo: &mut Servo,
+        m: &Ideal,
+        from: u64,
+        until: u64,
+        mut check: impl FnMut(&Servo, ServoEvent),
+    ) -> u64 {
+        let mut t = from;
+        while t < until {
+            let (t1, t2) = m.sync(t);
+            let t3 = t2 + 100 * MS;
+            servo.delay_measurement(t1, t2, t3, m.media_at(t3 + m.delay));
+            let event = servo.sync(t1, t2, t2);
+            check(servo, event);
+            t += 250 * MS;
+        }
+        t
+    }
+
+    #[test]
+    fn a_continuous_new_master_keeps_the_clock() {
+        // A Dante leader change: the new leader was synchronised to the old
+        // one (here to 2 us) and is reached over a slightly shorter path.
+        let a = Ideal { rate: 1.0 + 30e-6, delay: 50_000, offset: MEDIA0 };
+        let mut servo = Servo::new(ServoConfig::default());
+        let t = run_ideal(&mut servo, &a, 1_000 * MS, 30_000 * MS);
+        assert_eq!(servo.state(), ServoState::Locked);
+        assert!(!servo.fll);
+        let freq = servo.frequency();
+        let before = servo.snapshot().unwrap();
+
+        let snap = servo.change_master(t).unwrap();
+        assert_eq!(snap.media_ns_at(t), before.media_ns_at(t), "the clock jumped");
+        assert_eq!(snap.rate, freq);
+        assert_eq!(servo.state(), ServoState::Locking);
+        // The old path delay stands in until the new one is measured.
+        assert!((servo.path_delay_ns().unwrap() - 50_000).abs() < 100);
+        assert!(servo.wants_fast_delay_requests());
+
+        let b = Ideal { delay: 40_000, offset: MEDIA0 + 2_000, ..a };
+        let mut locked_at = None;
+        let end = run_checked(&mut servo, &b, t, t + 10_000 * MS, |s, event| {
+            assert!(matches!(event, ServoEvent::Slewed { .. }), "{event:?}");
+            if s.state() == ServoState::Locked {
+                locked_at.get_or_insert(s.last_update_ns);
+            }
+        });
+        // Eight Syncs to lock again, without stepping or acquiring.
+        assert!(locked_at.unwrap() - t <= 2_500 * MS, "{:?}", locked_at.map(|l| l - t));
+        assert!(!servo.fll, "the frequency fit was not restarted");
+        assert!((servo.frequency() - freq).abs() < 0.1e-6);
+        assert!((servo.path_delay_ns().unwrap() - 40_000).abs() < 100);
+        let err = servo.snapshot().unwrap().media_ns_at(end) as i64 - b.media_at(end) as i64;
+        assert!(err.abs() < 2_000, "{err} ns");
+    }
+
+    #[test]
+    fn a_new_master_whose_time_differs_is_stepped_to() {
+        let a = Ideal { rate: 1.0 - 15e-6, delay: 50_000, offset: MEDIA0 };
+        let mut servo = Servo::new(ServoConfig::default());
+        let t = run_ideal(&mut servo, &a, 1_000 * MS, 30_000 * MS);
+        servo.change_master(t).unwrap();
+        // 400 us is beyond the rejoin threshold, though not the 2 ms step
+        // threshold of a steady lock.
+        let b = Ideal { offset: MEDIA0 + 400_000, ..a };
+        let mut events = Vec::new();
+        run_checked(&mut servo, &b, t, t + 500 * MS, |_, e| events.push(e));
+        assert!(matches!(events[0], ServoEvent::Held { .. }), "{events:?}");
+        match events[1] {
+            ServoEvent::Stepped { offset_ns: Some(e) } => assert!((e - 400_000).abs() < 5_000),
+            other => panic!("expected a step, got {other:?}"),
+        }
+        assert!(!servo.is_rejoining());
+        run_ideal(&mut servo, &b, t + 500 * MS, t + 10_000 * MS);
+        assert_eq!(servo.state(), ServoState::Locked);
+    }
+
+    #[test]
+    fn delayed_syncs_unlock_without_restarting_the_frequency_fit() {
+        // 300 us of extra queueing of every Sync for 3 s (finding clock#2).
+        let m = Ideal { rate: 1.0 + 45e-6, delay: 50_000, offset: MEDIA0 };
+        let mut servo = Servo::new(ServoConfig::default());
+        let t = run_ideal(&mut servo, &m, 1_000 * MS, 30_000 * MS);
+        assert!(!servo.fll);
+        let freq = servo.frequency();
+        let queued = Ideal { delay: 350_000, ..m };
+        let mut unlocked = false;
+        let mut worst = 0i64;
+        let mut watch = |s: &Servo, event: ServoEvent| {
+            assert!(!matches!(event, ServoEvent::Stepped { .. }), "{event:?}");
+            assert!(!s.fll, "the frequency fit restarted");
+            unlocked |= s.state() == ServoState::Locking;
+            let now = s.last_update_ns;
+            let err = s.snapshot().unwrap().media_ns_at(now) as i64 - m.media_at(now) as i64;
+            worst = worst.max(err.abs());
+        };
+        let t = run_checked(&mut servo, &queued, t, t + 3_000 * MS, &mut watch);
+        run_checked(&mut servo, &m, t, t + 20_000 * MS, &mut watch);
+        assert!(unlocked);
+        assert_eq!(servo.state(), ServoState::Locked);
+        // The PI controller slews at most 0.14/s x 300 us for about a second.
+        assert!(worst < 60_000, "{worst} ns from the master");
+        // The integrator only learned from the small errors of the
+        // recovery, and is unwinding them.
+        assert!((servo.frequency() - freq).abs() < 2e-6, "{}", servo.frequency() - freq);
+    }
+
+    #[test]
+    fn rejoining_after_holdover_slews_small_errors_and_steps_large_ones() {
+        for (moved, steps) in [(100_000u64, false), (600_000, true)] {
+            let m = Ideal { rate: 1.0 + 5e-6, delay: 30_000, offset: MEDIA0 };
+            let mut servo = Servo::new(ServoConfig::default());
+            // Locked, but the frequency is still being fitted: the loop's
+            // gain is high, so the correction cap matters.
+            let t = run_ideal(&mut servo, &m, 1_000 * MS, 8_000 * MS);
+            assert!(servo.fll && servo.state() == ServoState::Locked);
+            servo.enter_holdover(t).unwrap();
+            assert!(servo.is_rejoining());
+            let back = Ideal { offset: MEDIA0 + moved, ..m };
+            let mut stepped = false;
+            run_checked(&mut servo, &back, t + 5_000 * MS, t + 15_000 * MS, |s, e| {
+                stepped |= matches!(e, ServoEvent::Stepped { .. });
+                let correction = s.snapshot().unwrap().rate - s.frequency();
+                assert!(correction.abs() <= 100e-6 + 1e-12, "{} ppm", correction * 1e6);
+            });
+            assert_eq!(stepped, steps, "moved {moved} ns");
+            assert_eq!(servo.state(), ServoState::Locked, "moved {moved} ns");
+            assert!(!servo.is_rejoining());
+        }
     }
 
     #[test]
