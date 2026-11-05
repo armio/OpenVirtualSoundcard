@@ -28,10 +28,11 @@
 //! the daemon and the driver share one definition of both.
 
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ovsc_shm::clock::{ClockBlock, ClockRecord};
+use ovsc_shm::clock::{ClockBlock, ClockRead, ClockRecord};
 
 pub use ovsc_shm::time::{ClockSnapshot, ClockState, NANOS_PER_SEC, ns_to_samples, samples_to_ns};
 
@@ -153,8 +154,15 @@ enum Source {
 struct Shared {
     source: Source,
     /// The published mapping, behind the same seqlock the macOS driver reads
-    /// from shared memory.
-    block: ClockBlock,
+    /// from shared memory, in two copies. The writer fills the copy readers
+    /// are not directed to and then points them at it, so a reader never
+    /// waits for a write in progress. The writer is the PTP follower's task
+    /// at normal priority, and the readers include real-time transmit and
+    /// receive threads, which could otherwise spin for as long as the
+    /// scheduler leaves a preempted writer off the CPU (finding clock#5).
+    blocks: [ClockBlock; 2],
+    /// Index of the copy readers use.
+    current: AtomicUsize,
     status: Mutex<ClockStatus>,
     /// Only touched on writer paths and by [`MediaClock::set_mirror`].
     mirror: Mutex<Option<Arc<dyn ClockMirror>>>,
@@ -164,14 +172,25 @@ impl Shared {
     fn new(source: Source) -> Self {
         Self {
             source,
-            block: ClockBlock::new(),
+            blocks: [ClockBlock::new(), ClockBlock::new()],
+            current: AtomicUsize::new(0),
             status: Mutex::new(ClockStatus::default()),
             mirror: Mutex::new(None),
         }
     }
 
+    /// The current mapping, without waiting for a writer: a copy is only
+    /// busy if the writer has finished the other one since this reader
+    /// chose, so each retry follows progress of the writer.
     fn snapshot(&self) -> Option<ClockSnapshot> {
-        self.block.read_spin().filter(|r| r.valid).map(|r| r.snapshot)
+        loop {
+            let i = self.current.load(Ordering::Acquire) & 1;
+            match self.blocks[i].read_bounded(1) {
+                ClockRead::Record(r) => return r.valid.then_some(r.snapshot),
+                ClockRead::NeverWritten => return None,
+                ClockRead::Contended => {}
+            }
+        }
     }
 
     fn status(&self) -> ClockStatus {
@@ -205,8 +224,8 @@ impl fmt::Debug for Shared {
 
 /// Cloneable, lock-free read handle to the media clock.
 ///
-/// Reading never blocks and never allocates, so it is safe to call from
-/// real-time audio threads.
+/// Reading never blocks, never waits for the writer and never allocates, so
+/// it is safe to call from real-time audio threads.
 #[derive(Clone, Debug)]
 pub struct MediaClock {
     shared: Arc<Shared>,
@@ -315,9 +334,12 @@ impl ClockWriter {
     }
 
     fn store(&self, snapshot: ClockSnapshot, valid: bool) {
+        // Fill the copy readers do not use, then switch them to it. There is
+        // one writer, so nobody else changes `current` meanwhile.
+        let next = (self.shared.current.load(Ordering::Relaxed) & 1) ^ 1;
         // In-process readers only look at the mapping; the state, step
         // generation and grandmaster are the mirror's business.
-        self.shared.block.publish(&ClockRecord {
+        self.shared.blocks[next].publish(&ClockRecord {
             snapshot,
             valid,
             state: ClockState::Unlocked,
@@ -325,6 +347,7 @@ impl ClockWriter {
             grandmaster: 0,
             publish_ns: 0,
         });
+        self.shared.current.store(next, Ordering::Release);
     }
 }
 
@@ -530,6 +553,29 @@ mod tests {
         assert_eq!(system_clock().set_mirror(Some(recorder.clone())), Err(MirrorUnsupported));
         assert_eq!(system_clock().set_mirror(None), Err(MirrorUnsupported));
         assert!(recorder.take().is_empty());
+    }
+
+    #[test]
+    fn readers_never_wait_for_a_writer_stuck_in_a_write() {
+        let (clock, writer) = MediaClock::new();
+        let a = ClockSnapshot { local_ref_ns: 10, media_ref_ns: 1_000, rate: 1.0 };
+        writer.publish(a);
+        // The writer is preempted in the middle of its next publish: the
+        // copy it writes has an odd sequence.
+        let shared = &clock.shared;
+        let next = &shared.blocks[(shared.current.load(Ordering::Relaxed) & 1) ^ 1];
+        next.seq.fetch_or(1, Ordering::Relaxed);
+        // A reader gets the last complete mapping at once.
+        let reader = clock.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(reader.snapshot()).unwrap());
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), Some(a));
+        // The writer finishes later; its next publish is read.
+        let b = ClockSnapshot { local_ref_ns: 20, media_ref_ns: 2_000, rate: 1.0 };
+        writer.publish(b);
+        assert_eq!(clock.snapshot(), Some(b));
+        writer.invalidate();
+        assert_eq!(clock.snapshot(), None);
     }
 
     #[test]
