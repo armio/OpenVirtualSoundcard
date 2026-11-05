@@ -105,12 +105,26 @@ wait_rate_settled() {
 # The coreaudio-check snapshot lines of a run log, by label.
 snapshot_line() { sed -n "s/^snapshot $2 'ovst': //p" "$1" | tail -1; }
 
-# Fails if any of the counters moved between two status lines.
+# same_counters A B [JUMPS SKIPPED]: fails if any of the counters moved
+# between two status lines. Two of them also count Core Audio's own
+# lateness, and may move as far as the skips a loopback saw explain (JUMPS
+# skips, SKIPPED frames in all): late_out by the one cycle written late as
+# Core Audio fell behind, per skip, and tx_underruns by the packets without
+# the audio it never wrote, at most one per frame skipped and one per skip.
 same_counters() {
-    local a=$1 b=$2 ok=0 k
+    local a=$1 b=$2 jumps=${3:-0} skipped=${4:-0} ok=0 k x y max
     for k in absorbs seed late_out early_in far_out far_in tx_underruns; do
-        if [ "$(kv "$a" "$k")" != "$(kv "$b" "$k")" ]; then
-            echo "counter $k changed: $(kv "$a" "$k") -> $(kv "$b" "$k")"
+        x=$(kv "$a" "$k") y=$(kv "$b" "$k")
+        [ "$x" = "$y" ] && continue
+        case $k in
+            late_out) max=$jumps ;;
+            tx_underruns) max=$((skipped + jumps)) ;;
+            *) max=0 ;;
+        esac
+        if [ -n "$x" ] && [ -n "$y" ] && [ "$y" -gt "$x" ] && [ $((y - x)) -le "$max" ]; then
+            echo "counter $k changed: $x -> $y, as Core Audio skipped $skipped frames in $jumps skips"
+        else
+            echo "counter $k changed: $x -> $y"
             ok=1
         fi
     done
@@ -186,7 +200,7 @@ s3() {
 s4() {
     limit 70 "$CHECK" wait-status "$DEV" clock=following 60 || return 1
     wait_rate_settled 120 2 || return 1
-    local t0 rc a b missing=0
+    local t0 rc a b res missing=0
     # On the hosted runners the VM can stall the daemon past the 4 ms
     # latency: the driver then reads silence where the input has not
     # arrived, and counts it (in_missing). There S4 may lose 50 ms per
@@ -200,7 +214,8 @@ s4() {
     b=$(snapshot_line "$WORK/s4.log" 'at 75%')
     echo "ovst at 25%: $a"
     echo "ovst at 75%: $b"
-    same_counters "$a" "$b" || rc=1
+    res=$(grep '^CA-RESULT' "$WORK/s4.log" | tail -1)
+    same_counters "$a" "$b" "$(kv "$res" jumps)" "$(kv "$res" skipped)" || rc=1
     local n
     n=$(reanchors_since "$t0")
     echo "coreaudiod re-anchor lines during the run: $n"

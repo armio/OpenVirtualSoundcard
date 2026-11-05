@@ -345,11 +345,14 @@ pub fn run(a: &Args) -> Result<i32, String> {
         );
     }
 
-    // Discontinuities in input sample time are overloads or resyncs.
-    let mut jumps = 0u64;
+    // Discontinuities in input sample time are overloads or resyncs; the
+    // frames they skip went through no IO cycle of this client.
+    let (mut jumps, mut skipped) = (0u64, 0.0f64);
     for w in cycles.windows(2) {
-        if w[1].in_sample != w[0].in_sample + w[0].in_frames as f64 {
+        let end = w[0].in_sample + w[0].in_frames as f64;
+        if w[1].in_sample != end {
             jumps += 1;
+            skipped += (w[1].in_sample - end).max(0.0);
             if jumps <= 10 {
                 println!(
                     "timeline jump: input sample time {} -> {} after {} frames",
@@ -358,8 +361,9 @@ pub fn run(a: &Args) -> Result<i32, String> {
             }
         }
     }
-    println!("timeline jumps: {jumps}");
+    println!("timeline jumps: {jumps} ({skipped} frames skipped)");
     result.insert("jumps", jumps.to_string());
+    result.insert("skipped", format!("{skipped:.0}"));
     if jumps > o.max_jumps {
         failures.push(format!("{jumps} timeline jumps (max {})", o.max_jumps));
     }
