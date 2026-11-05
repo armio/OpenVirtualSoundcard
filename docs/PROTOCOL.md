@@ -1355,10 +1355,12 @@ changing sample rate or encoding.
 
 **OpenVirtualSoundcard** answers 0x0081 and 0x0083 with 0x0080 and 0x0082: its six
 sample rates and the encodings 16, 24 and 32. When its owner can apply a
-change (the macOS daemon), it sets the capability bits 0x08 and 0x10 in
-0x0060 and update mode 2, takes a set request (`u32 1`, `u32 value`), reports
-the value as pending and restarts with it; otherwise the mode is 0 (fixed)
-and set requests are ignored. ⚠️ (not yet tried with Dante Controller)
+change (the macOS daemon) and the show lock is off, it sets the capability
+bits 0x08 and 0x10 in 0x0060 and update mode 2, takes a set request
+(`u32 1`, `u32 value`), reports the value as pending and restarts with it;
+otherwise the bits are clear, the mode is 0 (fixed) and set requests are
+ignored. It sends 0x0060, 0x0080 and 0x0082 unasked whenever the show lock
+turns on or off. ⚠️ (not yet tried with Dante Controller)
 
 #### 7.4.6 0x0102 RX channel change and other change notifications
 

@@ -75,6 +75,10 @@ impl State {
 pub enum Notify {
     /// Receive channels (0-based) whose name or subscription changed.
     RxChannelsChanged(Vec<usize>),
+    /// The show lock turned on or off ([`Shared::lock_remote_settings`]),
+    /// which decides whether controllers may set the sample rate and the
+    /// encoding.
+    RemoteSettingsLockChanged,
 }
 
 /// Packet counters, written by the transmit thread and the receive threads
@@ -354,10 +358,16 @@ impl Shared {
     /// then on it replaces the configuration's `lock_remote_settings`. Only
     /// the device's owner (the app) calls this; controllers cannot.
     pub fn lock_remote_settings(&self, locked: bool) {
-        self.modify(|s| {
+        let changed = self.modify(|s| {
+            let changed = s.remote_settings_locked != locked;
             s.remote_settings_locked = locked;
             s.remote_settings_lock_set = Some(locked);
+            changed
         });
+        // Conmon tells controllers again whether the format is settable.
+        if changed {
+            self.notify(Notify::RemoteSettingsLockChanged);
+        }
     }
 
     /// Notes a controller's change, or refused attempt, in

@@ -451,6 +451,9 @@ pub async fn run_cmc(shared: Arc<Shared>, socket: UdpSocket) {
 struct Conmon {
     shared: Arc<Shared>,
     socket: UdpSocket,
+    /// Where statuses go: the info multicast group (a local socket in
+    /// tests).
+    info_dest: SocketAddr,
     seq: u16,
     /// The clock state last reported, to report changes.
     sync: Option<conmon::Sync>,
@@ -479,7 +482,7 @@ impl Conmon {
     }
 
     async fn status(&mut self, id: u16, content: &[u8]) {
-        let dest = SocketAddr::from((conmon::INFO_GROUP, conmon::INFO_PORT));
+        let dest = self.info_dest;
         self.send(conmon::START_INFO, conmon::status_opcode(id), content, dest).await;
     }
 
@@ -488,13 +491,14 @@ impl Conmon {
     async fn answer(&mut self, id: u16, body: &[u8], from: Option<SocketAddr>) {
         let info = self.shared.info.clone();
         let iface = &info.iface;
-        // While locked, the status says the format is not writable, so that
-        // a controller shows it as fixed rather than as a change that failed.
+        // While locked, the statuses say the format is not writable, and the
+        // capabilities that it is not configurable, so that a controller
+        // shows it as fixed rather than as a change that failed.
         let writable = self.shared.format_configurable && !self.shared.remote_settings_locked();
         match id {
             notification::VERSIONS_QUERY => {
                 let mut capabilities = conmon::capability::MANUFACTURER_NAME;
-                if self.shared.format_configurable {
+                if writable {
                     capabilities |= conmon::capability::SAMPLE_RATE | conmon::capability::ENCODING;
                 }
                 let c = conmon::versions_status(BOARD_NAME, capabilities);
@@ -560,6 +564,29 @@ impl Conmon {
                 self.status(notification::CLEAR_CONFIG_STATUS, &conmon::clear_config_status()).await
             }
             other => debug!("unhandled conmon query {other:#06x}"),
+        }
+    }
+
+    /// Tells controllers what another task of the device changed.
+    async fn notified(&mut self, n: Notify) {
+        match n {
+            Notify::RxChannelsChanged(channels) => {
+                self.status(notification::RX_CHANNEL_CHANGE, &conmon::channel_change(channels))
+                    .await;
+            }
+            // Controllers ask for these statuses when they first see the
+            // device, not when the lock changes what they say. Statuses
+            // double as notifications, multicast to every controller: send
+            // them unasked, as at start-up (docs/PROTOCOL.md §7.2, §7.3).
+            Notify::RemoteSettingsLockChanged => {
+                for query in [
+                    notification::VERSIONS_QUERY,
+                    notification::SAMPLE_RATE_QUERY,
+                    notification::ENCODING_QUERY,
+                ] {
+                    self.answer(query, &[], None).await;
+                }
+            }
         }
     }
 
@@ -720,7 +747,15 @@ pub async fn run_conmon(
     socket: UdpSocket,
     mut notify: mpsc::UnboundedReceiver<Notify>,
 ) {
-    let mut c = Conmon { shared, socket, seq: 1, sync: None, traffic: None, errors_base: None };
+    let mut c = Conmon {
+        shared,
+        socket,
+        info_dest: SocketAddr::from((conmon::INFO_GROUP, conmon::INFO_PORT)),
+        seq: 1,
+        sync: None,
+        traffic: None,
+        errors_base: None,
+    };
     c.answer(notification::VERSIONS_QUERY, &[], None).await;
     c.answer(notification::MANUFACTURER_VERSIONS_QUERY, &[], None).await;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
@@ -740,9 +775,7 @@ pub async fn run_conmon(
                 }
             }
             n = notify.recv() => match n {
-                Some(Notify::RxChannelsChanged(channels)) => {
-                    c.status(notification::RX_CHANNEL_CHANGE, &conmon::channel_change(channels)).await;
-                }
+                Some(n) => c.notified(n).await,
                 None => return,
             },
             _ = heartbeat.tick() => c.heartbeat().await,
@@ -810,6 +843,11 @@ mod tests {
     /// A device's shared state at 4 ms, 2 + 2 channels, named `desk-mac`,
     /// with the show lock `locked`, without its servers.
     fn shared(locked: bool) -> Arc<Shared> {
+        shared_with_notifications(locked).0
+    }
+
+    /// [`shared`], and the notifications meant for the conmon task.
+    fn shared_with_notifications(locked: bool) -> (Arc<Shared>, mpsc::UnboundedReceiver<Notify>) {
         let config = DeviceConfig {
             tx_channels: Channels::Count(2),
             rx_channels: Channels::Count(2),
@@ -840,7 +878,49 @@ mod tests {
             name_conflict: None,
         };
         let clock = ovsc_clock::system_clock();
-        Shared::new(info, state, clock, 1024, None, true, RemoteChanges::default()).unwrap().0
+        Shared::new(info, state, clock, 1024, None, true, RemoteChanges::default()).unwrap()
+    }
+
+    /// A conmon server for `shared` that sends its statuses to the returned
+    /// socket rather than to the multicast group.
+    async fn local_conmon(shared: &Arc<Shared>) -> (Conmon, std::net::UdpSocket) {
+        let listener = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let c = Conmon {
+            shared: shared.clone(),
+            socket: UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap(),
+            info_dest: listener.local_addr().unwrap(),
+            seq: 1,
+            sync: None,
+            traffic: None,
+            errors_base: None,
+        };
+        (c, listener)
+    }
+
+    /// Whether each of the next `n` statuses `listener` receives says that
+    /// controllers may set the format, by status id: the capability bits of
+    /// 0x0060, the update mode of 0x0080 and 0x0082 (docs/PROTOCOL.md
+    /// §7.4.5, §7.4.7).
+    fn format_settable(listener: &std::net::UdpSocket, n: usize) -> Vec<(u16, bool)> {
+        let mut buf = [0u8; MTU];
+        let format = conmon::capability::SAMPLE_RATE | conmon::capability::ENCODING;
+        (0..n)
+            .map(|_| {
+                let len = listener.recv(&mut buf).expect("a status");
+                let (h, c) = ConmonHeader::decode(&buf[..len]).unwrap();
+                let id = conmon::opcode_id(&h.opcode).unwrap();
+                let settable = match id {
+                    notification::VERSIONS_STATUS => {
+                        let caps = u32::from_be_bytes(c[0x14..0x18].try_into().unwrap());
+                        assert!(caps & format == 0 || caps & format == format, "{caps:#x}");
+                        caps & format == format
+                    }
+                    _ => u16::from_be_bytes([c[12], c[13]]) == 2,
+                };
+                (id, settable)
+            })
+            .collect()
     }
 
     /// Dante Controller's address in these tests.
@@ -942,15 +1022,7 @@ mod tests {
     #[tokio::test]
     async fn the_show_lock_refuses_a_controllers_format() {
         let shared = shared(true);
-        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let mut c = Conmon {
-            shared: shared.clone(),
-            socket,
-            seq: 1,
-            sync: None,
-            traffic: None,
-            errors_base: None,
-        };
+        let (mut c, _statuses) = local_conmon(&shared).await;
         let mut formats = shared.format_requests();
         // Dante Controller's "set" body: mode 1, then the value
         // (docs/PROTOCOL.md §7.5).
@@ -975,6 +1047,51 @@ mod tests {
         assert!(formats.has_changed().unwrap());
         assert_eq!(formats.borrow_and_update().sample_rate, Some(96_000));
         assert_eq!(noted(&shared)[2], (false, "the sample rate to 96000 Hz".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn conmon_shows_the_format_fixed_while_the_show_lock_is_on() {
+        use notification::{ENCODING_STATUS, SAMPLE_RATE_STATUS, VERSIONS_STATUS};
+        let (shared, mut notify) = shared_with_notifications(false);
+        let (mut c, statuses) = local_conmon(&shared).await;
+        let all = |settable| {
+            [
+                (VERSIONS_STATUS, settable),
+                (SAMPLE_RATE_STATUS, settable),
+                (ENCODING_STATUS, settable),
+            ]
+        };
+        // Unlocked, a device whose owner applies a new format says so.
+        for query in [
+            notification::VERSIONS_QUERY,
+            notification::SAMPLE_RATE_QUERY,
+            notification::ENCODING_QUERY,
+        ] {
+            c.answer(query, &[], Some(controller())).await;
+        }
+        assert_eq!(format_settable(&statuses, 3), all(true));
+
+        // The lock tells conmon, which says again, unasked, that it is not.
+        shared.lock_remote_settings(true);
+        c.notified(notify.try_recv().expect("a notification")).await;
+        assert_eq!(format_settable(&statuses, 3), all(false));
+        // So does every answer while it is locked.
+        c.answer(notification::VERSIONS_QUERY, &[], Some(controller())).await;
+        assert_eq!(format_settable(&statuses, 1), [(VERSIONS_STATUS, false)]);
+        // Locking it again changes nothing, and says nothing.
+        shared.lock_remote_settings(true);
+        assert!(notify.try_recv().is_err());
+
+        shared.lock_remote_settings(false);
+        let n = notify.try_recv().expect("a notification");
+        assert!(matches!(n, Notify::RemoteSettingsLockChanged), "{n:?}");
+        c.notified(n).await;
+        assert_eq!(format_settable(&statuses, 3), all(true));
+        // A locked change is still refused with the ARC error result
+        // (0x0022), as a value out of range is (docs/PROTOCOL.md §3.3).
+        shared.lock_remote_settings(true);
+        let set = arc::encode_set_latency_request(1, 2_000_000, 16);
+        assert_eq!(ask(&shared, set), 0x0022);
     }
 
     #[test]
