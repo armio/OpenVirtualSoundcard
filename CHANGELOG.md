@@ -79,8 +79,9 @@ The first public version, not released yet.
 
 ### Fixed
 
-- The transmit thread could panic on a malformed flow request, sent nothing
-  after a stall of more than 100 ms without catching up, and logged on its
+- The transmit thread could panic on a malformed flow request, replayed up
+  to 100 ms of stale packets after a late wake-up before the one a receiver
+  could still play (now at most 40 ms, then it resyncs), and logged on its
   real-time thread.
 - An expired transmit flow could remove a flow that had just been requested
   again.
