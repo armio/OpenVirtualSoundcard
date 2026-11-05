@@ -194,8 +194,9 @@ needs a name of its own.
   <name>...: Rename one of them.`, announces its records again, and keeps
   reporting the conflict until the other device withdraws the name or its
   records expire. Meanwhile a subscription on this device to
-  `<channel>@<name>` goes to the other device if that one has the channel,
-  rather than looping back to this one, and logs a warning.
+  `<channel>@<name>` that is made (or that reconnects) goes to the other
+  device if that one has the channel, rather than looping back to this one,
+  and logs a warning. Subscriptions already receiving stay where they are.
 * A Mac cloned from another one's disk has the same `ovsc.toml` and
   `state.toml`, so the same device name. Rename one of the two (Dante
   Controller or the app) before putting both on one network.

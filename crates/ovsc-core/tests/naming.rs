@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use ovsc_clock::system_clock;
 use ovsc_core::directory::StaticDirectory;
-use ovsc_core::mdns::{self, Advertisement, MDNS_GROUP, MDNS_PORT};
+use ovsc_core::mdns::{self, Advertisement, MDNS_GROUP, MDNS_PORT, Mdns};
 use ovsc_core::net::{Interface, bind_multicast, into_tokio};
 use ovsc_core::{Channels, Device, DeviceConfig, DeviceInfo, NameConflict, Ports};
 use ovsc_proto::discovery::ChannelTxt;
@@ -42,6 +42,15 @@ async fn eventually<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
         assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {what}");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// Waits until the device called `name` answers for its channel `01`: it
+/// has probed for its name (about a second) and announced it.
+async fn announced(name: &str) {
+    let mdns = Mdns::start(Ipv4Addr::LOCALHOST).unwrap();
+    let found = mdns.resolve_channel("01", name, Duration::from_secs(5)).await;
+    mdns.stop();
+    found.unwrap_or_else(|e| panic!("{name} not announced: {e}"));
 }
 
 /// Waits for `fut`, which must finish within a few seconds.
@@ -91,8 +100,7 @@ async fn a_device_whose_name_is_taken_takes_another() {
     let mut first_cfg = config(&name, 25640, 41);
     first_cfg.discovery = true;
     let first = Device::start(first_cfg, system_clock()).await.unwrap();
-    // Probing (about a second) and the first announcement.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    announced(&name).await;
     assert_eq!(first.name(), name);
 
     let mut second_cfg = config(&name, 25650, 42);
@@ -143,7 +151,9 @@ async fn a_device_announcing_our_name_is_reported() {
     let mut cfg = config(&name, 25660, 43);
     cfg.discovery = true;
     let dev = Device::start(cfg, system_clock()).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // Announced, not probing any more: the announcement below is not an
+    // answer to a probe.
+    announced(&name).await;
     assert_eq!(dev.name_conflict(), None);
 
     let twin = mdns::device_records(&Advertisement {
