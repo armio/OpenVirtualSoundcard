@@ -216,19 +216,19 @@ With the show session running at the show's buffer size:
 2. **Clock.** The app's Clock is **Locked**, its Leader is the console (or
    the Preferred Leader), and Dante Controller shows OVSC as a follower of
    the same leader. No other leader is reported.
-3. **Status.** The app shows no warnings, and Audio reads **Flowing**. Every
-   subscribed receive channel reads **receiving**.
+3. **Status.** The app's Audio light is green **Flowing**, the Status tab
+   shows no warnings, and every subscribed receive channel reads
+   **receiving**. The log's status line ends with `healthy`.
 4. **Returns.** Each return arrives at the console: check its meters, and that
    the console shows OVSC's flows without late packets.
 5. **Real-time.** The log has no line saying a thread runs "at normal
    priority" or "not real-time".
 6. **A long run.** Run the session for at least as long as the show (a dress
-   rehearsal is ideal). Afterwards the counters must not have moved: late,
-   lost, early and dropped receive packets; transmit send errors, late and
-   skipped packets; the driver's `late_out`, `early_in` and `tx_underruns`
-   while the host played; and `min_out_margin` and `min_in_margin` must stay
-   above 12 frames (250 µs at 48 kHz). The 30 s status line in
-   `/Library/Logs/OpenVirtualSoundcard/ovsc.log` has them all.
+   rehearsal is ideal). Afterwards the log must have no `health:` warning
+   from the run (`grep health: /Library/Logs/OpenVirtualSoundcard/ovsc.log*`). In the last status line, the receive `late` count and the
+   driver's `late_out`, `early_in` and `tx_underruns` must not have moved
+   while the host played, and `min_out_margin` and `min_in_margin` must stay
+   above 12 frames (250 µs at 48 kHz).
 7. **Show lock.** Turn it on (Settings).
 8. **Fallback.** Know how you will get the dry vocals to the IEMs and PA
    without the Mac, and test it once.
@@ -278,29 +278,63 @@ any of them.
 
 ## Health and warnings
 
-The app's Status tab lists problems in plain words, and the log at
-`/Library/Logs/OpenVirtualSoundcard/ovsc.log` has a status line every 30 s
-and a warning when something goes wrong. Warnings about the transmit and
-receive paths are logged as they happen, at most every 5 s per kind (every
-10 s per receive flow).
+The app's header has three lights. **Audio** is the one to watch:
 
-Worth knowing:
+| Audio light | Meaning | What to do |
+|---|---|---|
+| green **Flowing** | Audio can flow, and nothing audible went wrong in the last 30 s. | Nothing. |
+| amber **Dropouts** | Audio flows, but something audible happened in the last 30 s. | Read the warnings: they say what and what to do. |
+| amber **Stopped** | The driver holds the audio back: inputs and returns are silent. Usually for seconds while the clock settles or the engine restarts. | If it lasts, read the warnings (clock, engine). |
+| red **Silent**, with Driver red **Failed** | The Core Audio driver hit an internal error and is silent until Core Audio restarts. | Run `sudo killall coreaudiod` (the app has a button to copy it), then restart the host's audio. All audio on the Mac stops for a few seconds. |
 
-* **Clock** Locking (amber) for a few seconds after a leader change is normal.
-  Holdover means no leader is heard: find out why before the 30 s run out.
-* **Late packets** on receive mean `latency_ms` is too short for the network;
-  raise it (between songs is not the time: the change interrupts audio).
-* **Lost packets** point at the network: cabling, a switch port, or QoS.
-* **Early packets** mean a transmitter's clock disagrees with OVSC's: check
-  that both follow the same leader.
-* **Dropped datagrams** mean packets reached a flow that do not belong to it:
-  usually a stale flow after a restart, which expires on its own within 4 s.
-* **Transmit send errors** point at the Mac's network interface or a receiver
-  that went away.
-* **Late output cycles** (driver) mean the host missed deadlines: raise the
-  buffer, or lighten the session.
-* **Not real-time**: a thread did not get real-time scheduling. On macOS this
-  should not happen; restart the daemon.
+The Status tab lists warnings in plain words, red ones first. A red warning
+means audio is down now in at least one direction: a failed driver, Core
+Audio no longer calling the driver, the driver's gate closed for 2 s while
+an application plays, a stopped transmit engine (the daemon then restarts
+itself), a clock that has not locked, or a clock that lost its leader after
+the holdover. Amber warnings follow:
+
+* **Counters that rose** in the last 30 s, with how many and what to do:
+  lost or late received packets (from the first one), early packets and
+  datagrams from a stray sender (from 5), transmit send errors (with the
+  system's error), late sends (from 5, with the worst lateness), skipped
+  packets and restarts of a flow's timing, expired flows, late output or
+  early input cycles, a margin run out, slips, invalid samples (NaN or
+  infinity) from the host, and packets sent without the host's audio while
+  it plays. A warning stays 30 s after its counter last rose. The first 10 s
+  after the engine starts and the first 3 s after the host starts its audio
+  do not count.
+* **States while they hold**: the clock in holdover, with the seconds left
+  before audio stops; the clock relocking; a jump of the clock; a new clock
+  leader; subscribed channels without audio for 10 s; a transmit thread
+  without real-time priority; another device using this one's name.
+* **Controllers' changes** for 10 minutes, then under **Earlier** at the
+  bottom.
+
+The same warnings reach the log at
+`/Library/Logs/OpenVirtualSoundcard/ovsc.log`: `health: <warning>` (WARN)
+when one appears and `health: cleared: <what>` (INFO) once it has been gone
+10 s. The status line every 30 s ends with `healthy` or `warnings:` and a
+short list. A script on the stage computer can poll the control socket
+(`{"op":"status"}` on `/var/run/ovsc/control.sock`) and alarm when
+`urgent_warnings` is above 0 or `driver.faulted` is true.
+
+What the common warnings point at:
+
+* **Late received packets**: `latency_ms` is too short for the network.
+  Raise it after the show (the change interrupts audio).
+* **Lost received packets**: the network: cabling, a switch port, or QoS.
+* **Early packets**: a transmitter's clock disagrees with OVSC's: check that
+  both follow the same leader.
+* **Datagrams from a stray sender**: packets reached a flow that do not
+  belong to it, usually a stale flow after a restart; it expires on its own
+  within 4 s.
+* **Send errors**: the Mac's network interface, or a receiver that went
+  away.
+* **Late output or early input cycles, a margin run out**: the host missed
+  its deadlines. Raise the buffer, or lighten the session.
+* **No real-time priority**: should not happen on macOS; restart the daemon
+  after the show.
 
 ## Changes in this version that affect live use
 

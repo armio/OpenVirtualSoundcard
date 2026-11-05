@@ -50,6 +50,13 @@ The first public version, not released yet.
   transmit (send errors, lateness, skipped packets, resyncs, expired flows,
   real-time scheduling) and the clock (unlocks, steps, leader changes,
   holdover), logged as problems happen.
+- Health in the app and the log: the Audio light is green **Flowing** only
+  when nothing audible went wrong in the last 30 s, amber **Dropouts** when
+  something did, and red **Silent** when the driver has failed (with the
+  command that recovers it). Warnings in plain words cover what rose in the
+  last 30 s, with the urgent ones first; they are logged as `health:`
+  lines, and the status line ends with `healthy` or a short list.
+  Controllers' changes move to an **Earlier** list after 10 minutes.
 
 ### Changed
 
