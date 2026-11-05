@@ -369,15 +369,21 @@ async fn audio_flows_between_two_devices() {
     // Requested with every slot the flow may hold, as Dante receivers do.
     assert_eq!(flows[0].channels, vec![3, 1, 0, 0]);
 
-    // A freed slot is reused for the next channel from the same device.
+    // The next channel from the same device goes to a slot that carries
+    // nothing. The freed slot keeps its channel, so subscribing that again
+    // needs no request.
     rx.unsubscribe(1).unwrap();
     rx.subscribe(3, "04", "tx-dev").unwrap();
     eventually("audio on rx 3", || verify(&io, 2, 3)).await;
     verify(&io, 1, 0).unwrap();
     assert_eq!(tx.tx_flows().len(), 1);
-    assert_eq!(tx.tx_flows()[0].channels, vec![4, 1, 0, 0]);
+    assert_eq!(tx.tx_flows()[0].channels, vec![3, 1, 4, 0]);
+    rx.subscribe(1, "03", "tx-dev").unwrap();
+    eventually("audio on rx 1 again", || verify(&io, 0, 2)).await;
+    assert_eq!(tx.tx_flows()[0].channels, vec![3, 1, 4, 0]);
 
     // Unsubscribing everything stops the flow on the transmitter.
+    rx.unsubscribe(1).unwrap();
     rx.unsubscribe(2).unwrap();
     rx.unsubscribe(3).unwrap();
     eventually("transmitter to drop the flow", || {

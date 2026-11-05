@@ -13,6 +13,9 @@ use ovsc_proto::discovery::ChannelTxt;
 use crate::mdns::Mdns;
 use crate::{Error, Result};
 
+/// How long an mDNS lookup waits for answers.
+const MDNS_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// A transmit channel found on the network.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedChannel {
@@ -34,10 +37,21 @@ pub enum Directory {
 impl Directory {
     pub async fn resolve(&self, channel: &str, device: &str) -> Result<ResolvedChannel> {
         match self {
-            Directory::Mdns(m) => m.resolve_channel(channel, device, Duration::from_secs(2)).await,
-            Directory::Static(s) => {
-                s.get(channel, device).ok_or_else(|| Error::NotFound(format!("{channel}@{device}")))
-            }
+            Directory::Mdns(m) => m.resolve_channel(channel, device, MDNS_TIMEOUT).await,
+            Directory::Static(s) => s.resolve(channel, device).await,
+        }
+    }
+
+    /// What the directory already knows about `channel@device`, without
+    /// asking the network or waiting: for mDNS, what its cache holds. The
+    /// subscription manager uses it to tell, without blocking, whether a
+    /// subscription that changed its spelling still names the same channel.
+    pub async fn cached(&self, channel: &str, device: &str) -> Option<ResolvedChannel> {
+        match self {
+            // A lookup with no time to wait answers from the cache and
+            // gives up before it would send a query.
+            Directory::Mdns(m) => m.resolve_channel(channel, device, Duration::ZERO).await.ok(),
+            Directory::Static(s) => s.get(channel, device),
         }
     }
 }
@@ -46,6 +60,8 @@ impl Directory {
 #[derive(Clone, Default)]
 pub struct StaticDirectory {
     entries: Arc<RwLock<HashMap<(String, String), ResolvedChannel>>>,
+    /// How long a lookup of an unknown channel takes to fail.
+    miss_delay: Arc<RwLock<Duration>>,
 }
 
 impl StaticDirectory {
@@ -68,5 +84,22 @@ impl StaticDirectory {
             .unwrap_or_else(|e| e.into_inner())
             .get(&Self::key(channel, device))
             .cloned()
+    }
+
+    /// Makes lookups of unknown channels fail only after `delay`, as an
+    /// mDNS lookup does once it times out; by default they fail at once.
+    pub fn set_miss_delay(&self, delay: Duration) {
+        *self.miss_delay.write().unwrap_or_else(|e| e.into_inner()) = delay;
+    }
+
+    async fn resolve(&self, channel: &str, device: &str) -> Result<ResolvedChannel> {
+        if let Some(entry) = self.get(channel, device) {
+            return Ok(entry);
+        }
+        let delay = *self.miss_delay.read().unwrap_or_else(|e| e.into_inner());
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        self.get(channel, device).ok_or_else(|| Error::NotFound(format!("{channel}@{device}")))
     }
 }
