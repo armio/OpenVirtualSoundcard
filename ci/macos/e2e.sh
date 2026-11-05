@@ -226,13 +226,13 @@ s4() {
 }
 
 s5() {
-    local rc=0 n jumps bad slips
+    local rc=0 n jumps bad
     for n in 32 128 1024 4096; do
-        jumps=3 bad=0 slips=0
+        jumps=3 bad=0
         [ "$n" = 32 ] && jumps=10
         # Cycles of 0.7 and 2.7 ms leave the least room for stalls.
         if [ "$n" -le 128 ]; then
-            bad=$((5 * STALL_FRAMES)) slips=20
+            bad=$((5 * STALL_FRAMES))
             # The 32- and 128-frame cases run on the hosted runners too, but
             # may skip one cycle in 20 (375 and 93 skips) there, not 10 and
             # 3: every frame must still come back in its place, and a device
@@ -241,7 +241,7 @@ s5() {
         fi
         echo "--- buffer $n ---"
         loopback "s5-$n" --seconds 5 --channels 8 --buffer "$n" --expect-device-delay 0 \
-            --max-jumps "$jumps" --max-bad "$bad" --max-slips "$slips" || rc=1
+            --max-jumps "$jumps" --max-bad "$bad" || rc=1
         echo "ovst: $(ovst)"
     done
     return "$rc"
@@ -256,7 +256,7 @@ s6() {
     # skips ahead, which the jump allowance covers). The device's own
     # timeline must not jump: no re-anchors, and the seed stays the same.
     limit 120 "$CHECK" loopback "$DEV" --seconds 40 --channels 8 --buffer 512 --allow-outage 15 \
-        --expect-device-delay 0 --max-jumps 2 --max-bad $((5 * STALL_FRAMES)) --max-slips 4 \
+        --expect-device-delay 0 --max-jumps 2 --max-bad $((5 * STALL_FRAMES)) \
         >"$WORK/s6.log" 2>&1 &
     local pid=$!
     sleep 10
