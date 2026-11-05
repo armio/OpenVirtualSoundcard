@@ -438,8 +438,10 @@ struct Failure {
     /// The subscription that failed; forgotten when the channel's changes.
     key: Key,
     status: SubscriptionStatus,
+    /// How it is retried: the class of the failure.
+    retry: Retry,
     retry_at: Instant,
-    /// Failures in a row.
+    /// Failures of this class in a row.
     count: u32,
 }
 
@@ -1380,9 +1382,17 @@ impl RxManager {
         let now = Instant::now();
         let mut changed = false;
         for &ch in chans {
-            let count = self.failures.get(&ch).filter(|f| f.key == *k).map_or(0, |f| f.count) + 1;
-            let failure =
-                Failure { key: k.clone(), status, retry_at: now + retry.delay(count), count };
+            // Backing off counts the failures of one class: a console that
+            // starts refusing after timing out while it rebooted is asked
+            // again after the first delay for refusals, not the longest.
+            let count = self
+                .failures
+                .get(&ch)
+                .filter(|f| f.key == *k && f.retry == retry)
+                .map_or(0, |f| f.count)
+                + 1;
+            let retry_at = now + retry.delay(count);
+            let failure = Failure { key: k.clone(), status, retry, retry_at, count };
             changed |= self.failures.insert(ch, failure).is_none_or(|old| old.status != status);
         }
         changed
@@ -2594,6 +2604,49 @@ mod tests {
             assert!(Arc::ptr_eq(&now, &mgr.flows[0].routing.load_full()));
             mgr.stop_all().await;
             tx.shutdown().await;
+        }
+
+        /// Backing off counts the failures of one class: a console that
+        /// timed out many times while it rebooted, then refuses while it
+        /// starts, is asked again after the first delay for refusals, not
+        /// the longest.
+        #[tokio::test]
+        async fn backing_off_starts_over_when_the_failure_changes_class() {
+            let iface = Interface::find("127.0.0.1").unwrap();
+            let mut mgr = manager(&config("unit-class", 24745), iface, StaticDirectory::new());
+            let console = key("01", "console");
+            // Fails channel 0 and returns its failure count and the delay
+            // until it is retried.
+            let mut fail = |k: &Key, status: SubscriptionStatus, retry: Retry| {
+                let before = Instant::now();
+                mgr.fail(&[0], k, status, retry);
+                let after = Instant::now();
+                let f = &mgr.failures[&0];
+                let delay = retry.delay(f.count);
+                assert!(before + delay <= f.retry_at && f.retry_at <= after + delay);
+                (f.count, delay)
+            };
+            for n in 1..=8 {
+                assert_eq!(fail(&console, status::NO_CONNECTION, Retry::FAST).0, n);
+            }
+            let refused = |n: u64| Duration::from_secs(n);
+            assert_eq!(fail(&console, SubscriptionStatus::TxFail, Retry::REFUSED), (1, refused(1)));
+            // Refusals of another kind back off together.
+            assert_eq!(
+                fail(&console, SubscriptionStatus::TxNoFlows, Retry::REFUSED),
+                (2, refused(2))
+            );
+            assert_eq!(fail(&console, SubscriptionStatus::TxFail, Retry::REFUSED), (3, refused(4)));
+            // Silent again: the first timeout's delay.
+            assert_eq!(
+                fail(&console, status::NO_CONNECTION, Retry::FAST),
+                (1, Duration::from_millis(250))
+            );
+            // Another subscription starts over too.
+            assert_eq!(
+                fail(&key("02", "console"), status::NO_CONNECTION, Retry::FAST),
+                (1, Duration::from_millis(250))
+            );
         }
 
         /// When our own address is gone, the subscription says so (RX_FAIL),
