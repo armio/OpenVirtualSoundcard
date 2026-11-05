@@ -907,6 +907,22 @@ mod tests {
         .unwrap()
     }
 
+    /// Waits for the state file at `path` to hold all of `wanted`. The
+    /// running device saves it by itself after each change, durably (with
+    /// `F_FULLFSYNC` on macOS, which can take a while), so it may lag
+    /// behind what the status already shows.
+    async fn saved_state_holds(path: &Path, wanted: &[&str]) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let saved = std::fs::read_to_string(path).unwrap_or_default();
+            if wanted.iter().all(|w| saved.contains(w)) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "the state file lacks {wanted:?}: {saved}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     async fn latency_ms(path: &Path) -> Option<f64> {
         match ask(path, Request::Status).await {
             Response::Status(s) => s.device.map(|d| d.latency_ms),
@@ -1010,9 +1026,8 @@ mod tests {
                 Response::Settings(s) => assert_eq!(s.latency_ms, 2.0),
                 other => panic!("no settings: {other:?}"),
             }
-            let saved = std::fs::read_to_string(dir.join("state.toml")).unwrap();
-            assert!(saved.contains("latency_ns = 2000000"), "{saved}");
-            assert!(saved.contains("name = \"vocal-fx\""), "{saved}");
+            let state = dir.join("state.toml");
+            saved_state_holds(&state, &["latency_ns = 2000000", "name = \"vocal-fx\""]).await;
 
             // Out of range: refused, and nothing restarts.
             let change = SettingsChange { latency_ms: Some(80.0), ..Default::default() };
@@ -1216,8 +1231,9 @@ mod tests {
             let at = |text: &str| s.warnings.iter().position(|w| w.contains(text));
             let changed = "changed the receive latency to 3 ms";
             assert!(at(changed).unwrap() < at(refused).unwrap(), "{:?}", s.warnings);
-            let saved = std::fs::read_to_string(dir.join("state.toml")).unwrap();
-            assert!(saved.contains("lock_remote_settings = false"), "{saved}");
+            let state = dir.join("state.toml");
+            saved_state_holds(&state, &["lock_remote_settings = false", "latency_ns = 3000000"])
+                .await;
             assert!(!received.got_bye());
             stop_tx.send("test").unwrap();
             wait_for("the bye", || received.got_bye()).await;
