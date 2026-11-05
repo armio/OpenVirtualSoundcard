@@ -50,7 +50,7 @@ pub async fn run_arc(shared: Arc<Shared>, socket: UdpSocket) {
             debug!("malformed ARC packet from {src}");
             continue;
         };
-        if let Some(resp) = handle_arc(&shared, &frame) {
+        if let Some(resp) = handle_arc(&shared, &frame, src) {
             if let Err(e) = socket.send_to(&resp, src).await {
                 debug!("ARC send to {src} failed: {e}");
             }
@@ -78,10 +78,32 @@ fn read_properties(shared: &Shared, asked: Option<&[u16]>) -> Vec<(u16, Option<u
     }
 }
 
+/// Whether the show lock refuses the controller at `from` the change `what`
+/// (see [`crate::state::State::remote_settings_locked`]). A refusal is
+/// logged and listed with the device's remote changes, so that the owner
+/// learns why a controller's change did not take.
+fn refused_by_lock(shared: &Shared, from: SocketAddr, what: impl FnOnce() -> String) -> bool {
+    if !shared.remote_settings_locked() {
+        return false;
+    }
+    let what = what();
+    warn!("refusing {what} from the controller at {from}: remote settings are locked");
+    shared.record_remote_change(from, what, true);
+    true
+}
+
+/// Notes a change the controller at `from` made.
+fn changed_by(shared: &Shared, from: SocketAddr, what: String) {
+    info!("the controller at {from} changed {what}");
+    shared.record_remote_change(from, what, false);
+}
+
 /// A controller writing device properties ([`opcode::PROPERTIES_1101`]):
 /// the configured or receive latency is saved and applied by restarting the
-/// device. The answer echoes the records applied.
-fn write_properties(shared: &Shared, frame: &Frame<'_>) -> Vec<u8> {
+/// device, unless the show lock refuses it. The answer echoes the records
+/// applied; a refusal is an error result, as for a value out of range
+/// (docs/PROTOCOL.md §4.6.3: the real reply to 0x1101 is unknown).
+fn write_properties(shared: &Shared, frame: &Frame<'_>, from: SocketAddr) -> Vec<u8> {
     use arc::property::*;
     let h = &frame.header;
     let Ok(records) = arc::decode_write_properties_request(frame) else {
@@ -99,11 +121,6 @@ fn write_properties(shared: &Shared, frame: &Frame<'_>) -> Vec<u8> {
         warn!("refusing a latency of {} ms", ns as f64 / 1e6);
         return respond(h, result::ERROR, &[]);
     }
-    if let Err(e) = shared.request_latency(ns) {
-        warn!("refusing a latency of {} ms: {e}", ns as f64 / 1e6);
-        return respond(h, result::ERROR, &[]);
-    }
-    info!("receive latency set to {} ms by a controller", ns as f64 / 1e6);
     let applied: Vec<(u16, Option<u32>)> = records
         .iter()
         .filter_map(|&(id, v)| match id {
@@ -112,11 +129,41 @@ fn write_properties(shared: &Shared, frame: &Frame<'_>) -> Vec<u8> {
             _ => None,
         })
         .collect();
+    // Writing the latency the device is already set to changes nothing, so
+    // the lock lets it through: a controller applying a page of settings at
+    // once then gets no error for a field nobody touched.
+    let unchanged = ns == shared.configured_latency_ns();
+    if unchanged && shared.remote_settings_locked() {
+        return arc::encode_properties_response(h, &applied);
+    }
+    let what = || format!("the receive latency to {} ms", ns as f64 / 1e6);
+    if refused_by_lock(shared, from, what) {
+        return respond(h, result::ERROR, &[]);
+    }
+    if let Err(e) = shared.request_latency(ns) {
+        warn!("refusing a latency of {} ms: {e}", ns as f64 / 1e6);
+        return respond(h, result::ERROR, &[]);
+    }
+    if !unchanged {
+        changed_by(shared, from, what());
+        // The restart that applies it closes the transmit flows too, though
+        // only the receive side changes (docs/MACOS.md, "Setting the
+        // latency from Dante Controller or the app"). Only the macOS daemon
+        // restarts at once; other backends apply it at their next start.
+        let flows = shared.state().tx_flows.len();
+        if flows > 0 {
+            warn!(
+                "the new latency applies when the device restarts (at once in the macOS daemon), \
+                 which stops the {flows} flows other devices receive from it until each \
+                 receiver requests its flow again"
+            );
+        }
+    }
     arc::encode_properties_response(h, &applied)
 }
 
-/// Handles one ARC request and returns the response, if any.
-pub fn handle_arc(shared: &Shared, frame: &Frame<'_>) -> Option<Vec<u8>> {
+/// Handles one ARC request from `from` and returns the response, if any.
+pub fn handle_arc(shared: &Shared, frame: &Frame<'_>, from: SocketAddr) -> Option<Vec<u8>> {
     let h = &frame.header;
     if h.result != result::REQUEST {
         trace!("ignoring ARC packet with result code {:#x}", h.result);
@@ -149,11 +196,18 @@ pub fn handle_arc(shared: &Shared, frame: &Frame<'_>) -> Option<Vec<u8>> {
         opcode::SET_DEVICE_NAME => {
             let name = arc::decode_set_device_name_request(frame).ok()?;
             let name = name.unwrap_or_else(|| info.factory_name.clone());
+            // Receivers subscribe by `channel@device`: a new device name
+            // leaves their subscriptions to this device unresolved.
+            let what = || format!("the device name to {name}");
             if discovery::validate_device_name(&name).is_err() {
                 warn!("refusing invalid device name {name:?}");
                 respond(h, result::ERROR, &[])
+            } else if name == shared.name() {
+                arc::encode_device_name_response(h, &name)
+            } else if refused_by_lock(shared, from, what) {
+                respond(h, result::ERROR, &[])
             } else {
-                info!("device renamed to {name}");
+                changed_by(shared, from, what());
                 shared.modify(|s| s.name = name.clone());
                 arc::encode_device_name_response(h, &name)
             }
@@ -171,16 +225,32 @@ pub fn handle_arc(shared: &Shared, frame: &Frame<'_>) -> Option<Vec<u8>> {
         }
         opcode::RENAME_TX_CHANNELS => {
             let renames = arc::decode_rename_tx_channels_request(frame).ok()?;
+            // Subscriptions made by a channel's previous name stop
+            // resolving (those by its factory name keep working).
+            let renaming = renames_anything(shared, &renames, true);
+            if renaming && refused_by_lock(shared, from, || renames_words(&renames, true)) {
+                return Some(respond(h, result::ERROR, &[]));
+            }
             let changed = rename(shared, &renames, true);
             // Peers learn about transmit renames from mDNS.
             if changed.is_empty() {
                 respond(h, result::ERROR, &[])
             } else {
+                if renaming {
+                    changed_by(shared, from, renames_words(&renames, true));
+                }
                 respond(h, result::SUCCESS, &[0, 0])
             }
         }
         opcode::RENAME_RX_CHANNELS => {
             let renames = arc::decode_rename_rx_channels_request(frame).ok()?;
+            // Harmless to audio, but locked with the other names: a show's
+            // input labels stay as set up.
+            if renames_anything(shared, &renames, false)
+                && refused_by_lock(shared, from, || renames_words(&renames, false))
+            {
+                return Some(respond(h, result::ERROR, &[]));
+            }
             let changed = rename(shared, &renames, false);
             if changed.is_empty() {
                 respond(h, result::ERROR, &[])
@@ -266,7 +336,7 @@ pub fn handle_arc(shared: &Shared, frame: &Frame<'_>) -> Option<Vec<u8>> {
             let asked = arc::decode_read_properties_request(frame).ok()?;
             arc::encode_properties_response(h, &read_properties(shared, asked.as_deref()))
         }
-        opcode::PROPERTIES_1101 => write_properties(shared, frame),
+        opcode::PROPERTIES_1101 => write_properties(shared, frame, from),
         opcode::PROPERTIES_1102 => arc::encode_properties_1102_response(h),
         opcode::RX_PORT_RANGES => arc::encode_rx_port_ranges_response(h),
         other => {
@@ -294,6 +364,32 @@ fn rx_channel_list(shared: &Shared) -> Vec<RxChannelInfo> {
             status: sub.as_ref().map_or(arc::SubscriptionStatus::None, |s| s.status),
         })
         .collect()
+}
+
+/// Whether `renames` would change a channel's name; an empty name restores
+/// the factory name. Entries for unknown channels change nothing.
+fn renames_anything(shared: &Shared, renames: &[(u16, String)], tx: bool) -> bool {
+    let factory = if tx { &shared.info.tx_channels } else { &shared.info.rx_channels };
+    let s = shared.state();
+    let names = if tx { &s.tx_names } else { &s.rx_names };
+    renames.iter().any(|(id, name)| {
+        (*id as usize).checked_sub(1).filter(|&i| i < factory.len()).is_some_and(|i| {
+            let name = if name.is_empty() { &factory[i] } else { name };
+            names[i] != *name
+        })
+    })
+}
+
+/// Channel renames in words, for the log and the app.
+fn renames_words(renames: &[(u16, String)], tx: bool) -> String {
+    let kind = if tx { "transmit" } else { "receive" };
+    match renames {
+        [(id, name)] if name.is_empty() => {
+            format!("the name of {kind} channel {id} back to its factory name")
+        }
+        [(id, name)] => format!("the name of {kind} channel {id} to {name}"),
+        _ => format!("the names of {} {kind} channels", renames.len()),
+    }
 }
 
 /// Applies channel renames; an empty name restores the factory name.
@@ -387,10 +483,14 @@ impl Conmon {
         self.send(conmon::START_INFO, conmon::status_opcode(id), content, dest).await;
     }
 
-    /// Answers request `id` with content `body`.
-    async fn answer(&mut self, id: u16, body: &[u8]) {
+    /// Answers request `id` with content `body`, from the controller at
+    /// `from` (`None`: the device announcing itself).
+    async fn answer(&mut self, id: u16, body: &[u8], from: Option<SocketAddr>) {
         let info = self.shared.info.clone();
         let iface = &info.iface;
+        // While locked, the status says the format is not writable, so that
+        // a controller shows it as fixed rather than as a change that failed.
+        let writable = self.shared.format_configurable && !self.shared.remote_settings_locked();
         match id {
             notification::VERSIONS_QUERY => {
                 let mut capabilities = conmon::capability::MANUFACTURER_NAME;
@@ -401,36 +501,37 @@ impl Conmon {
                 self.status(notification::VERSIONS_STATUS, &c).await
             }
             notification::SAMPLE_RATE_QUERY => {
-                if let Some(rate) = conmon::decode_configurable_request(body) {
-                    self.request_format(FormatRequest {
-                        sample_rate: Some(rate),
-                        ..Default::default()
-                    });
+                if let (Some(rate), Some(from)) = (conmon::decode_configurable_request(body), from)
+                {
+                    let request = FormatRequest { sample_rate: Some(rate), ..Default::default() };
+                    self.request_format(request, from, info.sample_rate != rate);
                 }
                 let pending = self.shared.pending_format().sample_rate;
                 let c = conmon::configurable_status(
                     info.sample_rate,
                     pending.filter(|&r| r != info.sample_rate).unwrap_or(0),
-                    self.shared.format_configurable,
+                    writable,
                     &crate::config::SAMPLE_RATES,
                 );
                 self.status(notification::SAMPLE_RATE_STATUS, &c).await
             }
             notification::ENCODING_QUERY => {
-                if let Some(bits) = conmon::decode_configurable_request(body) {
-                    self.request_format(FormatRequest {
+                let current = u32::from(info.format.bits());
+                if let (Some(bits), Some(from)) = (conmon::decode_configurable_request(body), from)
+                {
+                    let request = FormatRequest {
                         bits_per_sample: Some(bits.min(u32::from(u16::MAX)) as u16),
                         ..Default::default()
-                    });
+                    };
+                    self.request_format(request, from, bits != current);
                 }
-                let current = u32::from(info.format.bits());
                 let pending = self.shared.pending_format().bits_per_sample.map(u32::from);
                 let values: Vec<u32> =
                     crate::config::BITS_PER_SAMPLE.iter().map(|&b| u32::from(b)).collect();
                 let c = conmon::configurable_status(
                     current,
                     pending.filter(|&b| b != current).unwrap_or(0),
-                    self.shared.format_configurable,
+                    writable,
                     &values,
                 );
                 self.status(notification::ENCODING_STATUS, &c).await
@@ -462,11 +563,31 @@ impl Conmon {
         }
     }
 
-    /// Applies a controller's format request, or says why not.
-    fn request_format(&self, request: FormatRequest) {
+    /// Applies the format request of the controller at `from`, or says why
+    /// not. `changes` says whether it differs from the running format: the
+    /// lock lets a request for the running format through, as it changes
+    /// nothing. A refusal has no reply of its own (conmon answers with the
+    /// status, which shows the format unchanged).
+    fn request_format(&self, request: FormatRequest, from: SocketAddr, changes: bool) {
+        let what = || match request {
+            FormatRequest { sample_rate: Some(rate), .. } => {
+                format!("the sample rate to {rate} Hz")
+            }
+            FormatRequest { bits_per_sample: Some(bits), .. } => {
+                format!("the encoding to {bits}-bit")
+            }
+            _ => format!("the format to {request:?}"),
+        };
+        if !changes && self.shared.remote_settings_locked() {
+            return;
+        }
+        if refused_by_lock(&self.shared, from, what) {
+            return;
+        }
         match self.shared.request_format(request) {
-            Ok(()) => info!("a controller asked for {request:?}"),
-            Err(e) => warn!("refusing {request:?} from a controller: {e}"),
+            Ok(()) if changes => changed_by(&self.shared, from, what()),
+            Ok(()) => info!("the controller at {from} asked for {request:?}"),
+            Err(e) => warn!("refusing {request:?} from the controller at {from}: {e}"),
         }
     }
 
@@ -600,8 +721,8 @@ pub async fn run_conmon(
     mut notify: mpsc::UnboundedReceiver<Notify>,
 ) {
     let mut c = Conmon { shared, socket, seq: 1, sync: None, traffic: None, errors_base: None };
-    c.answer(notification::VERSIONS_QUERY, &[]).await;
-    c.answer(notification::MANUFACTURER_VERSIONS_QUERY, &[]).await;
+    c.answer(notification::VERSIONS_QUERY, &[], None).await;
+    c.answer(notification::MANUFACTURER_VERSIONS_QUERY, &[], None).await;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut buf = vec![0u8; MTU];
@@ -611,7 +732,7 @@ pub async fn run_conmon(
                 let Ok((len, src)) = r else { continue };
                 match ConmonHeader::decode(&buf[..len]) {
                     Ok((h, body)) => match conmon::opcode_id(&h.opcode) {
-                        Some(id) => c.answer(id, body).await,
+                        Some(id) => c.answer(id, body, Some(src)).await,
                         None => debug!("conmon request with unknown opcode {} from {src}",
                                        hex::encode(h.opcode)),
                     },
@@ -677,5 +798,200 @@ mod tests {
     fn clock_states_map_to_conmon() {
         assert_eq!(clock_sync(ClockState::Locked), conmon::Sync::Locked);
         assert_eq!(clock_sync(ClockState::Unlocked), conmon::Sync::Unlocked);
+    }
+
+    use std::net::Ipv4Addr;
+
+    use crate::config::{Channels, DeviceConfig};
+    use crate::info::DeviceInfo;
+    use crate::net::Interface;
+    use crate::state::{RemoteChanges, State};
+
+    /// A device's shared state at 4 ms, 2 + 2 channels, named `desk-mac`,
+    /// with the show lock `locked`, without its servers.
+    fn shared(locked: bool) -> Arc<Shared> {
+        let config = DeviceConfig {
+            tx_channels: Channels::Count(2),
+            rx_channels: Channels::Count(2),
+            latency_ms: 4.0,
+            lock_remote_settings: locked,
+            ..Default::default()
+        };
+        let iface = Interface {
+            name: "lo".into(),
+            ip: Ipv4Addr::LOCALHOST,
+            netmask: Ipv4Addr::new(255, 0, 0, 0),
+            gateway: Ipv4Addr::UNSPECIFIED,
+            mac: [0; 6],
+            link_speed_mbps: 1000,
+        };
+        let info = DeviceInfo::new(&config, iface).unwrap();
+        let state = State {
+            name: "desk-mac".into(),
+            tx_names: info.tx_channels.clone(),
+            rx_names: info.rx_channels.clone(),
+            subscriptions: vec![None; 2],
+            tx_flows: Vec::new(),
+            rx_flows: Vec::new(),
+            rx_flow_stats: Vec::new(),
+            latency_override_ns: None,
+            remote_settings_locked: locked,
+            remote_settings_lock_set: None,
+            name_conflict: None,
+        };
+        let clock = ovsc_clock::system_clock();
+        Shared::new(info, state, clock, 1024, None, true, RemoteChanges::default()).unwrap().0
+    }
+
+    /// Dante Controller's address in these tests.
+    fn controller() -> SocketAddr {
+        SocketAddr::from(([192, 168, 1, 20], 51_000))
+    }
+
+    /// The result code of the ARC answer to `request`.
+    fn ask(shared: &Shared, request: Vec<u8>) -> u16 {
+        let frame = Frame::parse(&request).unwrap();
+        let answer = handle_arc(shared, &frame, controller()).expect("an answer");
+        Frame::parse(&answer).unwrap().header.result
+    }
+
+    /// The remote changes noted so far, as `(refused, what)`.
+    fn noted(shared: &Shared) -> Vec<(bool, String)> {
+        shared.remote_changes.recent().into_iter().map(|c| (c.refused, c.what)).collect()
+    }
+
+    #[test]
+    fn the_show_lock_refuses_a_controllers_latency() {
+        let shared = shared(true);
+        let requests = shared.latency_requests();
+        // Dante Controller's own 0x1101 packet for 2 ms: refused with an
+        // error result, and the device does not restart.
+        let set = |ns| arc::encode_set_latency_request(1, ns, 16);
+        assert_eq!(ask(&shared, set(2_000_000)), result::ERROR);
+        assert_eq!(shared.configured_latency_ns(), 4_000_000);
+        assert!(!requests.has_changed().unwrap());
+        assert_eq!(noted(&shared), [(true, "the receive latency to 2 ms".to_owned())]);
+        assert_eq!(shared.remote_changes.recent()[0].from, controller());
+        // The latency it already has changes nothing: no error, no restart.
+        assert_eq!(ask(&shared, set(4_000_000)), result::SUCCESS);
+        assert!(!requests.has_changed().unwrap());
+        assert_eq!(noted(&shared).len(), 1);
+
+        // Unlocked, the controller sets it, which restarts the device.
+        shared.lock_remote_settings(false);
+        assert_eq!(ask(&shared, set(2_000_000)), result::SUCCESS);
+        assert_eq!(shared.configured_latency_ns(), 2_000_000);
+        assert!(requests.has_changed().unwrap());
+        assert_eq!(noted(&shared)[1], (false, "the receive latency to 2 ms".to_owned()));
+        // Saved with the state, as the app's choice.
+        assert_eq!(shared.state().remote_settings_lock_set, Some(false));
+    }
+
+    #[test]
+    fn the_show_lock_refuses_renames_but_not_routing() {
+        let shared = shared(true);
+        let name = |n| arc::encode_set_device_name_request(1, Some(n));
+        assert_eq!(ask(&shared, name("vox-fx")), result::ERROR);
+        assert_eq!(shared.name(), "desk-mac");
+        // Its own name again changes nothing.
+        assert_eq!(ask(&shared, name("desk-mac")), result::SUCCESS);
+        assert_eq!(
+            ask(&shared, arc::encode_rename_tx_channels_request(1, &[(1, "Vox")])),
+            result::ERROR
+        );
+        assert_eq!(
+            ask(&shared, arc::encode_rename_rx_channels_request(1, &[(2, "Mic")])),
+            result::ERROR
+        );
+        assert_eq!(shared.state().tx_names, ["01", "02"]);
+        assert_eq!(shared.state().rx_names, ["01", "02"]);
+        assert_eq!(
+            noted(&shared),
+            [
+                (true, "the device name to vox-fx".to_owned()),
+                (true, "the name of transmit channel 1 to Vox".to_owned()),
+                (true, "the name of receive channel 2 to Mic".to_owned()),
+            ]
+        );
+        // Subscriptions stay open: patching is the console's job mid-show.
+        let sub = arc::SubscriptionRequest {
+            rx_channel: 1,
+            source: Some(("01".into(), "stagebox".into())),
+        };
+        assert_eq!(ask(&shared, arc::encode_set_subscriptions_request(1, &[sub])), result::SUCCESS);
+        assert!(shared.state().subscriptions[0].is_some());
+
+        shared.lock_remote_settings(false);
+        assert_eq!(ask(&shared, name("vox-fx")), result::SUCCESS);
+        assert_eq!(shared.name(), "vox-fx");
+        assert_eq!(
+            ask(&shared, arc::encode_rename_tx_channels_request(1, &[(1, "Vox")])),
+            result::SUCCESS
+        );
+        assert_eq!(shared.state().tx_names, ["Vox", "02"]);
+        let last = noted(&shared).split_off(3);
+        assert_eq!(
+            last,
+            [
+                (false, "the device name to vox-fx".to_owned()),
+                (false, "the name of transmit channel 1 to Vox".to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_show_lock_refuses_a_controllers_format() {
+        let shared = shared(true);
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let mut c = Conmon {
+            shared: shared.clone(),
+            socket,
+            seq: 1,
+            sync: None,
+            traffic: None,
+            errors_base: None,
+        };
+        let mut formats = shared.format_requests();
+        // Dante Controller's "set" body: mode 1, then the value
+        // (docs/PROTOCOL.md §7.5).
+        let set = |value: u32| [1u32.to_be_bytes(), value.to_be_bytes()].concat();
+        c.answer(notification::SAMPLE_RATE_QUERY, &set(96_000), Some(controller())).await;
+        c.answer(notification::ENCODING_QUERY, &set(32), Some(controller())).await;
+        assert!(!formats.has_changed().unwrap());
+        assert_eq!(
+            noted(&shared),
+            [
+                (true, "the sample rate to 96000 Hz".to_owned()),
+                (true, "the encoding to 32-bit".to_owned()),
+            ]
+        );
+        // The running format changes nothing, so it is not refused either.
+        c.answer(notification::ENCODING_QUERY, &set(24), Some(controller())).await;
+        assert!(!formats.has_changed().unwrap());
+        assert_eq!(noted(&shared).len(), 2);
+
+        shared.lock_remote_settings(false);
+        c.answer(notification::SAMPLE_RATE_QUERY, &set(96_000), Some(controller())).await;
+        assert!(formats.has_changed().unwrap());
+        assert_eq!(formats.borrow_and_update().sample_rate, Some(96_000));
+        assert_eq!(noted(&shared)[2], (false, "the sample rate to 96000 Hz".to_owned()));
+    }
+
+    #[test]
+    fn the_remote_change_log_keeps_the_latest() {
+        let log = RemoteChanges::default();
+        let shared_log = log.clone();
+        for i in 0..RemoteChanges::KEPT + 3 {
+            log.push(crate::state::RemoteChange {
+                at: std::time::SystemTime::UNIX_EPOCH,
+                from: controller(),
+                what: i.to_string(),
+                refused: false,
+            });
+        }
+        let kept: Vec<String> = shared_log.recent().into_iter().map(|c| c.what).collect();
+        assert_eq!(kept.len(), RemoteChanges::KEPT);
+        assert_eq!(kept.first().unwrap(), "3");
+        assert_eq!(kept.last().unwrap(), &(RemoteChanges::KEPT + 2).to_string());
     }
 }

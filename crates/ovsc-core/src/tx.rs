@@ -813,6 +813,8 @@ mod tests {
             rx_flows: Vec::new(),
             rx_flow_stats: Vec::new(),
             latency_override_ns: None,
+            remote_settings_locked: false,
+            remote_settings_lock_set: None,
             name_conflict: None,
         };
         // One fixed mapping from the monotonic clock, so that the transmit
@@ -820,7 +822,9 @@ mod tests {
         // clock maps afresh on every read, off by any preemption between
         // its two clock reads).
         let clock = free_running_clock();
-        Shared::new(info, state, clock, config.ring_capacity, None, false).unwrap().0
+        Shared::new(info, state, clock, config.ring_capacity, None, false, Default::default())
+            .unwrap()
+            .0
     }
 
     fn flow_request(port: u16, fpp: u16, bits: u32, channels: &[u16]) -> FlowRequest {

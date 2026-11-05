@@ -4,8 +4,8 @@
 use std::io;
 
 use ovsc_control::{
-    BITS_PER_SAMPLE, ClockInfo, DriverInfo, InterfaceInfo, LATENCY_CHOICES_MS, PROTOCOL_VERSION,
-    Restart, SAMPLE_RATES, Settings, SettingsChange, Status,
+    BITS_PER_SAMPLE, ClockInfo, DeviceStatus, DriverInfo, InterfaceInfo, LATENCY_CHOICES_MS,
+    PROTOCOL_VERSION, Restart, SAMPLE_RATES, Settings, SettingsChange, Status,
 };
 
 /// The command that starts the daemon, for when it does not run.
@@ -32,6 +32,8 @@ pub fn change(current: &Settings, edited: &Settings) -> SettingsChange {
         rx_channels: (edited.rx_channels != current.rx_channels).then_some(edited.rx_channels),
         tx_channels: (edited.tx_channels != current.tx_channels).then_some(edited.tx_channels),
         latency_ms: (edited.latency_ms != current.latency_ms).then_some(edited.latency_ms),
+        lock_remote_settings: (edited.lock_remote_settings != current.lock_remote_settings)
+            .then_some(edited.lock_remote_settings),
     }
 }
 
@@ -53,23 +55,122 @@ pub fn expected_restart(change: &SettingsChange) -> Restart {
 }
 
 /// What applying a change that restarts `restart` does to the audio, if
-/// anything.
+/// anything. Either restart closes the flows other devices receive from
+/// this one too, so the returns to a console drop with the inputs, and
+/// each receiver must ask for its flow again.
 pub fn interruption(restart: Restart) -> Option<&'static str> {
     match restart {
         Restart::None => None,
-        Restart::Device => {
-            Some("Audio stops for a second or two while the network engine restarts.")
-        }
-        Restart::Daemon => Some("Audio stops for 10–20 seconds while OpenVirtualSoundcard restarts."),
+        Restart::Device => Some(
+            "Audio stops for a second or two in both directions while the network engine \
+             restarts: this device's inputs, and the feeds other devices receive from it, such as \
+             returns to the console. Those devices must then request their feeds again, which may \
+             take them several more seconds.",
+        ),
+        Restart::Daemon => Some(
+            "Audio stops for 10–20 seconds in both directions while OpenVirtualSoundcard \
+             restarts: this device's inputs, and the feeds other devices receive from it, such as \
+             returns to the console, which those devices must then request again.",
+        ),
     }
 }
 
-/// What the user is told once the daemon accepted a change.
-pub fn applied_message(restart: Restart) -> &'static str {
+/// The devices receiving from this one, as the status lists them: names,
+/// or addresses for those that gave none.
+pub fn receivers(device: Option<&DeviceStatus>) -> Vec<String> {
+    let mut names: Vec<String> = device
+        .map(|d| &d.tx_flows[..])
+        .unwrap_or_default()
+        .iter()
+        .map(|f| {
+            f.receiver.clone().unwrap_or_else(|| {
+                f.destination.rsplit_once(':').map_or(&f.destination[..], |(ip, _)| ip).to_owned()
+            })
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// What renaming the device from `old` to `new` does to the devices
+/// subscribed to its channels (`receivers` receive from it now). Dante
+/// subscriptions name the transmitting device (`channel@device`), so theirs
+/// stop resolving, and stay so after any restart, until they are patched
+/// again.
+pub fn rename_warning(old: &str, new: &str, receivers: &[String]) -> String {
+    let who = if receivers.is_empty() {
+        "Devices subscribed to this device's channels".to_owned()
+    } else {
+        format!("Devices subscribed to this device's channels (now: {})", receivers.join(", "))
+    };
+    format!(
+        "{who} lose them: their subscriptions name \"{old}\" and stop resolving, so returns to \
+         the console can go silent. Patch them again to \"{new}\" in Dante Controller."
+    )
+}
+
+/// What the user must accept before a change is sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Confirmation {
+    pub title: &'static str,
+    pub text: String,
+    pub button: &'static str,
+}
+
+/// The confirmation `change` needs, if it interrupts audio or breaks other
+/// devices' subscriptions: a restart of either kind, or a new name.
+/// `current` is the device's name now and `receivers` who receives from it.
+pub fn confirmation(
+    change: &SettingsChange,
+    current: &str,
+    receivers: &[String],
+) -> Option<Confirmation> {
+    let restart = expected_restart(change);
+    let mut text: Vec<String> = interruption(restart).map(str::to_owned).into_iter().collect();
+    if let Some(name) = &change.name {
+        text.push(rename_warning(current, name, receivers));
+    }
+    if text.is_empty() {
+        return None;
+    }
+    let (title, button) = match restart {
+        Restart::Daemon => ("Restart OpenVirtualSoundcard?", "Restart"),
+        Restart::Device => ("Restart the network engine?", "Restart"),
+        Restart::None => ("Rename the device?", "Rename"),
+    };
+    Some(Confirmation { title, text: text.join("\n\n"), button })
+}
+
+/// What the show lock does, for the settings form.
+pub const LOCK_HELP: &str = "While locked, Dante Controller cannot change the latency, sample \
+    rate, encoding or names. Routing stays open, and changes made here still apply.";
+
+/// The show lock's state, for the status.
+pub fn lock_label(locked: bool) -> &'static str {
+    if locked { "Locked" } else { "Open to controllers" }
+}
+
+/// What the user is told once the daemon accepted `change`, which restarts
+/// `restart`.
+pub fn applied_message(change: &SettingsChange, restart: Restart) -> &'static str {
     match restart {
-        Restart::None => "Saved.",
-        Restart::Device => "Saved. The network engine restarts; audio returns in a second or two.",
-        Restart::Daemon => "Saved. OpenVirtualSoundcard restarts; audio returns in 10–20 seconds.",
+        Restart::Device => {
+            "Saved. The network engine restarts; audio returns in a second or two, and devices \
+             receiving from this one subscribe again on their own."
+        }
+        Restart::Daemon => {
+            "Saved. OpenVirtualSoundcard restarts; audio returns in 10–20 seconds, and devices \
+             receiving from this one subscribe again on their own."
+        }
+        Restart::None if change.name.is_some() => {
+            "Saved. Patch the subscriptions to this device's channels again in Dante Controller."
+        }
+        Restart::None => match change.lock_remote_settings {
+            Some(true) => "Saved. Dante Controller can no longer change these settings.",
+            Some(false) => "Saved. Dante Controller can change these settings again.",
+            None => "Saved.",
+        },
     }
 }
 
@@ -88,6 +189,11 @@ pub fn rebase(old: &Settings, edited: &Settings, new: &Settings) -> Settings {
         rx_channels: pick(&old.rx_channels, &edited.rx_channels, &new.rx_channels),
         tx_channels: pick(&old.tx_channels, &edited.tx_channels, &new.tx_channels),
         latency_ms: pick(&old.latency_ms, &edited.latency_ms, &new.latency_ms),
+        lock_remote_settings: pick(
+            &old.lock_remote_settings,
+            &edited.lock_remote_settings,
+            &new.lock_remote_settings,
+        ),
     }
 }
 
@@ -378,6 +484,7 @@ mod tests {
             rx_channels: 8,
             tx_channels: 8,
             latency_ms: 4.0,
+            lock_remote_settings: false,
         }
     }
 
@@ -451,25 +558,110 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(expected_restart(&both), Restart::Daemon);
+        assert_eq!(only(|c| c.lock_remote_settings = Some(true)), Restart::None);
         assert_eq!(interruption(Restart::None), None);
         assert!(interruption(Restart::Daemon).unwrap().contains("10–20 seconds"));
     }
 
     #[test]
+    fn interruptions_name_the_returns_to_the_console() {
+        // Either restart closes the flows other devices receive from this
+        // one, not only its inputs.
+        for restart in [Restart::Device, Restart::Daemon] {
+            let words = interruption(restart).unwrap();
+            assert!(words.contains("both directions"), "{words}");
+            assert!(words.contains("returns to the console"), "{words}");
+        }
+        assert!(interruption(Restart::Device).unwrap().contains("several more seconds"));
+    }
+
+    fn device_with_flows(receivers: &[Option<&str>]) -> DeviceStatus {
+        DeviceStatus {
+            name: "studio-mac".into(),
+            interface: "en7".into(),
+            ip: "192.168.0.8".into(),
+            sample_rate: 48_000,
+            bits_per_sample: 24,
+            latency_ms: 4.0,
+            rx_channels: Vec::new(),
+            tx_channels: vec!["01".into(), "02".into()],
+            tx_flows: receivers
+                .iter()
+                .map(|r| ovsc_control::TxFlowStatus {
+                    receiver: r.map(str::to_owned),
+                    destination: "192.168.0.20:14400".into(),
+                    channels: vec![1, 2],
+                })
+                .collect(),
+            packets: Default::default(),
+            remote_settings_locked: false,
+        }
+    }
+
+    #[test]
+    fn a_rename_asks_first_and_names_the_receivers() {
+        let s = settings();
+        let renamed = change(&s, &Settings { name: "vox-fx".into(), ..settings() });
+        // The daemon applies it at once, but other devices lose their
+        // subscriptions: the app asks first.
+        assert_eq!(expected_restart(&renamed), Restart::None);
+        let device = device_with_flows(&[Some("desk"), None, Some("desk")]);
+        let receivers = receivers(Some(&device));
+        assert_eq!(receivers, ["192.168.0.20", "desk"]);
+        let c = confirmation(&renamed, "studio-mac", &receivers).unwrap();
+        assert_eq!((c.title, c.button), ("Rename the device?", "Rename"));
+        assert!(c.text.contains("(now: 192.168.0.20, desk)"), "{}", c.text);
+        assert!(c.text.contains("\"studio-mac\""), "{}", c.text);
+        assert!(c.text.contains("Patch them again to \"vox-fx\""), "{}", c.text);
+        // Nobody receiving now: subscriptions may still exist.
+        let c = confirmation(&renamed, "studio-mac", &[]).unwrap();
+        assert!(c.text.starts_with("Devices subscribed to this device's channels lose"));
+        assert!(applied_message(&renamed, Restart::None).contains("Patch the subscriptions"));
+    }
+
+    #[test]
+    fn restarts_ask_first_too() {
+        let s = settings();
+        let latency = change(&s, &Settings { latency_ms: 2.0, ..settings() });
+        let c = confirmation(&latency, "studio-mac", &[]).unwrap();
+        assert_eq!((c.title, c.button), ("Restart the network engine?", "Restart"));
+        assert_eq!(c.text, interruption(Restart::Device).unwrap());
+        let both = change(&s, &Settings { name: "x".into(), sample_rate: 96_000, ..settings() });
+        let c = confirmation(&both, "studio-mac", &[]).unwrap();
+        assert_eq!(c.title, "Restart OpenVirtualSoundcard?");
+        assert!(c.text.contains("10–20 seconds") && c.text.contains("\"x\""), "{}", c.text);
+        // The lock interrupts nothing.
+        let lock = change(&s, &Settings { lock_remote_settings: true, ..settings() });
+        assert_eq!(lock, SettingsChange { lock_remote_settings: Some(true), ..Default::default() });
+        assert_eq!(confirmation(&lock, "studio-mac", &[]), None);
+    }
+
+    #[test]
     fn applied_messages() {
-        assert_eq!(applied_message(Restart::None), "Saved.");
-        assert!(applied_message(Restart::Device).contains("a second or two"));
-        assert!(applied_message(Restart::Daemon).contains("10–20 seconds"));
+        let none = SettingsChange::default();
+        assert_eq!(applied_message(&none, Restart::None), "Saved.");
+        assert!(applied_message(&none, Restart::Device).contains("a second or two"));
+        assert!(applied_message(&none, Restart::Daemon).contains("10–20 seconds"));
+        let lock = |on| SettingsChange { lock_remote_settings: Some(on), ..Default::default() };
+        assert!(applied_message(&lock(true), Restart::None).contains("can no longer"));
+        assert!(applied_message(&lock(false), Restart::None).contains("again"));
+        assert_eq!(lock_label(true), "Locked");
     }
 
     #[test]
     fn rebase_keeps_edits_and_takes_the_rest() {
         let old = settings();
         let edited = Settings { latency_ms: 1.0, ..settings() };
-        let new = Settings { name: "renamed".into(), latency_ms: 10.0, ..settings() };
+        let new = Settings {
+            name: "renamed".into(),
+            latency_ms: 10.0,
+            lock_remote_settings: true,
+            ..settings()
+        };
         let rebased = rebase(&old, &edited, &new);
         assert_eq!(rebased.name, "renamed");
         assert_eq!(rebased.latency_ms, 1.0);
+        assert!(rebased.lock_remote_settings);
         // Nothing edited: the new settings as they are.
         assert_eq!(rebase(&old, &old, &new), new);
     }

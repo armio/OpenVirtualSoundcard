@@ -320,6 +320,7 @@ mod tests {
             rx_channels: 8,
             tx_channels: 8,
             latency_ms: 4.0,
+            lock_remote_settings: false,
         }
     }
 

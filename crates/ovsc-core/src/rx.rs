@@ -2360,11 +2360,15 @@ mod tests {
                 rx_flows: Vec::new(),
                 rx_flow_stats: Vec::new(),
                 latency_override_ns: None,
+                remote_settings_locked: false,
+                remote_settings_lock_set: None,
                 name_conflict: None,
             };
             let clock = ovsc_clock::system_clock();
             let ring_capacity = crate::buffer::DEFAULT_CAPACITY;
-            let (shared, _) = Shared::new(info, state, clock, ring_capacity, None, false).unwrap();
+            let changes = crate::RemoteChanges::default();
+            let (shared, _) =
+                Shared::new(info, state, clock, ring_capacity, None, false, changes).unwrap();
             let (threads, _) = mpsc::channel(1);
             RxManager::new(shared, Directory::Static(directory), threads)
         }

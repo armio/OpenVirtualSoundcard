@@ -23,7 +23,7 @@ use crate::mdns::{self, Advertisement, Mdns, NameConflict};
 use crate::net::{Interface, bind_udp, into_tokio};
 use crate::persist::{self, SavedState};
 use crate::rx::{RxManager, own_channel_txt};
-use crate::state::{FormatRequest, Shared, State, Subscription};
+use crate::state::{FormatRequest, RemoteChanges, Shared, State, Subscription};
 use crate::tx::{self, FlowControl, TxCommand};
 use crate::{Error, Result};
 
@@ -84,6 +84,10 @@ pub struct StartOptions {
     /// caller then applies [`Device::format_requests`], restarting the
     /// device with them.
     pub format_configurable: bool,
+    /// Note controllers' changes in this log, rather than a new one, to keep
+    /// them listed across a restart of the device (see
+    /// [`Device::remote_changes`]).
+    pub remote_changes: Option<RemoteChanges>,
 }
 
 /// Packet counters since the device started.
@@ -164,6 +168,7 @@ impl Device {
             config.ring_capacity,
             options.rings,
             options.format_configurable,
+            options.remote_changes.unwrap_or_default(),
         )?;
 
         // Bind everything first so that port conflicts fail the start.
@@ -283,6 +288,22 @@ impl Device {
     /// depth; see [`StartOptions::format_configurable`].
     pub fn format_requests(&self) -> watch::Receiver<FormatRequest> {
         self.shared.format_requests()
+    }
+
+    /// Whether the show lock keeps controllers from changing the latency,
+    /// the format and the names; see [`DeviceConfig::lock_remote_settings`].
+    pub fn remote_settings_locked(&self) -> bool {
+        self.shared.remote_settings_locked()
+    }
+
+    /// Turns the show lock on or off, saved with the device's state.
+    pub fn lock_remote_settings(&self, locked: bool) {
+        self.shared.lock_remote_settings(locked)
+    }
+
+    /// What controllers changed, or tried to change while locked, recently.
+    pub fn remote_changes(&self) -> RemoteChanges {
+        self.shared.remote_changes.clone()
     }
 
     /// Renames the device, as a controller would.
@@ -593,6 +614,8 @@ fn initial_state(config: &DeviceConfig, info: &DeviceInfo, saved: SavedState) ->
         rx_flows: Vec::new(),
         rx_flow_stats: Vec::new(),
         latency_override_ns: saved.latency_ns.filter(|&ns| ns == info.latency_ns),
+        remote_settings_locked: saved.lock_remote_settings.unwrap_or(config.lock_remote_settings),
+        remote_settings_lock_set: saved.lock_remote_settings,
     }
 }
 

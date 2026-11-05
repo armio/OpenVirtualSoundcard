@@ -341,6 +341,12 @@ latency_ms = 4.0             # receive latency, 1 to 40
 # tx_latency_ms = 1.0
 # Remember renames and subscriptions made from a controller.
 state_file = "ovsc-state.toml"
+# Show lock: refuse changes from controllers (Dante Controller) to the
+# latency, sample rate and encoding, which stop audio both ways, and to the
+# device and channel names, which other devices subscribe by. Subscriptions
+# stay open. The macOS app turns it on and off; its choice is saved in
+# state_file and replaces this.
+lock_remote_settings = false
 
 # Subscriptions to set up at start (controllers can change them later).
 # [[device.subscriptions]]
@@ -382,6 +388,16 @@ mod tests {
         assert_eq!(macos.device.name, "");
         assert_eq!(cfg.clock.source, ClockSource::Ptp);
         assert_eq!(cfg.audio.backend, BackendKind::None);
+        assert!(!cfg.device.lock_remote_settings);
+    }
+
+    #[test]
+    fn the_show_lock_is_a_device_option() {
+        let cfg: AppConfig = toml::from_str("[device]\nlock_remote_settings = true\n").unwrap();
+        assert!(cfg.device.lock_remote_settings);
+        // Off unless asked for, also for the configuration installed on Macs.
+        let mac: AppConfig = toml::from_str(EXAMPLE_MACOS).unwrap();
+        assert!(!mac.device.lock_remote_settings);
     }
 
     #[test]

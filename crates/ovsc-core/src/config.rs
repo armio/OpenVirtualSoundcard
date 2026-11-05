@@ -122,6 +122,12 @@ pub struct DeviceConfig {
     /// Advertise over mDNS and send conmon multicasts. Disable for tests on
     /// hosts without multicast.
     pub discovery: bool,
+    /// Show lock: refuse controllers' changes of the latency, sample rate
+    /// and encoding (they interrupt audio both ways) and of the device and
+    /// channel names (other devices subscribe by them). Subscriptions stay
+    /// open. The owner's app can turn it on and off; its choice is saved in
+    /// `state_file` and then replaces this.
+    pub lock_remote_settings: bool,
     /// Where names and subscriptions are persisted. `None` disables it.
     pub state_file: Option<PathBuf>,
     /// Device id (16 hex digits). Default: derived from IP and process id.
@@ -148,6 +154,7 @@ impl Default for DeviceConfig {
             max_channels_per_rx_flow: 8,
             ports: Ports::default(),
             discovery: true,
+            lock_remote_settings: false,
             state_file: None,
             device_id: None,
             process_id: 0,

@@ -18,6 +18,10 @@ pub struct SavedState {
     /// Receive latency set by a controller or the app, ns.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latency_ns: Option<u32>,
+    /// The show lock as the app set it; replaces the configuration's
+    /// `lock_remote_settings`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lock_remote_settings: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,6 +62,7 @@ impl SavedState {
                 })
                 .collect(),
             latency_ns: state.latency_override_ns,
+            lock_remote_settings: state.remote_settings_lock_set,
         }
     }
 
@@ -126,6 +131,7 @@ mod tests {
                 tx_device: "desk".into(),
             }],
             latency_ns: Some(2_000_000),
+            lock_remote_settings: Some(true),
         };
         saved.save(&path).unwrap();
         assert_eq!(SavedState::load(&path), Some(saved));
