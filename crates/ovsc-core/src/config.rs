@@ -22,9 +22,16 @@ pub const MAX_LATENCY_MS: f64 = 40.0;
 /// wake-up delay plus the network's transit. A receiver plays frame `t` at
 /// `t + latency` (docs/PROTOCOL.md 8.4), so a latency of `tx_guard` or less
 /// makes every packet late. This is the room left for the wake-up and the
-/// network. It applies to the receive latency too: another device of ours
-/// sends with the same guard, and our receiver does not raise its latency
-/// to a transmitter's `latency_ns`.
+/// network.
+///
+/// It bounds the receive latency too, though not for OVSC peers: they
+/// advertise a transmit latency (TXT `latency_ns`) of at least their guard
+/// plus this headroom, and our receiver plays each flow at the larger of
+/// its own latency and the one its transmitter advertises (docs/PROTOCOL.md
+/// 2.2 and 8.4; `flow_latency` in `rx.rs`). The floor on our own receive
+/// latency guards our transmit latency while `tx_latency_ms` is unset (it
+/// is the receive latency then), and flows from transmitters that send
+/// later than they advertise.
 pub const LATENCY_HEADROOM_US: u32 = 500;
 
 /// UDP ports of the device's services.
