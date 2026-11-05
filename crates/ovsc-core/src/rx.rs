@@ -13,7 +13,8 @@
 //!    another receive latency than the device runs at now
 //!    (`Device::restart_rx`), whose channels are requested again at once;
 //! 3. subscribed channels already carried by a flow are routed to it;
-//! 4. the remaining ones are resolved (mDNS), grouped per transmitter and
+//! 4. the remaining ones are resolved (mDNS), grouped per transmitter (a
+//!    computer on Wi-Fi and Ethernet is one, at either address) and
 //!    requested, in free slots of existing flows or as new unicast flows;
 //! 5. per-channel statuses are published for ARC listings.
 //!
@@ -85,8 +86,8 @@ const REPORT_INTERVAL: Duration = Duration::from_secs(10);
 /// A flow counts as degraded for this long after it last lost a packet or
 /// received one too late.
 const DEGRADED_HOLD: Duration = Duration::from_secs(5);
-/// A receive thread that follows one source port of its transmitter moves to
-/// another only after the first has been quiet this long.
+/// A receive thread that follows one source of its transmitter (an address
+/// and port) moves to another only after the first has been quiet this long.
 const SOURCE_HOLD_NS: u64 = KEEPALIVE_INTERVAL.as_nanos() as u64;
 /// How long packets the transmitter sent before a slot switched to another
 /// transmit channel may matter. They are stamped at most the flow's latency
@@ -121,6 +122,15 @@ type Key = (String, String);
 
 fn key(channel: &str, device: &str) -> Key {
     (channel.to_ascii_lowercase(), device.to_ascii_lowercase())
+}
+
+/// Whether the transmitter of `r` takes flow requests at `control`: its
+/// flow-control port, at any of its addresses. A computer on Wi-Fi and
+/// Ethernet is one transmitter with an address on each, and which of them
+/// a lookup gives first changes when it announces them in another order.
+fn is_control_of(control: SocketAddrV4, r: &ResolvedChannel) -> bool {
+    control.port() == r.flow_control_port
+        && (*control.ip() == r.addr || r.addrs.contains(control.ip()))
 }
 
 /// How soon a failed lookup or request is tried again: `first`, doubling
@@ -214,8 +224,11 @@ type Routing = Arc<ArcSwap<Routes>>;
 struct RxFlow {
     id: u16,
     tx_device: String,
-    /// The transmitter's flow-control address; also where its audio comes
-    /// from.
+    /// The transmitter's flow-control address, where the flow was
+    /// requested. Its audio may come from any of the transmitter's
+    /// addresses ([`FlowParams::tx`]), and the transmitter's other channels
+    /// are requested here too, whichever address they were found at
+    /// ([`RxManager::control_for`]).
     control: SocketAddrV4,
     handle: FlowHandle,
     /// A spelling of the transmit channel requested for each slot.
@@ -272,10 +285,11 @@ impl RxFlow {
     }
 
     /// Whether `slot` carries the transmit channel `r` (and no request is
-    /// changing it).
+    /// changing it), whichever of the transmitter's addresses `r` was found
+    /// at.
     fn carries(&self, r: &ResolvedChannel, slot: usize) -> bool {
         r.txt.id != 0
-            && SocketAddrV4::new(r.addr, r.flow_control_port) == self.control
+            && is_control_of(self.control, r)
             && self.tx_ids.get(slot) == Some(&r.txt.id)
             && !self.changing.contains(&slot)
     }
@@ -307,6 +321,7 @@ impl RxFlow {
                         device: self.tx_device.clone(),
                         channel: self.slot_names[slot].clone(),
                         addr: *self.control.ip(),
+                        addrs: self.worker.params.tx.as_slice().to_vec(),
                         flow_control_port: self.control.port(),
                         txt,
                     },
@@ -363,7 +378,7 @@ impl RxFlow {
                  from {} and have {} bytes, or another whole number of {}-byte frames)",
                 t.rejected,
                 last & 0xffff,
-                self.control.ip(),
+                self.worker.params.tx,
                 self.worker.params.packet_len(),
                 self.worker.params.stride(),
             ));
@@ -544,7 +559,8 @@ pub struct RxManager {
     resolving: HashSet<Key>,
     /// Lookups done, waiting for their transmitter to be free.
     resolved: HashMap<Key, (ResolvedChannel, Instant)>,
-    /// Transmitters with a request job in flight.
+    /// Transmitters with a request job in flight, by the address it went to
+    /// (see [`RxManager::control_for`]).
     busy: HashSet<SocketAddrV4>,
     /// Local channels in a request in flight, and what they were requested
     /// as.
@@ -903,7 +919,7 @@ impl RxManager {
                     }
                 }
             };
-            let control = SocketAddrV4::new(resolved.addr, resolved.flow_control_port);
+            let control = self.control_for(&resolved, per_tx.keys().copied());
             per_tx.entry(control).or_default().push(Placed { slot: 0, resolved, key: k, chans });
         }
 
@@ -924,6 +940,28 @@ impl RxManager {
         for control in idle {
             self.dispatch(control, Vec::new(), Vec::new());
         }
+    }
+
+    /// Where to ask the transmitter of `r` for flows: where a request to it
+    /// is in flight, else where a flow we have from it was requested, else
+    /// where `planned` requests (this pass's) to it go, else the address
+    /// `r` was found at. A transmitter with several addresses is thus asked
+    /// at one of them, whichever a lookup gives first, so that its channels
+    /// go in free slots of the flows we have from it rather than in new
+    /// ones, and its requests go one at a time.
+    fn control_for(
+        &self,
+        r: &ResolvedChannel,
+        planned: impl IntoIterator<Item = SocketAddrV4>,
+    ) -> SocketAddrV4 {
+        let flows = self.flows.iter().map(|f| f.control);
+        self.busy
+            .iter()
+            .copied()
+            .chain(flows)
+            .chain(planned)
+            .find(|&c| is_control_of(c, r))
+            .unwrap_or(SocketAddrV4::new(r.addr, r.flow_control_port))
     }
 
     /// Whether another device may use our name: a static directory may list
@@ -1025,6 +1063,9 @@ impl RxManager {
     /// Puts entries of `left` in free slots of flows from the transmitter
     /// at `control`, so that transmitters (which may only have a few flows)
     /// aren't asked for a new flow per channel. Entries placed are removed.
+    /// `control` is where those flows were requested, whichever of the
+    /// transmitter's addresses the entries were found at
+    /// ([`RxManager::control_for`]).
     fn plan_grows(&mut self, control: SocketAddrV4, left: &mut Vec<Placed>) -> Vec<Grow> {
         let mut grows = Vec::new();
         for flow in self.flows.iter_mut().filter(|f| f.control == control && !f.grow_refused) {
@@ -1375,8 +1416,13 @@ impl RxManager {
             routes.slots[p.slot] = chans;
             slot_names[p.slot] = p.resolved.channel.clone();
         }
+        // A computer on Wi-Fi and Ethernet may grant the flow at one address
+        // and send its audio from the other: the flow takes audio from any
+        // of the transmitter's addresses, the one it was requested from
+        // first.
+        let addrs = placed.iter().flat_map(|p| p.resolved.addrs.iter().copied());
         let params = FlowParams {
-            tx_ip: *control.ip(),
+            tx: TxAddrs::new(*control.ip(), addrs),
             slots,
             fpp: request.fpp as usize,
             format,
@@ -1546,6 +1592,7 @@ impl RxManager {
             device: state.name.clone(),
             channel: channel.to_owned(),
             addr: info.iface.ip,
+            addrs: vec![info.iface.ip],
             flow_control_port: info.ports.flow_control,
             txt: own_channel_txt(info, index as u16 + 1),
         })
@@ -1818,11 +1865,60 @@ impl Drop for Worker {
     }
 }
 
+/// The addresses a flow's audio may come from: its transmitter's, the one
+/// the flow was requested from first. A fixed-size array, which the receive
+/// thread checks without allocating.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TxAddrs {
+    addrs: [Ipv4Addr; TxAddrs::MAX],
+    len: usize,
+}
+
+impl TxAddrs {
+    /// Wi-Fi and Ethernet, with room to spare.
+    const MAX: usize = 4;
+
+    /// `first`, then those of `others` not in yet, as many as fit.
+    fn new(first: Ipv4Addr, others: impl IntoIterator<Item = Ipv4Addr>) -> Self {
+        let mut set = Self { addrs: [first; Self::MAX], len: 1 };
+        for addr in others {
+            if set.len == Self::MAX {
+                break;
+            }
+            if !set.contains(addr) {
+                set.addrs[set.len] = addr;
+                set.len += 1;
+            }
+        }
+        set
+    }
+
+    fn contains(&self, addr: Ipv4Addr) -> bool {
+        self.as_slice().contains(&addr)
+    }
+
+    fn as_slice(&self) -> &[Ipv4Addr] {
+        &self.addrs[..self.len]
+    }
+}
+
+impl std::fmt::Display for TxAddrs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, addr) in self.as_slice().iter().enumerate() {
+            if i > 0 {
+                f.write_str(" or ")?;
+            }
+            write!(f, "{addr}")?;
+        }
+        Ok(())
+    }
+}
+
 /// What a receive thread knows about its flow.
 #[derive(Clone, Copy, Debug)]
 struct FlowParams {
-    /// The transmitter's address: datagrams from any other are dropped.
-    tx_ip: Ipv4Addr,
+    /// The transmitter's addresses: datagrams from any other are dropped.
+    tx: TxAddrs,
     /// Slots per packet, fixed when the flow was requested.
     slots: usize,
     fpp: usize,
@@ -1990,12 +2086,13 @@ impl Receiver {
         last_packet_ns.store(now_ns, Ordering::Relaxed);
     }
 
-    /// Whether a datagram is one of the flow's packets: from the
-    /// transmitter's address and the source port its packets have been
-    /// coming from, and whole frames of the flow's slots. Anything else (a
-    /// flow that a previous receiver on this port left behind, a second flow
-    /// created by a retried request) would be mixed into this flow's
-    /// channels, or decoded with the wrong layout.
+    /// Whether a datagram is one of the flow's packets: from one of the
+    /// transmitter's addresses (a computer on Wi-Fi and Ethernet may send
+    /// from either, whichever the flow was requested from), from the source
+    /// its packets have been coming from, and whole frames of the flow's
+    /// slots. Anything else (a flow that a previous receiver on this port
+    /// left behind, a second flow created by a retried request) would be
+    /// mixed into this flow's channels, or decoded with the wrong layout.
     ///
     /// The frame count is not checked against the fpp we asked for, only
     /// against [`RX_FPP_LIMIT`]: receivers derive it from the length
@@ -2006,12 +2103,14 @@ impl Receiver {
         let stride = self.params.stride();
         let frames = payload / stride;
         let whole = payload % stride == 0 && (1..=self.samples.len()).contains(&frames);
-        if from.ip() != IpAddr::V4(self.params.tx_ip) || !whole {
+        let IpAddr::V4(ip) = from.ip() else { return false };
+        if !self.params.tx.contains(ip) || !whole {
             return false;
         }
         match self.source {
             Some(source) if source == from => {}
-            // Another port: only once the one we follow has gone quiet.
+            // Another port, or another of the transmitter's addresses: only
+            // once the one we follow has gone quiet.
             Some(_) if now_ns.saturating_sub(self.source_ns) < SOURCE_HOLD_NS => return false,
             _ => self.source = Some(from),
         }
@@ -2161,8 +2260,13 @@ mod tests {
     }
 
     fn test_rx(slots: usize, fpp: usize, offset: u64) -> TestRx {
+        test_rx_from(TxAddrs::new(TX, []), slots, fpp, offset)
+    }
+
+    /// Like [`test_rx`], for a transmitter with the addresses `tx`.
+    fn test_rx_from(tx: TxAddrs, slots: usize, fpp: usize, offset: u64) -> TestRx {
         let params = FlowParams {
-            tx_ip: TX,
+            tx,
             slots,
             fpp,
             format: SampleFormat::S24,
@@ -2254,6 +2358,61 @@ mod tests {
         t.send(a, 1_000 + SOURCE_HOLD_NS + 2, ts + 48, 500);
         assert_eq!(t.rings[0].read_one(ts + 48), None);
         assert_eq!(get(&t.stats.rejected_packets), 4);
+    }
+
+    /// A computer on Wi-Fi and Ethernet on the Dante subnet may grant a flow
+    /// at one address and send its audio from the other. Audio from any of
+    /// the transmitter's addresses plays; a stale flow from another device
+    /// is still dropped, and the source followed is kept as before.
+    #[test]
+    fn packets_from_the_transmitters_other_address_play() {
+        let wifi = Ipv4Addr::new(127, 0, 0, 5);
+        // Requested from TX, the wired address.
+        let mut t = test_rx_from(TxAddrs::new(TX, [wifi]), 2, 12, 0);
+        let ts = t.now();
+        let a = from(wifi, 5000);
+        t.send(a, 1_000, ts, 100);
+        assert_eq!(get(&t.stats.rejected_packets), 0);
+        assert_eq!(get(&t.stats.packets), 1);
+        assert_eq!(t.rx.source, Some(a));
+        assert_eq!(t.rings[0].read_one(ts), Some(100 << 8));
+        assert_eq!(t.rings[1].read_one(ts + 11), Some(101 << 8));
+
+        // Another device: dropped.
+        t.send(from(Ipv4Addr::new(127, 0, 0, 2), 5000), 2_000, ts + 12, 200);
+        // The wired address while Wi-Fi, the source followed, is busy: also
+        // dropped, as another port would be.
+        let b = from(TX, 5000);
+        t.send(b, 3_000, ts + 12, 300);
+        assert_eq!(get(&t.stats.rejected_packets), 2);
+        assert_eq!(get(&t.counters.rx_rejected_packets), 2);
+        assert_eq!(t.rings[0].read_one(ts + 12), None);
+        t.send(a, 4_000, ts + 12, 400);
+        assert_eq!(t.rings[0].read_one(ts + 12), Some(400 << 8));
+
+        // Once Wi-Fi has been quiet a while, the wired address takes over:
+        // the computer moved the flow to its other interface.
+        t.send(b, 4_000 + SOURCE_HOLD_NS + 1, ts + 24, 500);
+        assert_eq!(t.rx.source, Some(b));
+        assert_eq!(t.rings[0].read_one(ts + 24), Some(500 << 8));
+        assert_eq!(get(&t.stats.packets), 3);
+        assert_eq!(get(&t.stats.rejected_packets), 2);
+    }
+
+    /// A flow keeps the address it was requested from first, and takes each
+    /// other address of the transmitter once, as many as fit.
+    #[test]
+    fn a_flow_takes_up_to_four_transmitter_addresses() {
+        let ip = |n| Ipv4Addr::new(10, 0, 0, n);
+        let tx = TxAddrs::new(ip(2), [ip(1), ip(2), ip(3), ip(1), ip(4), ip(5)]);
+        assert_eq!(tx.as_slice(), [ip(2), ip(1), ip(3), ip(4)]);
+        assert!(tx.contains(ip(4)));
+        assert!(!tx.contains(ip(5)));
+        assert_eq!(tx.to_string(), "10.0.0.2 or 10.0.0.1 or 10.0.0.3 or 10.0.0.4");
+        let one = TxAddrs::new(ip(7), []);
+        assert_eq!(one.as_slice(), [ip(7)]);
+        assert!(!one.contains(ip(2)));
+        assert_eq!(one.to_string(), "10.0.0.7");
     }
 
     /// Receivers derive fpp from a packet's length (PROTOCOL.md §8.2): a
@@ -2572,6 +2731,7 @@ mod tests {
                 remote_settings_locked: false,
                 remote_settings_lock_set: None,
                 name_conflict: None,
+                announced: None,
             };
             let clock = ovsc_clock::system_clock();
             let ring_capacity = crate::buffer::DEFAULT_CAPACITY;
@@ -2710,6 +2870,174 @@ mod tests {
             tx.shutdown().await;
         }
 
+        /// A flow takes audio from every address its transmitter has, the
+        /// one it was requested from first: a computer on Wi-Fi and Ethernet
+        /// may send from either.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_flow_takes_every_address_of_its_transmitter() {
+            let tx =
+                Device::start(config("multi-tx", 24560), ovsc_clock::system_clock()).await.unwrap();
+            let directory = StaticDirectory::new();
+            // Its Wi-Fi address (TEST-NET-1), after the one it is reached at.
+            let wifi = Ipv4Addr::new(192, 0, 2, 7);
+            for mut entry in tx.directory_entries() {
+                entry.addrs.push(wifi);
+                directory.insert(entry);
+            }
+            let iface = Interface::find("127.0.0.1").unwrap();
+            let mut mgr = manager(&config("multi-rx", 24570), iface, directory);
+            subscribe(&mgr, 0, "01", "multi-tx");
+            drive(&mut mgr, |m| m.flows.len() == 1).await;
+            let flow = &mgr.flows[0];
+            assert_eq!(*flow.control.ip(), Ipv4Addr::LOCALHOST);
+            assert_eq!(flow.worker.params.tx.as_slice(), [Ipv4Addr::LOCALHOST, wifi]);
+            mgr.stop_all().await;
+            tx.shutdown().await;
+        }
+
+        /// The Wi-Fi address of [`dual_homed`] transmitters, in TEST-NET-1:
+        /// a request sent there fails.
+        const WIFI: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 7);
+
+        /// A transmitter on Ethernet (here 127.0.0.1) and Wi-Fi, as lookups
+        /// see it once it has announced its addresses in another order:
+        /// channel 02 is found at its Wi-Fi address first, the others at its
+        /// wired one. Returns its wired flow-control address too.
+        async fn dual_homed(name: &str, base: u16) -> (Device, StaticDirectory, SocketAddrV4) {
+            let tx = Device::start(config(name, base), ovsc_clock::system_clock()).await.unwrap();
+            let directory = StaticDirectory::new();
+            for mut entry in tx.directory_entries() {
+                let wired = entry.addr;
+                entry.addrs = if entry.txt.id == 2 { vec![WIFI, wired] } else { vec![wired, WIFI] };
+                entry.addr = entry.addrs[0];
+                directory.insert(entry);
+            }
+            (tx, directory, SocketAddrV4::new(Ipv4Addr::LOCALHOST, base + 2))
+        }
+
+        /// Until rx 2 is routed or has failed.
+        fn rx2_settled(mgr: &RxManager) -> bool {
+            mgr.flows.iter().any(|f| f.routes.feeds(1)) || mgr.failures.contains_key(&1)
+        }
+
+        /// Rx 1 and 2 play channels 01 and 02 of `tx` from one flow,
+        /// requested at its wired address: the transmitter has one flow.
+        fn assert_one_flow(mgr: &RxManager, tx: &Device, wired: SocketAddrV4) {
+            assert_eq!(mgr.failures.get(&1).map(|f| f.status), None, "rx 2 failed");
+            let controls: Vec<SocketAddrV4> = mgr.flows.iter().map(|f| f.control).collect();
+            assert_eq!(controls, [wired]);
+            let flow = &mgr.flows[0];
+            assert_eq!(flow.tx_ids, [1, 2, 0, 0]);
+            assert!(flow.routes.feeds(0) && flow.routes.feeds(1), "{:?}", flow.routes.slots);
+            let theirs: Vec<Vec<u16>> = tx.tx_flows().into_iter().map(|f| f.channels).collect();
+            assert_eq!(theirs, [[1, 2, 0, 0]]);
+        }
+
+        /// A computer on Wi-Fi and Ethernet is one transmitter: a channel
+        /// found at its other address goes in a free slot of the flow we
+        /// have from it (DBCP 0x0102), not in a second flow, which would
+        /// spend one more of the few flows a transmitter has.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_channel_found_at_another_address_joins_the_transmitters_flow() {
+            let (tx, directory, wired) = dual_homed("dual-tx", 24540).await;
+            let iface = Interface::find("127.0.0.1").unwrap();
+            let mut mgr = manager(&config("dual-rx", 24550), iface, directory);
+            subscribe(&mgr, 0, "01", "dual-tx");
+            drive(&mut mgr, |m| m.flows.len() == 1 && m.flows[0].routes.feeds(0)).await;
+
+            subscribe(&mgr, 1, "02", "dual-tx");
+            drive(&mut mgr, rx2_settled).await;
+            assert_one_flow(&mgr, &tx, wired);
+            // Its slot 1 switched to channel 02: the flow was changed.
+            assert!(mgr.flows[0].switched_at[1].is_some());
+            mgr.stop_all().await;
+            tx.shutdown().await;
+        }
+
+        /// Channels of one transmitter found at different addresses, both
+        /// before it is asked for anything, are asked for in one new flow.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn channels_found_at_different_addresses_share_a_new_flow() {
+            let (tx, directory, wired) = dual_homed("dual-tx-b", 24580).await;
+            let iface = Interface::find("127.0.0.1").unwrap();
+            let mut mgr = manager(&config("dual-rx-b", 24590), iface, directory);
+            subscribe(&mgr, 0, "01", "dual-tx-b");
+            subscribe(&mgr, 1, "02", "dual-tx-b");
+            // Both lookups finish before the next pass.
+            mgr.reconcile().await;
+            for _ in 0..2 {
+                let lookup = mgr.jobs.join_next_with_id().await.unwrap();
+                mgr.finished(lookup);
+            }
+            drive(&mut mgr, rx2_settled).await;
+            assert_one_flow(&mgr, &tx, wired);
+            // Requested with both channels, and not changed since.
+            assert!(mgr.flows[0].switched_at.iter().all(Option::is_none));
+            mgr.stop_all().await;
+            tx.shutdown().await;
+        }
+
+        /// Requests go to a transmitter one at a time, whichever of its
+        /// addresses its channels were found at: a channel found at its
+        /// other address while a request is in flight waits for it, then
+        /// goes in the flow that request made.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_request_in_flight_holds_back_the_transmitters_other_address() {
+            let (tx, directory, wired) = dual_homed("dual-tx-c", 24520).await;
+            let iface = Interface::find("127.0.0.1").unwrap();
+            let mut mgr = manager(&config("dual-rx-c", 24524), iface, directory.clone());
+            subscribe(&mgr, 0, "01", "dual-tx-c");
+            mgr.reconcile().await;
+            let lookup = mgr.jobs.join_next_with_id().await.unwrap();
+            mgr.finished(lookup);
+            // Asks for a flow for 01, at the wired address.
+            mgr.reconcile().await;
+            assert_eq!(mgr.busy, HashSet::from([wired]));
+
+            // Meanwhile 02 is found at the Wi-Fi address first.
+            subscribe(&mgr, 1, "02", "dual-tx-c");
+            let k = key("02", "dual-tx-c");
+            mgr.looked_up(k.clone(), Ok(directory.get("02", "dual-tx-c").unwrap()));
+            mgr.reconcile().await;
+            assert_eq!(mgr.busy, HashSet::from([wired]));
+            assert!(mgr.resolved.contains_key(&k), "waits");
+
+            drive(&mut mgr, rx2_settled).await;
+            assert_one_flow(&mgr, &tx, wired);
+            mgr.stop_all().await;
+            tx.shutdown().await;
+        }
+
+        /// A slot's transmit channel is recognised at either address of
+        /// its transmitter: subscribed to under its label, found at the
+        /// other address first, it shares the slot, and a subscription
+        /// re-spelled to the label keeps its route.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_carried_channel_is_recognised_at_the_transmitters_other_address() {
+            let (tx, directory, wired) = dual_homed("dual-tx-d", 24544).await;
+            let first = directory.get("01", "dual-tx-d").unwrap();
+            let addrs = vec![WIFI, *wired.ip()];
+            directory.insert(ResolvedChannel { channel: "Vox".into(), addr: WIFI, addrs, ..first });
+            let iface = Interface::find("127.0.0.1").unwrap();
+            let mut mgr = manager(&config("dual-rx-d", 24554), iface, directory);
+            subscribe(&mgr, 0, "01", "dual-tx-d");
+            drive(&mut mgr, |m| m.flows.len() == 1 && m.flows[0].routes.feeds(0)).await;
+
+            subscribe(&mgr, 1, "Vox", "dual-tx-d");
+            mgr.reconcile().await;
+            assert_eq!(mgr.flows[0].routes.slots[0], [0, 1]);
+            subscribe(&mgr, 0, "Vox", "dual-tx-d");
+            mgr.reconcile().await;
+            assert_eq!(mgr.flows[0].routes.slots[0], [0, 1]);
+            // Nothing asked of the transmitter.
+            assert!(mgr.jobs.is_empty());
+            assert_eq!(mgr.flows[0].tx_ids, [1, 0, 0, 0]);
+            let theirs: Vec<Vec<u16>> = tx.tx_flows().into_iter().map(|f| f.channels).collect();
+            assert_eq!(theirs, [[1, 0, 0, 0]]);
+            mgr.stop_all().await;
+            tx.shutdown().await;
+        }
+
         /// A slot that took another channel holds back packets from before
         /// the switch only for a while: then the manager hands the receive
         /// thread a table without the switch, so that a media clock that
@@ -2807,6 +3135,7 @@ mod tests {
                 device: "far-tx".into(),
                 channel: "01".into(),
                 addr: Ipv4Addr::LOCALHOST,
+                addrs: vec![Ipv4Addr::LOCALHOST],
                 flow_control_port: 24799,
                 txt: txt(1, 1_000_000, 32, 4),
             });
@@ -2859,6 +3188,7 @@ mod tests {
                 device: "slow-tx".into(),
                 channel: "01".into(),
                 addr: Ipv4Addr::LOCALHOST,
+                addrs: vec![Ipv4Addr::LOCALHOST],
                 flow_control_port: 24799,
                 txt: txt(1, 50_000_000, 32, 4),
             });

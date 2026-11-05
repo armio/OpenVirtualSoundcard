@@ -987,6 +987,7 @@ mod tests {
             remote_settings_locked: false,
             remote_settings_lock_set: None,
             name_conflict: None,
+            announced: None,
         };
         // One fixed mapping from the monotonic clock, so that the transmit
         // thread and a test reading the time agree exactly (the system

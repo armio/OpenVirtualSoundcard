@@ -197,9 +197,16 @@ computer during a show.
   Dante Controller. OVSC only follows the clock; it never leads.
 * Give the Mac a fixed address or a DHCP reservation. An address change
   restarts the network engine (a few seconds of silence, see below).
-* A computer that transmits to OVSC (another Mac, Dante Virtual Soundcard)
-  must have only one interface on the Dante subnet: OVSC accepts a flow's
-  audio only from the address it requested the flow from.
+* A computer that transmits to OVSC (another Mac, Dante Virtual Soundcard,
+  Dante Via) may have two interfaces on the Dante subnet, Wi-Fi and
+  Ethernet say, and send a flow's audio from either: OVSC accepts it from
+  every address the computer announces (up to four), and from no other
+  device. It reads them when it requests the flow: audio from an address
+  announced later is dropped until OVSC requests the flow again, once the
+  flow has delivered nothing for 3 s. The computer's channels share flows
+  as any transmitter's do, whichever of its addresses OVSC finds first.
+  Still keep that computer's Wi-Fi off the Dante subnet for a show: audio
+  sent over Wi-Fi arrives late or not at all.
 * Run no other Dante software on the show Mac. OVSC moves its ports out of
   the way of Audinate's ConMon service, but Dante Virtual Soundcard and OVSC
   must not both carry the show.
@@ -303,7 +310,7 @@ any of them.
 | The transmit thread stalls (rare: the Mac is overloaded) | A gap on the returns about as long as the stall beyond the console's slack (about 0.5 ms at a 1 ms console latency) | Packets up to 40 ms overdue are sent at once, oldest first, for receivers with longer latencies; beyond 40 ms the flow resyncs and the skipped packets are counted. Late sends and skips are warnings in the app. |
 | The daemon crashes (a panic anywhere) | 5 to 10 s of silence plus the clock relock; the returns may take longer | It logs the panic, says goodbye to the driver and exits; launchd starts a new daemon. Core Audio sees no change. The returns come back once the console requests OVSC's flows again, on its own timing. |
 | The Core Audio driver faults (a caught panic) | Silence on every channel until Core Audio restarts | Run `sudo killall coreaudiod`; the host will likely need to reopen the device. |
-| Another device uses OVSC's name mid-show | Nothing at once; new subscriptions may reach the wrong device | OVSC keeps its name, through engine restarts too (an address change; a new latency restarts nothing that announces it); it logs an error and the app warns. Rename one device after the show. Only a restart of the daemon itself (a crash, a reboot) probes the name again and, while the other device still has it, takes `<name>-2`: clear any name warning before the show. |
+| Another device uses OVSC's name mid-show | Nothing at once; new subscriptions may reach the wrong device | OVSC keeps its name, through engine restarts (an address change; a new latency restarts nothing that announces it) and restarts of the daemon itself (a crash, a reboot): `state.toml` keeps the name with the Dante interface's MAC address, and a new daemon on the same Mac announces it again without asking the network. It logs an error and the app warns. Rename one device after the show. Only another Mac (a cloned disk) or another Dante interface, whose MAC address differs, asks the network again and, while the other device has the name, takes `<name>-2`: clear any name warning before the show. |
 | A controller changes a setting | See [Changes that interrupt audio](#changes-that-interrupt-audio) | With the show lock on, refused and listed in the app; without it, applied and listed. |
 | The audio engine starts or the gate opens or closes | A 5 ms fade, not a click | The driver ramps in and out at its gate. |
 
@@ -385,12 +392,13 @@ What the common warnings point at:
 * A flow plays at the larger of OVSC's latency and the transmitter's, as on
   Dante hardware.
 * Receive flows read the packet size from the packet, as Dante receivers do,
-  and accept packets only from the transmitter's address and the port its
-  audio comes from.
+  and accept packets only from the transmitter's addresses (a computer on
+  Wi-Fi and Ethernet has one on each) and the port its audio comes from.
 * Recovery from a pulled cable or a rebooted console no longer waits on
   other transmitters, and failures show as Dante statuses
   (`NO_CONNECTION`, `RX_FAIL`, `CHANNEL_FORMAT`, `NO_RX`, `CHANNEL_LATENCY`).
-* The device name is probed at start; a taken name gets `-2`.
+* The device name is probed before OVSC first announces it on a Mac; a taken
+  name gets `-2`. Once held, it is kept through engine and daemon restarts.
 * The show lock, and a list of controllers' changes in the app.
 * The daemon follows its network interface, restarts itself after any panic,
   keeps its state file safe across power cuts, and keeps the Mac awake from
@@ -409,6 +417,9 @@ These rest on code reading, Linux tests and simulation, not on hardware:
   controller writes while locked, and a flow re-requested with another
   packet size.
 * That macOS keeps the DSCP marking on the wire (check with Wireshark).
+* A transmitting computer on Wi-Fi and Ethernet on the Dante subnet: tested
+  with simulated mDNS announcements and packets, not with Dante Virtual
+  Soundcard or Dante Via.
 * The clock figures (leader change, holdover accuracy, relock times) are
   from simulation and a replay of the real servo, not from a Mac on a Dante
   network.

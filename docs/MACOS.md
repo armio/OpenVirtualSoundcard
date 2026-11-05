@@ -122,7 +122,7 @@ notarizes with `NOTARY_PROFILE`.
 | `/Library/Application Support/OpenVirtualSoundcard/bin/ovsc` | The daemon. |
 | `/usr/local/bin/ovsc` | A link to the daemon, unless a file that is not a link is already there. |
 | `/Library/Application Support/OpenVirtualSoundcard/ovsc.toml` | The configuration. |
-| `/Library/Application Support/OpenVirtualSoundcard/state.toml` | Renames, subscriptions and the latency set from a controller or the app (`state_file` in the default configuration). |
+| `/Library/Application Support/OpenVirtualSoundcard/state.toml` | Renames, subscriptions and the latency set from a controller or the app, and the name the device holds on the network (see [The device name](#the-device-name); `state_file` in the default configuration). |
 | `/Applications/OpenVirtualSoundcard.app` | The [OpenVirtualSoundcard app](#the-openvirtualsoundcard-app), if it was built. |
 | `/var/run/ovsc/control.sock` | The daemon's [control socket](#the-control-socket), while it runs. |
 | `/Library/Application Support/OpenVirtualSoundcard/uninstall.sh` | The uninstaller. |
@@ -188,25 +188,31 @@ needs a name of its own.
   device takes the name <name>-2`. The device that had the name keeps it,
   and neither changes name at its next start. Receivers' subscriptions to
   `<name>` reach the device that kept it: re-patch the ones meant for this
-  one before the show. When the daemon restarts its network engine (when
-  the network interface changes), the device keeps the name it announced
-  without asking again; a new latency restarts nothing that announces it.
+  one before the show.
+* Once the device has its name, it keeps it without asking again when the
+  daemon restarts its network engine (when the network interface changes;
+  a new latency restarts nothing that announces it), and when a new daemon
+  starts on the same Mac (launchd starting one after a crash, a reboot).
+  `state.toml` saves the name the device holds under `[claim]`, with the
+  MAC address of the Dante interface; a new daemon announces the name at
+  once if it is still the device's name and the interface's MAC address is
+  the same.
 * If another device starts announcing the name while this one runs (one
   that does not probe, or two devices started at the same instant), this
   device keeps its name, since renaming it mid-show would break every
-  subscription to it, also through the daemon's restarts of its network
-  engine. It logs `the device at <address> also announces
+  subscription to it, also through restarts of the network engine and of
+  the daemon. It logs `the device at <address> also announces
   <name>...: Rename one of them.`, announces its records again, and keeps
   reporting the conflict until the other device withdraws the name or its
-  records expire. A new daemon process (launchd starting one after a
-  crash, a reboot) asks the network again, and takes `<name>-2` if the other
-  device still announces the name. Meanwhile a subscription on this device to
+  records expire. Meanwhile a subscription on this device to
   `<channel>@<name>` that is made (or that reconnects) goes to the other
   device if that one has the channel, rather than looping back to this one,
   and logs a warning. Subscriptions already receiving stay where they are.
 * A Mac cloned from another one's disk has the same `ovsc.toml` and
-  `state.toml`, so the same device name. Rename one of the two (Dante
-  Controller or the app) before putting both on one network.
+  `state.toml`, so the same device name. Its Dante interface has another
+  MAC address, so the clone asks the network for the name as at a first
+  start, and takes `<name>-2` while the original Mac has it. Rename one of
+  the two (Dante Controller or the app) before putting both on one network.
 
 ### Ports and other Dante software
 

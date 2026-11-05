@@ -78,18 +78,22 @@ The first public version, not released yet.
 - Receive flows play at the larger of the device's latency and the latency
   the transmitter asks for, as Dante receivers do.
 - Received packets give their frame count by their length (up to 256), and
-  are accepted only from the transmitter's address and the port its audio
-  comes from.
+  are accepted only from the transmitter's addresses and the port its audio
+  comes from. A computer on Wi-Fi and Ethernet in the Dante subnet may send
+  from either of its addresses.
 - Receive recovery never waits on the network: a transmitter that does not
   answer no longer delays the others, and failures show as Dante statuses
   (`NO_CONNECTION`, `RX_FAIL`, `CHANNEL_FORMAT`, `NO_RX`, `CHANNEL_LATENCY`).
 - Latencies below 1 ms are refused from the app and controllers, and raised
   to the minimum, with a warning, in the configuration: packets leave 0.5 ms
   after their time.
-- A device restarted in-process (an address change) keeps the name it
-  announced instead of probing it again, so a name conflict can no longer
-  rename it mid-show. The daemon offers Core Audio the saved latency and
-  names at start, so its restart does not reconfigure the device twice.
+- A device restarted in-process (an address change), or by a new daemon on
+  the same Mac (after a crash, at a reboot), keeps the name it announced
+  instead of probing it again, so a name conflict can no longer rename it
+  mid-show. The state file keeps the name with the interface's MAC address;
+  a copy on another Mac (a cloned disk) probes as before. The daemon offers
+  Core Audio the saved latency and names at start, so its restart does not
+  reconfigure the device twice.
 - While the show lock is on, controllers see the sample rate and encoding as
   fixed.
 - Transmit flows accept 2 to 32 frames per packet and 1 to 8 channels, as
@@ -123,5 +127,14 @@ The first public version, not released yet.
   came back.
 - The app's Apply stayed disabled while the engine waited for the network
   with an empty device name.
+- The mDNS cache kept only the last address of a host that announces one per
+  interface, such as a computer on Wi-Fi and Ethernet: a record with the
+  cache-flush bit removed the others at once, even those just received. It
+  now follows RFC 6762 §10.2.
+- A computer on Wi-Fi and Ethernet was taken for two transmitters when
+  lookups gave its addresses in another order: a channel found at its other
+  address got a new flow instead of a free slot in the existing one,
+  spending one more of the computer's flows. Its channels now share flows,
+  and requests to it go one at a time.
 
 [Unreleased]: https://github.com/armio/OpenVirtualSoundcard/commits/main

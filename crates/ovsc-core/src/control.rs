@@ -869,6 +869,7 @@ mod tests {
             remote_settings_locked: locked,
             remote_settings_lock_set: None,
             name_conflict: None,
+            announced: None,
         };
         let clock = ovsc_clock::system_clock();
         Shared::new(info, state, clock, 1024, None, true, RemoteChanges::default()).unwrap()

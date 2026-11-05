@@ -278,6 +278,7 @@ async fn a_refused_channel_update_gets_a_flow_of_its_own() {
             device: "fake-tx".into(),
             channel: format!("CH{id}"),
             addr: Ipv4Addr::LOCALHOST,
+            addrs: vec![Ipv4Addr::LOCALHOST],
             flow_control_port: FC_PORT,
             txt: ChannelTxt {
                 id,

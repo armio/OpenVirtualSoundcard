@@ -32,6 +32,12 @@ pub struct State {
     /// Another device using the device name, as mDNS shows it. Status only:
     /// setting it doesn't go through [`Shared::modify`].
     pub name_conflict: Option<crate::mdns::NameConflict>,
+    /// The device name the device announces on the network, once it has
+    /// claimed it, or from the start if it holds it already (see
+    /// [`crate::Device::announced_name`]). Saved as the device's claim of
+    /// the name ([`crate::SavedClaim`]), so a change goes through
+    /// [`Shared::modify`], which wakes the task that saves the state.
+    pub announced: Option<String>,
     /// Current transmit channel names (user-assigned or factory).
     pub tx_names: Vec<String>,
     /// Current receive channel names.
