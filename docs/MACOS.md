@@ -128,11 +128,13 @@ notarizes with `NOTARY_PROFILE`.
 | `/Library/Application Support/OpenVirtualSoundcard/uninstall.sh` | The uninstaller. |
 | `/Library/LaunchDaemons/org.openvirtualsoundcard.daemon.plist` | The launchd job `org.openvirtualsoundcard.daemon`. |
 | `/Library/Logs/OpenVirtualSoundcard/ovsc.log` | The daemon's log. |
-| `/etc/newsyslog.d/org.openvirtualsoundcard.conf` | Rotates the log at 1 MiB, keeping 5 old files. The running daemon keeps writing to the rotated `ovsc.log.0` until it restarts. |
+| `/etc/newsyslog.d/org.openvirtualsoundcard.conf` | Rotates the log at 1 MiB, keeping 5 old files. The daemon notices within 5 s and writes to the new `ovsc.log`. |
 
-The launchd job runs `ovsc run --config "/Library/Application Support/OpenVirtualSoundcard/ovsc.toml"`
-as root, at boot and again whenever it exits (`RunAtLoad`, `KeepAlive`,
-`ThrottleInterval` 5 s). It holds the Mach service `org.openvirtualsoundcard.audio`
+The launchd job runs `ovsc run --config "/Library/Application Support/OpenVirtualSoundcard/ovsc.toml"
+--log-file /Library/Logs/OpenVirtualSoundcard/ovsc.log` as root, at boot and
+again whenever it exits (`RunAtLoad`, `KeepAlive`, `ThrottleInterval` 5 s):
+it exits on purpose, with an error, when a part of it failed ([The daemon
+restarted by itself](#the-daemon-restarted-by-itself)). It holds the Mach service `org.openvirtualsoundcard.audio`
 (`MachServices`), which only launchd can hand out, so the driver can connect
 only to a daemon that launchd started. `ProcessType` `Interactive` keeps
 launchd from throttling it and coalescing its timers.
@@ -236,7 +238,7 @@ The `[coreaudio]` section tunes the device:
 | `output_latency_ms` | unset | Output latency reported to applications; unset means `latency_ms`. |
 | `input_latency_mode` | `"safety"` | `"safety"` or `"latency"`: see [Latency and safety offsets](#latency-and-safety-offsets). |
 | `clock_algorithm` | `"raw"` | Core Audio's time stamp smoothing: `"raw"` (none) or `"iir"`. |
-| `prevent_idle_sleep` | `true` | Keep the Mac from idle-sleeping while the daemon runs, from its start and across engine restarts. A restart of the daemon itself still releases it for a moment: on a show machine, also turn system sleep off (see [Live use: sleep](#the-mac-must-not-sleep)). |
+| `prevent_idle_sleep` | `true` | Keep the Mac from idle-sleeping while the daemon runs, from its start and across engine restarts. A restart of the daemon itself still releases it for a moment: on a show machine, also turn system sleep off (see [The Mac must not sleep](#the-mac-must-not-sleep)). |
 | `status_log_interval_s` | `30` | Seconds between status lines in the log; 0 disables them. |
 | `service` | `"org.openvirtualsoundcard.audio"` | The Mach service the daemon serves. Leave it as is: the driver always connects to `org.openvirtualsoundcard.audio`, which is compiled in and listed in its Info.plist, and the launchd job holds that name. |
 | `debug_zts_jitter_ns` | `0` | Jitters the time stamps on purpose, for tests only. |
@@ -458,11 +460,13 @@ sudo tail -400 /Library/Logs/OpenVirtualSoundcard/ovsc.log
 sudo launchctl print system/org.openvirtualsoundcard.daemon
 ```
 
-launchd opens this file when it starts the daemon, and the daemon never
-reopens it. After newsyslog rotates the log at 1 MiB, the running daemon
-keeps writing to `ovsc.log.0` until it restarts. If `ovsc.log` is
-empty or stale, read `ovsc.log.0`, or restart the daemon with
-`sudo launchctl kickstart -k system/org.openvirtualsoundcard.daemon`.
+The daemon opens this file itself (`--log-file`) and looks every 5 s whether
+it is still the file it writes to. When newsyslog has rotated it (at 1 MiB,
+keeping `ovsc.log.0` to `ovsc.log.4`), the daemon logs `log file ... reopened
+after a rotation` at the top of the new `ovsc.log`; the last few seconds
+before that are at the end of `ovsc.log.0`. An older daemon (before
+`--log-file`) went on writing to `ovsc.log.0`, which then grew without
+bound: if `ovsc.log` stays empty, reinstall, or restart the daemon.
 
 Lines worth knowing:
 
@@ -470,9 +474,16 @@ Lines worth knowing:
   at start;
 * `hal: plug-in attached: pid <helper>, ...` when a driver instance connects;
 * `clock locked to ...` and `clock lost`;
+* `the network interface <name> is gone`, `... lost its IPv4 address`,
+  `... has its address <ip> back`, and `<why>: restarting the network
+  engine` ([The network changed](#the-network-changed));
+* `<what> panicked: ...` and `...: restarting the daemon`
+  ([The daemon restarted by itself](#the-daemon-restarted-by-itself));
+* `the saved state ... could not be read` ([The saved subscriptions are
+  gone](#the-saved-subscriptions-are-gone));
 * every `status_log_interval_s`: `clock <state>; receiving <n>/<m>
   subscribed channels; <k> transmit flows; packets: tx <n> (<u> underruns),
-  rx <n> (<l> late); hal: peers=... io=... gate=... regime=... absorbs=...
+  rx <n> (<l> late)[; <interface problem>]; hal: peers=... io=... gate=... regime=... absorbs=...
   seed=... late_out=... early_in=... silenced=... in_missing=...
   tx_underruns=... min_out_margin=... min_in_margin=...`, the margins being
   the smallest seen since IO started, in frames. A late packet arrived after
@@ -580,6 +591,72 @@ with the Dante interface in place of `en7`.
   Thunderbolt Ethernet adapter (an Intel chip, which timestamps PTP in
   hardware). Use another Ethernet adapter for the Dante network: a plain
   USB-C adapter worked.
+
+### The network changed
+
+The daemon looks at its network interface every second. It restarts the
+whole network engine (clock, device, advertisement; the driver stays
+attached and reads silence meanwhile) when:
+
+* the interface came back after it was gone: a USB-C or Thunderbolt
+  Ethernet adapter or a dock that re-enumerated after a knock or a power
+  blip. Its multicast memberships (PTP, mDNS) went with it, so without a
+  restart the clock would be lost some 35 s later, for good;
+* the interface was attached again under a new index;
+* the interface no longer has the engine's address: a DHCP lease replacing
+  a self-assigned 169.254 address, or a router handing out a new lease;
+* the interface got its address back after a cable pull, but the clock has
+  not locked 15 s later.
+
+A restart needs two looks in a row (2 s). While the interface is gone or
+has no address the engine waits for it; after a cable pull that brings the
+same address back, nothing restarts and the clock locks again by itself.
+Audio returns once the clock has locked again, typically a few seconds
+after the restart. The log says what happened (`the network interface en7
+is gone`, `... is back: restarting the network engine`), and the status
+line ends with the problem while it lasts.
+
+Name the Dante interface in `[device] interface` for a show: with the
+default route (an empty name), a restart picks whatever carries the default
+route at that moment, which may be Wi-Fi.
+
+### The daemon restarted by itself
+
+A part of the daemon failed: a panic in any thread (logged at error level
+as `... panicked: ...`), a device task or the transmit thread that stopped,
+or the driver heartbeat task. Rather than run on half dead (silent with a
+green status), the daemon says goodbye to the driver and exits with an
+error; launchd starts a new one within `ThrottleInterval` (5 s), and audio
+returns once its clock locks. `sudo launchctl print
+system/org.openvirtualsoundcard.daemon` shows the last exit status. Please
+report the panic message with the log.
+
+### The saved subscriptions are gone
+
+The renames, subscriptions and latency set from Dante Controller or the app
+are saved in `state.toml` ([What gets installed](#what-gets-installed)). Each
+save is flushed to the disk before it replaces the file, and the previous
+version is kept as `state.toml.bak`. If the file cannot be read at start
+(empty or damaged, after a power cut during a save on an older version, or
+a disk fault), the daemon logs `the saved state ... could not be read` as
+an error, moves the file aside as `state.toml.corrupt-<time>`, starts from
+`state.toml.bak`, and the app shows a warning. Check the subscriptions in
+Dante Controller then. The damaged file is never overwritten, so it can
+still be repaired by hand: stop the daemon, copy the repaired file over
+`state.toml`, and start it again.
+
+### The Mac must not sleep
+
+With `prevent_idle_sleep = true` (the default) the daemon keeps the Mac
+from idle-sleeping from the moment it starts, across engine restarts. A
+restart of the daemon itself (a settings change in the app, a crash)
+releases it for a few seconds, and nothing keeps a display or a lid from
+sleeping. On a show machine, also turn sleep off:
+
+```sh
+sudo pmset -a sleep 0 disablesleep 1
+pmset -g assertions | grep -i openvirtualsoundcard
+```
 
 ### Firewall
 
