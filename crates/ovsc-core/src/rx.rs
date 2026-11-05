@@ -757,8 +757,8 @@ impl RxManager {
     /// packet and latency for it, and a transmitter cannot change those of
     /// a flow: it is stopped and requested again. Its channels are not
     /// looked up again (the flow knows what they resolved to), so the new
-    /// request goes out in this same pass, after the stop of the old flow
-    /// (see [`request_job`]).
+    /// request goes out in this same pass, where the old flow is stopped
+    /// and after its stop ([`RxManager::control_for`], [`request_job`]).
     fn stop_flows(&mut self, now: Instant) {
         let now_ns = local_now_ns();
         let own = self.shared.info.latency.samples();
@@ -944,24 +944,33 @@ impl RxManager {
 
     /// Where to ask the transmitter of `r` for flows: where a request to it
     /// is in flight, else where a flow we have from it was requested, else
-    /// where `planned` requests (this pass's) to it go, else the address
-    /// `r` was found at. A transmitter with several addresses is thus asked
-    /// at one of them, whichever a lookup gives first, so that its channels
-    /// go in free slots of the flows we have from it rather than in new
-    /// ones, and its requests go one at a time.
+    /// where flows of it are to be stopped (at the address `r` was found
+    /// at first), else where `planned` requests (this pass's) to it go,
+    /// else the address `r` was found at. A transmitter with several
+    /// addresses is thus asked at one of them, whichever a lookup gives
+    /// first, so that its channels go in free slots of the flows we have
+    /// from it rather than in new ones, and its requests go one at a time.
+    /// Asked where its flows are to be stopped, it gets the stops first, in
+    /// the same job ([`request_job`]): a flow stopped for a new latency is
+    /// gone before the one replacing it is asked for.
     fn control_for(
         &self,
         r: &ResolvedChannel,
         planned: impl IntoIterator<Item = SocketAddrV4>,
     ) -> SocketAddrV4 {
+        let found = SocketAddrV4::new(r.addr, r.flow_control_port);
         let flows = self.flows.iter().map(|f| f.control);
+        let stopping = std::iter::once(found)
+            .filter(|c| self.stops.contains_key(c))
+            .chain(self.stops.keys().copied());
         self.busy
             .iter()
             .copied()
             .chain(flows)
+            .chain(stopping)
             .chain(planned)
             .find(|&c| is_control_of(c, r))
-            .unwrap_or(SocketAddrV4::new(r.addr, r.flow_control_port))
+            .unwrap_or(found)
     }
 
     /// Whether another device may use our name: a static directory may list
@@ -3034,6 +3043,48 @@ mod tests {
             assert_eq!(mgr.flows[0].tx_ids, [1, 0, 0, 0]);
             let theirs: Vec<Vec<u16>> = tx.tx_flows().into_iter().map(|f| f.channels).collect();
             assert_eq!(theirs, [[1, 0, 0, 0]]);
+            mgr.stop_all().await;
+            tx.shutdown().await;
+        }
+
+        /// A transmitter whose flow is stopped for a new latency is asked
+        /// for the new flow where the old one is stopped, in the same job,
+        /// stop first, even when another of its channels was just found at
+        /// its other address. Asked there, the new request could reach the
+        /// transmitter before the stop, and one at its flow limit would
+        /// refuse it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_new_latency_asks_where_the_old_flow_is_stopped() {
+            let (tx, directory, wired) = dual_homed("relat-dual-tx", 25210).await;
+            let iface = Interface::find("127.0.0.1").unwrap();
+            let mut mgr = manager(&config("relat-dual-rx", 25220), iface, directory.clone());
+            // Channel 03, found at the wired address.
+            subscribe(&mgr, 0, "03", "relat-dual-tx");
+            drive(&mut mgr, |m| m.flows.len() == 1 && m.flows[0].routes.feeds(0)).await;
+            assert_eq!(mgr.flows[0].control, wired);
+
+            // 02 is found at the Wi-Fi address first, and the latency
+            // changes, before the next pass.
+            subscribe(&mgr, 1, "02", "relat-dual-tx");
+            let k = key("02", "relat-dual-tx");
+            mgr.looked_up(k, Ok(directory.get("02", "relat-dual-tx").unwrap()));
+            mgr.shared.request_latency(5_000_000).unwrap();
+            assert!(mgr.shared.restart_rx());
+            mgr.reconcile().await;
+            assert_eq!(mgr.busy, HashSet::from([wired]), "one job, where the flow is stopped");
+            assert!(mgr.stops.is_empty(), "the stop is in the job");
+
+            drive(&mut mgr, |m| rx2_settled(m) && m.flows.iter().any(|f| f.routes.feeds(0))).await;
+            assert_eq!(mgr.failures.get(&1).map(|f| f.status), None, "rx 2 failed");
+            let controls: Vec<SocketAddrV4> = mgr.flows.iter().map(|f| f.control).collect();
+            assert_eq!(controls, [wired]);
+            let flow = &mgr.flows[0];
+            assert_eq!(flow.own, 240);
+            assert_eq!(flow.tx_ids, [2, 3, 0, 0]);
+            // The old flow was stopped before the new one was asked for.
+            let theirs: Vec<Vec<u16>> = tx.tx_flows().into_iter().map(|f| f.channels).collect();
+            assert_eq!(theirs, [[2, 3, 0, 0]]);
+            assert_eq!(tx.stats().tx_expired_flows, 0);
             mgr.stop_all().await;
             tx.shutdown().await;
         }
