@@ -579,13 +579,14 @@ async fn run(inner: Arc<Inner>) {
         let received = tokio::select! {
             r = inner.socket.recv_from(&mut buf) => r,
             _ = sweep.tick() => {
-                let names = sweep_conflicts(&inner);
-                if !names.is_empty() {
-                    let questions = names
-                        .into_iter()
-                        .map(|name| Question { name, qtype: rtype::ANY, unicast_response: false })
-                        .collect();
-                    send(&inner.socket, &Message::query(questions), inner.dest).await;
+                let questions = sweep_conflicts(&inner)
+                    .into_iter()
+                    .map(|name| Question { name, qtype: rtype::ANY, unicast_response: false })
+                    .collect();
+                // A device using our name shadows a few names per transmit
+                // channel: hundreds of questions, more than one packet holds.
+                for query in split_query(questions) {
+                    send(&inner.socket, &query, inner.dest).await;
                 }
                 continue;
             }
@@ -918,6 +919,29 @@ fn split_response(records: Vec<Record>, template: Message) -> Vec<Message> {
     out
 }
 
+/// Packs questions into as few queries as fit in [`MAX_PACKET`] bytes. A
+/// larger query would be fragmented, and a lost fragment loses all of it.
+fn split_query(questions: Vec<Question>) -> Vec<Message> {
+    let base = Message::query(Vec::new()).encode().len();
+    let mut out = Vec::new();
+    let mut current = Vec::new();
+    let mut size = base;
+    for q in questions {
+        // Without name compression: never less than in the packet.
+        let q_size = Message::query(vec![q.clone()]).encode().len() - base;
+        if size + q_size > MAX_PACKET && !current.is_empty() {
+            out.push(Message::query(std::mem::take(&mut current)));
+            size = base;
+        }
+        size += q_size;
+        current.push(q);
+    }
+    if !current.is_empty() {
+        out.push(Message::query(current));
+    }
+    out
+}
+
 /// What a device advertises.
 pub struct Advertisement<'a> {
     pub name: &'a str,
@@ -1123,6 +1147,26 @@ mod tests {
         assert!(msgs.len() > 1);
         assert!(msgs.iter().all(|m| m.encode().len() <= MAX_PACKET));
         assert_eq!(msgs.iter().map(|m| m.answers.len()).sum::<usize>(), 200);
+    }
+
+    /// The names of a 64-channel device using ours, asked about again
+    /// before its conflict expires, take several queries.
+    #[test]
+    fn large_queries_are_split() {
+        let chan = discovery::service_name(discovery::CHAN_SERVICE);
+        let questions: Vec<Question> = (1..=128)
+            .map(|i| Question {
+                name: Name::instance(&format!("Channel {i:03}@studio"), &chan),
+                qtype: rtype::ANY,
+                unicast_response: false,
+            })
+            .collect();
+        let msgs = split_query(questions.clone());
+        assert!(msgs.len() > 1);
+        assert!(msgs.iter().all(|m| !m.is_response() && m.encode().len() <= MAX_PACKET));
+        let sent: Vec<Question> = msgs.into_iter().flat_map(|m| m.questions).collect();
+        assert_eq!(sent, questions);
+        assert!(split_query(Vec::new()).is_empty());
     }
 
     #[test]
