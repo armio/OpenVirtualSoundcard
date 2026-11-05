@@ -193,6 +193,7 @@ already in use`. Add the section and restart the daemon.
 | `[device] bits_per_sample` | 16, 24 or 32, for the transmitted audio. |
 | `[device] latency_ms` | The receive latency, 0.25 to 40 ms. |
 | `[clock] source` | `"ptp"` follows the network's PTP master; `"free"` runs on this Mac's own clock, for a network without a master. `"system"` is refused. |
+| `[device] lock_remote_settings` | `false` (default) or `true`: the [show lock](#locking-the-settings-for-a-show). The app's choice replaces it. |
 
 A new rate, channel count or latency reaches Core Audio as a device
 configuration change: applications that use the device see it reconfigure.
@@ -206,8 +207,44 @@ In Device View, under Device Config, Dante Controller sets the latency (see
 below), the sample rate and the encoding (the bit depth). A new sample rate
 or encoding is written into `ovsc.toml`, as from the [OpenVirtualSoundcard
 app](#the-openvirtualsoundcard-app), and the daemon restarts with it: audio stops for
-10 to 20 seconds. Remember that devices only exchange audio at the same
-sample rate.
+10 to 20 seconds in both directions, the feeds other devices receive from
+OpenVirtualSoundcard included, and Dante Controller gives no warning first.
+Remember that devices only exchange audio at the same sample rate.
+
+Dante Controller also renames the device and its channels. Receivers
+subscribe by `channel@device`, so a new device name leaves every
+subscription to OpenVirtualSoundcard's outputs unresolved (the console's
+returns go silent) until someone patches them again. A transmit channel
+keeps answering to its factory name (`01`, `02`, ...), so only subscriptions
+made to a previous custom name break.
+
+Any of these changes, made by mistake mid-show from any computer running
+Dante Controller, interrupts the show; [lock the
+settings](#locking-the-settings-for-a-show) to refuse them.
+
+#### Locking the settings for a show
+
+With the show lock on, the daemon refuses controllers' changes of the
+latency, the sample rate, the encoding, the device name and the channel
+names. Dante Controller gets an error for a latency write or a rename (the
+error result OpenVirtualSoundcard also gives for a value out of range), and
+the device reports the sample rate and encoding as not writable. The log says
+`refusing ... from the controller at ...: remote settings are locked`.
+Subscriptions stay open, so the console can still patch to and from
+OpenVirtualSoundcard, and the app's own changes still apply. A write that
+changes nothing (the latency it already has, say) is not refused.
+
+Turn it on in the app (Settings, **Show lock**), or from a script with
+`{"op":"apply","change":{"lock_remote_settings":true}}`. The choice is saved
+in the device's state file and survives restarts, like a rename; it replaces
+`[device] lock_remote_settings` (default `false`), which sets it until the
+app has.
+
+Whether locked or not, the app's Status lists the last few changes
+controllers made, or tried to make while locked, with the controller's
+address and how long ago: the explanation for a dropout that a colleague's
+Dante Controller caused. The list survives the network engine restarting,
+but not the daemon.
 
 #### Setting the latency from Dante Controller or the app
 
@@ -220,10 +257,27 @@ against that setting. Like a rename, the new latency is saved in the device's st
 (then restarting the daemon) goes back to `latency_ms`.
 
 To apply it, the daemon restarts its network engine while the clock keeps
-running and the driver stays attached: subscriptions drop for about a second
-and come back, and Core Audio sees a configuration change with the new
-latency and safety offsets. The log says `restarting the network engine for a
-receive latency of ... ms`.
+running and the driver stays attached. Although only the receive side
+changes, the restart stops audio in both directions:
+
+1. Each receive flow is stopped, then the device withdraws all its mDNS
+   records (goodbyes for the device and every transmit channel).
+2. Every transmit flow closes, so the feeds other devices receive from
+   OpenVirtualSoundcard (the processed returns to a console, say) stop.
+3. The engine starts again with the new latency, announces itself, and
+   requests its receive flows again: its inputs come back after about a
+   second.
+4. Each device that received from it must notice and request its flow
+   again. When that happens depends on that device, not on
+   OpenVirtualSoundcard; expect several seconds, and test it with your
+   console before relying on it.
+
+Core Audio also sees a configuration change with the new latency and safety
+offsets, and some applications restart their audio engine on it. The log
+says `restarting the network engine for a receive latency of ... ms`, and
+warns when transmit flows were open. Change the latency before the show, or
+[lock the settings](#locking-the-settings-for-a-show) so that nobody does it
+from Dante Controller during one.
 
 The `[coreaudio]` section tunes the device:
 
@@ -254,20 +308,30 @@ without it.
   **Driver** (whether Core Audio has loaded the OpenVirtualSoundcard driver) and
   **Audio** (whether an application is playing or recording through it).
 * **Status** lists the device (interface, address, sample rate, bit depth,
-  latency), the clock (its leader, offset, network delay and rate), the
-  receive channels with what each one is subscribed to, the transmit flows
-  and the packet counters. Warnings from the daemon, such as a clock that
-  does not lock, come first.
+  latency, whether settings from the network are locked), the clock (its
+  leader, offset, network delay and rate), the receive channels with what
+  each one is subscribed to, the transmit flows and the packet counters.
+  Warnings from the daemon come first: a clock that does not lock, and
+  the changes controllers made or tried to make, newest first. The header
+  says `settings locked` while the show lock is on.
 * **Settings** changes the device name, the network interface, the sample
-  rate, the bit depth, the receive and transmit channel counts and the
-  latency. **Apply** sends only what changed. A new name applies at once,
-  and a new latency restarts the network engine (audio stops for a second
-  or two, see
-  [above](#setting-the-latency-from-dante-controller-or-the-app)). A new
-  interface, rate, bit depth or channel count is written into
-  `ovsc.toml`, keeping its comments, and restarts the whole daemon:
-  the app asks first, since audio then stops for 10 to 20 seconds while the
-  clock locks again.
+  rate, the bit depth, the receive and transmit channel counts, the
+  latency and the [show lock](#locking-the-settings-for-a-show). **Apply**
+  sends only what changed, and asks first for anything that interrupts
+  audio or other devices' subscriptions, saying what it does:
+  * A new latency restarts the network engine: audio stops for a second or
+    two in both directions, and devices receiving from OpenVirtualSoundcard,
+    such as a console taking its returns, must request their flows again
+    (see [above](#setting-the-latency-from-dante-controller-or-the-app)).
+  * A new interface, rate, bit depth or channel count is written into
+    `ovsc.toml`, keeping its comments, and restarts the whole daemon:
+    audio stops for 10 to 20 seconds in both directions while the clock
+    locks again.
+  * A new name applies at once, but subscriptions other devices made to
+    OpenVirtualSoundcard's outputs name the old one: they stop resolving
+    until patched again in Dante Controller. The question lists the devices
+    receiving from it now.
+  * The show lock applies at once and interrupts nothing.
 
 Build it with `packaging/macos/build-app.sh`, which needs nothing beyond
 Rust and the command-line tools. It is signed ad hoc; built on the Mac that
@@ -293,7 +357,7 @@ echo '{"op":"apply","change":{"latency_ms":2}}' | nc -U /var/run/ovsc/control.so
 | Request | Answer |
 |---|---|
 | `{"op":"status"}` | `"result":"status"`: the device, the clock, the driver and warnings. |
-| `{"op":"settings"}` | `"result":"settings"`: `name`, `interface`, `sample_rate`, `bits_per_sample`, `rx_channels`, `tx_channels`, `latency_ms`. |
+| `{"op":"settings"}` | `"result":"settings"`: `name`, `interface`, `sample_rate`, `bits_per_sample`, `rx_channels`, `tx_channels`, `latency_ms`, `lock_remote_settings`. |
 | `{"op":"interfaces"}` | `"result":"interfaces"`: the interfaces that are up and have an IPv4 address. |
 | `{"op":"apply","change":{...}}` | `"result":"applied"` with `"restart"`: `"none"`, `"device"` (the network engine restarts) or `"daemon"` (the daemon exits for launchd to start it again); or `"result":"error"` with a `message`, and nothing changed. `change` holds any of the settings' fields. |
 
