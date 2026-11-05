@@ -241,6 +241,7 @@ async fn a_silent_transmitter_does_not_hold_up_others() {
         device: "silent-tx".into(),
         channel: "01".into(),
         addr: Ipv4Addr::LOCALHOST,
+        addrs: vec![Ipv4Addr::LOCALHOST],
         flow_control_port: silent.local_addr().unwrap().port(),
         txt: txt(1),
     });
@@ -317,6 +318,7 @@ async fn a_dead_flow_is_stopped_before_it_is_requested_again() {
         device: "mute-tx".into(),
         channel: "01".into(),
         addr: Ipv4Addr::LOCALHOST,
+        addrs: vec![Ipv4Addr::LOCALHOST],
         flow_control_port: port,
         txt: txt(1),
     });
@@ -386,6 +388,7 @@ async fn dead_flows_to_one_transmitter_are_stopped_together() {
             device: "reboot-tx".into(),
             channel: format!("{id:02}"),
             addr: Ipv4Addr::LOCALHOST,
+            addrs: vec![Ipv4Addr::LOCALHOST],
             flow_control_port: port,
             txt: ChannelTxt { nchan: 1, ..txt(id) },
         });
