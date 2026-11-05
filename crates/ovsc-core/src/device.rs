@@ -35,7 +35,8 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct Device {
     shared: Arc<Shared>,
     mdns: Option<Mdns>,
-    tasks: Vec<JoinHandle<()>>,
+    /// The device's tasks, each with what it does, for [`Device::stopped_part`].
+    tasks: Vec<(&'static str, JoinHandle<()>)>,
     rx_shutdown: Option<oneshot::Sender<oneshot::Sender<()>>>,
     /// Closes once the receive manager and all its threads have exited (see
     /// [`RxManager::new`]).
@@ -44,6 +45,8 @@ pub struct Device {
     tx_thread: Option<std::thread::JoinHandle<()>>,
     /// Where the device saves its state; saved once more on shutdown.
     state_file: Option<std::path::PathBuf>,
+    /// Why the saved state could not be used, if it could not.
+    state_problem: Option<String>,
 }
 
 /// Status of a receive channel.
@@ -126,7 +129,9 @@ impl Device {
         options: StartOptions,
     ) -> Result<Self> {
         config.validate()?;
-        let saved = config.state_file.as_deref().and_then(SavedState::load).unwrap_or_default();
+        let recovered = config.state_file.as_deref().map(SavedState::recover).unwrap_or_default();
+        let saved = recovered.state.clone();
+        let on_disk = recovered.intact.then_some(recovered.state);
         let config = with_saved_latency(config, &saved);
         let iface = Interface::find(&config.interface)?;
         let info = DeviceInfo::new(&config, iface)?;
@@ -178,30 +183,35 @@ impl Device {
         };
 
         let mut tasks = Vec::new();
-        tasks.push(tokio::spawn(control::run_arc(shared.clone(), arc_socket)));
+        tasks.push(("ARC server", tokio::spawn(control::run_arc(shared.clone(), arc_socket))));
         if let Some(s) = arc_loopback {
-            tasks.push(tokio::spawn(control::run_arc(shared.clone(), s)));
+            tasks.push((
+                "ARC server on 127.0.0.1",
+                tokio::spawn(control::run_arc(shared.clone(), s)),
+            ));
         }
-        tasks.push(tokio::spawn(control::run_cmc(shared.clone(), cmc_socket)));
+        tasks.push(("CMC server", tokio::spawn(control::run_cmc(shared.clone(), cmc_socket))));
         tasks.push(match settings_socket {
-            Some(s) => tokio::spawn(control::run_conmon(shared.clone(), s, notify_rx)),
-            None => tokio::spawn(control::drain_notifications(notify_rx)),
+            Some(s) => {
+                ("settings server", tokio::spawn(control::run_conmon(shared.clone(), s, notify_rx)))
+            }
+            None => ("notifications", tokio::spawn(control::drain_notifications(notify_rx))),
         });
 
         let (tx_commands, tx_events, tx_thread) = tx::spawn_engine(shared.clone());
         let fc = FlowControl::new(shared.clone(), tx_commands.clone());
-        tasks.push(tokio::spawn(fc.run(fc_socket, tx_events)));
+        tasks.push(("flow control server", tokio::spawn(fc.run(fc_socket, tx_events))));
 
         let (rx_shutdown, rx_shutdown_rx) = oneshot::channel();
         let (rx_threads_tx, rx_threads) = mpsc::channel(1);
         let rx = RxManager::new(shared.clone(), directory, rx_threads_tx);
-        tasks.push(tokio::spawn(rx.run(rx_shutdown_rx)));
+        tasks.push(("receive manager", tokio::spawn(rx.run(rx_shutdown_rx))));
 
         if let Some(m) = &mdns {
-            tasks.push(tokio::spawn(advertise(shared.clone(), m.clone())));
+            tasks.push(("mDNS advertiser", tokio::spawn(advertise(shared.clone(), m.clone()))));
         }
         if let Some(path) = config.state_file.clone() {
-            tasks.push(tokio::spawn(persist::run(shared.clone(), path)));
+            tasks.push(("state saver", tokio::spawn(persist::run(shared.clone(), path, on_disk))));
         }
 
         info!(
@@ -224,7 +234,26 @@ impl Device {
             tx_commands,
             tx_thread: Some(tx_thread),
             state_file: config.state_file,
+            state_problem: recovered.problem,
         })
+    }
+
+    /// Why the saved state (names, subscriptions, latency) could not be
+    /// used at start, if it could not: the device then started from the
+    /// backup or without it (see [`SavedState::recover`]).
+    pub fn saved_state_problem(&self) -> Option<&str> {
+        self.state_problem.as_deref()
+    }
+
+    /// A part of the running device that has stopped on its own, if one
+    /// has: the transmit thread or one of the tasks. They only end when
+    /// the device shuts down, so this means one failed (a panic, say) and
+    /// the device no longer works as a whole.
+    pub fn stopped_part(&self) -> Option<&'static str> {
+        if self.tx_thread.as_ref().is_some_and(|t| t.is_finished()) {
+            return Some("transmit thread");
+        }
+        self.tasks.iter().find(|(_, t)| t.is_finished()).map(|(what, _)| *what)
     }
 
     /// Current device name.
@@ -429,7 +458,7 @@ impl Device {
     /// Aborts the tasks, stops the transmit thread and mDNS, and returns the
     /// aborted tasks' handles.
     fn stop_now(&mut self) -> Vec<JoinHandle<()>> {
-        for t in &self.tasks {
+        for (_, t) in &self.tasks {
             t.abort();
         }
         let _ = self.tx_commands.send(TxCommand::Shutdown);
@@ -439,7 +468,7 @@ impl Device {
         if let Some(m) = &self.mdns {
             m.stop();
         }
-        std::mem::take(&mut self.tasks)
+        std::mem::take(&mut self.tasks).into_iter().map(|(_, t)| t).collect()
     }
 }
 

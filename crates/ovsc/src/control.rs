@@ -211,6 +211,12 @@ fn status(view: &View<'_>) -> Status {
                 .into(),
         );
     }
+    if let Some(problem) = view.engine.and_then(|(d, _, _)| d.saved_state_problem()) {
+        warnings.push(format!(
+            "The saved names and subscriptions could not be read at start: {problem}. Check \
+             the subscriptions in Dante Controller."
+        ));
+    }
     if let Some((d, _, running)) = view.engine {
         if !clock.locked && cfg.clock.source == ClockSource::Ptp && running > LOCK_WARNING_AFTER {
             warnings.push(format!(
@@ -392,27 +398,33 @@ pub fn apply(view: &View<'_>, change: &SettingsChange) -> anyhow::Result<Restart
         write_config(path, &text)?;
         restart = Restart::Daemon;
     }
-    if let Some(path) = &state_file {
-        SavedState::update(path, |s| {
+    match device {
+        // A running device saves its own state file: changed through it,
+        // the change is saved with everything else, by the one writer.
+        Some(d) => {
             if let Some(name) = &change.name {
-                s.name = Some(name.clone());
+                d.rename(name)?;
             }
             if let Some(ns) = latency_ns {
-                s.latency_ns = Some(ns);
+                if ns != d.info().latency_ns && restart != Restart::Daemon {
+                    d.request_latency(ns)?;
+                    restart = Restart::Device;
+                } else if ns != d.configured_latency_ns() {
+                    d.request_latency(ns)?;
+                }
             }
-        })
-        .with_context(|| format!("saving {}", path.display()))?;
-    }
-    if let Some(d) = device {
-        if let Some(name) = &change.name {
-            d.rename(name)?;
         }
-        if let Some(ns) = latency_ns {
-            if ns != d.info().latency_ns && restart != Restart::Daemon {
-                d.request_latency(ns)?;
-                restart = Restart::Device;
-            } else if ns != d.configured_latency_ns() {
-                d.request_latency(ns)?;
+        None => {
+            if let Some(path) = &state_file {
+                SavedState::update(path, |s| {
+                    if let Some(name) = &change.name {
+                        s.name = Some(name.clone());
+                    }
+                    if let Some(ns) = latency_ns {
+                        s.latency_ns = Some(ns);
+                    }
+                })
+                .with_context(|| format!("saving {}", path.display()))?;
             }
         }
     }

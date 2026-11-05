@@ -753,7 +753,13 @@ mod tests {
             wait_for("the engine", running).await;
             assert_eq!(latency_ms(&socket).await, Some(4.0));
 
-            let change = SettingsChange { latency_ms: Some(2.0), ..Default::default() };
+            // The running device saves the name and latency itself: the
+            // control socket does not write the state file behind its back.
+            let change = SettingsChange {
+                latency_ms: Some(2.0),
+                name: Some("vocal-fx".into()),
+                ..Default::default()
+            };
             match ask(&socket, Request::Apply { change }).await {
                 Response::Applied { restart } => assert_eq!(restart, Restart::Device),
                 other => panic!("not applied: {other:?}"),
@@ -772,6 +778,7 @@ mod tests {
             }
             let saved = std::fs::read_to_string(dir.join("state.toml")).unwrap();
             assert!(saved.contains("latency_ns = 2000000"), "{saved}");
+            assert!(saved.contains("name = \"vocal-fx\""), "{saved}");
 
             // Out of range: refused, and nothing restarts.
             let change = SettingsChange { latency_ms: Some(80.0), ..Default::default() };
