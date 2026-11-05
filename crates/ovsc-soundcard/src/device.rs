@@ -122,7 +122,7 @@ fn device_name(device: &cpal::Device) -> Option<String> {
     device.description().ok().map(|d| d.name().to_owned())
 }
 
-fn device_id(device: &cpal::Device) -> Option<String> {
+pub(crate) fn device_id(device: &cpal::Device) -> Option<String> {
     device.id().ok().map(|id| id.id().to_owned())
 }
 
