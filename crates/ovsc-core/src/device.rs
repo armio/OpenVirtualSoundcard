@@ -86,6 +86,11 @@ pub struct StartOptions {
     /// caller then applies [`Device::format_requests`], restarting the
     /// device with them.
     pub format_configurable: bool,
+    /// Start from this state instead of the state file's: the
+    /// [`Device::saved_state`] of the device this one replaces, so that a
+    /// restart keeps the names and subscriptions made since the start
+    /// even without a state file. It is saved to the state file, if any.
+    pub state: Option<SavedState>,
 }
 
 /// Packet counters since the device started.
@@ -129,7 +134,10 @@ impl Device {
         options: StartOptions,
     ) -> Result<Self> {
         config.validate()?;
-        let recovered = config.state_file.as_deref().map(SavedState::recover).unwrap_or_default();
+        let recovered = match options.state {
+            Some(state) => persist::Recovered { state, intact: false, problem: None },
+            None => config.state_file.as_deref().map(SavedState::recover).unwrap_or_default(),
+        };
         let saved = recovered.state.clone();
         let on_disk = recovered.intact.then_some(recovered.state);
         let config = with_saved_latency(config, &saved);
@@ -236,6 +244,12 @@ impl Device {
             state_file: config.state_file,
             state_problem: recovered.problem,
         })
+    }
+
+    /// The names, subscriptions and latency a controller or the app set,
+    /// as they would be saved; see [`StartOptions::state`].
+    pub fn saved_state(&self) -> SavedState {
+        SavedState::from_state(&self.shared.state(), &self.shared.info.factory_name)
     }
 
     /// Why the saved state (names, subscriptions, latency) could not be

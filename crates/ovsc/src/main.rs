@@ -4,6 +4,9 @@ mod backend;
 mod config;
 mod control;
 mod coreaudio;
+mod generic;
+mod netwatch;
+mod supervise;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -14,8 +17,7 @@ use clap::{Parser, Subcommand};
 use tracing::{info, warn};
 
 use ovsc_clock::ptp::master::{TestMaster, TestMasterConfig};
-use ovsc_clock::ptp::{PtpConfig, PtpFollower};
-use ovsc_clock::{ClockState, MediaClock, free_running_clock_with_rate, system_clock};
+use ovsc_clock::{ClockState, MediaClock, free_running_clock_with_rate};
 use ovsc_core::client::{self, next_seq};
 use ovsc_core::mdns::Mdns;
 use ovsc_core::net::Interface;
@@ -23,7 +25,6 @@ use ovsc_core::{Channels, Device};
 use ovsc_proto::arc::{self, SubscriptionRequest};
 use ovsc_proto::discovery::{self, ChannelTxt, parse_txt};
 use ovsc_proto::frame::Frame;
-use ovsc_soundcard::{Bridge, BridgeConfig};
 
 use crate::config::{AppConfig, BackendKind, ClockSource};
 
@@ -158,6 +159,10 @@ fn parse_backend(s: &str) -> Result<BackendKind, String> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if matches!(cli.command, Command::Run(_)) {
+        // The daemon restarts rather than run on with a dead part.
+        supervise::install_panic_hook();
+    }
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_new(&cli.log)?)
         .init();
@@ -358,90 +363,7 @@ async fn run(args: RunArgs) -> anyhow::Result<()> {
     }
 
     let mut stop = StopSignals::new()?;
-    let iface = Interface::find(&cfg.device.interface)?;
-    let (clock, follower) = match cfg.clock.source {
-        ClockSource::System => {
-            warn!("using the system clock: audio will not be in sync with a Dante network");
-            (system_clock(), None)
-        }
-        ClockSource::Free => {
-            warn!("using a free-running clock: audio will not be in sync with a Dante network");
-            (free_running_clock_with_rate(config::rate_from_ppm(cfg.clock.free_rate_ppm)?), None)
-        }
-        ClockSource::Ptp => {
-            let mut ptp = PtpConfig::new(iface.ip, iface.mac);
-            ptp.event_port = cfg.clock.ptp_event_port;
-            ptp.general_port = cfg.clock.ptp_general_port;
-            let (follower, clock) =
-                PtpFollower::start(ptp).await.context("starting the PTP clock follower")?;
-            (clock, Some(follower))
-        }
-    };
-
-    let device = Device::start(cfg.device.clone(), clock.clone()).await?;
-    let audio = device.audio();
-    let a = &cfg.audio;
-    let mut bridge = None;
-    let backend = match a.backend {
-        BackendKind::None => None,
-        BackendKind::Tone => Some(backend::tone(audio, a.tone_hz, a.tone_level_db)),
-        BackendKind::Loopback => Some(backend::loopback(audio)),
-        BackendKind::Record => Some(backend::record(audio, &a.record_path)?),
-        BackendKind::Soundcard => {
-            let bridge_cfg = BridgeConfig {
-                output_device: a.output_device.clone(),
-                input_device: a.input_device.clone(),
-                buffer_frames: a.buffer_frames,
-                output_map: config::channel_map(&a.output_channels),
-                input_map: config::channel_map(&a.input_channels),
-                margin_ms: a.margin_ms,
-            };
-            bridge =
-                Some(Bridge::start(audio, &bridge_cfg).context("starting the soundcard bridge")?);
-            None
-        }
-        BackendKind::CoreAudio => unreachable!("served by coreaudio::run"),
-    };
-
-    let mut status = tokio::time::interval(Duration::from_secs(30));
-    status.tick().await;
-    let mut clock_log = ClockStateLog::default();
-    let why = loop {
-        tokio::select! {
-            r = stop.requested() => break r?,
-            _ = status.tick() => {
-                info!("{}", status_line(&device, &clock));
-                if let Some(b) = &bridge {
-                    let stats = b.stats();
-                    for (what, d) in [("playback", stats.output), ("capture", stats.input)] {
-                        if let Some(d) = d {
-                            info!(
-                                "{what} {}: {}, {:+.1} ppm, error {:.1} samples, {} underruns, {} realigns{}",
-                                d.device,
-                                if d.locked { "locked" } else if d.running { "locking" } else { "starting" },
-                                d.ratio_ppm,
-                                d.error_samples,
-                                d.underruns,
-                                d.realigns,
-                                if d.device_lost { ", DEVICE LOST" } else { "" }
-                            );
-                        }
-                    }
-                }
-            }
-            _ = tokio::time::sleep(Duration::from_secs(1)) => clock_log.poll(&clock),
-        }
-    };
-    info!("{why}: shutting down");
-    if let Some(b) = backend {
-        b.stop();
-    }
-    drop(bridge);
-    device.shutdown().await;
-    if let Some(f) = follower {
-        f.shutdown();
-    }
-    Ok(())
+    generic::run(cfg, supervise::Supervision::daemon(), &mut stop).await
 }
 
 fn list_soundcards() -> anyhow::Result<()> {
