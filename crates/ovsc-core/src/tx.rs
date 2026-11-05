@@ -786,7 +786,7 @@ mod tests {
 
     use std::time::Instant;
 
-    use ovsc_clock::system_clock;
+    use ovsc_clock::free_running_clock;
 
     use crate::config::{Channels, DeviceConfig};
     use crate::info::DeviceInfo;
@@ -811,7 +811,12 @@ mod tests {
             rx_flow_stats: Vec::new(),
             latency_override_ns: None,
         };
-        Shared::new(info, state, system_clock(), config.ring_capacity, None, false).unwrap().0
+        // One fixed mapping from the monotonic clock, so that the transmit
+        // thread and a test reading the time agree exactly (the system
+        // clock maps afresh on every read, off by any preemption between
+        // its two clock reads).
+        let clock = free_running_clock();
+        Shared::new(info, state, clock, config.ring_capacity, None, false).unwrap().0
     }
 
     fn flow_request(port: u16, fpp: u16, bits: u32, channels: &[u16]) -> FlowRequest {
@@ -1145,12 +1150,12 @@ mod tests {
     fn the_transmit_thread_paces_marked_packets_and_counts_lateness() {
         let shared = test_shared(4);
         let (receiver, source, commands, thread) = start_engine(&shared, 16, 2);
+        let guard = ns_to_samples(shared.info.tx_guard_ns, 48_000);
         let mut buf = [0u8; 2048];
         let mut timestamps = Vec::new();
-        let mut first_at = None;
         while timestamps.len() < 200 {
             let (len, from) = receiver.recv_from(&mut buf).expect("packets keep coming");
-            first_at.get_or_insert_with(Instant::now);
+            let arrived = ns_to_samples(shared.clock.now_ns().unwrap(), 48_000);
             assert_eq!(from, source);
             // 16 frames of 2 slots at 24 bit.
             assert_eq!(len, audio::HEADER_LEN + 16 * 2 * 3);
@@ -1158,14 +1163,19 @@ mod tests {
             let ts = p.timestamp(48_000);
             assert_eq!(ts % 16, 0, "aligned to fpp");
             assert!(timestamps.last().is_none_or(|&last| ts > last), "in order");
+            // Paced by the media clock, not sent ahead in a burst: no packet
+            // leaves before its send time. This holds however late the test
+            // thread reads it (a load-dependent gap between the first and
+            // the last read would not); the extra sample covers rounding.
+            assert!(arrived + 1 >= ts + guard, "packet {ts} arrived at {arrived}, guard {guard}");
             timestamps.push(ts);
         }
-        // Paced by the clock, not sent in a burst: the packets span as much
-        // real time as audio (less a few ms of scheduling jitter).
-        let elapsed = first_at.unwrap().elapsed();
-        let span = Duration::from_micros((timestamps[199] - timestamps[0]) * 1_000_000 / 48_000);
-        assert!(elapsed + Duration::from_millis(5) >= span, "{elapsed:?} for {span:?}");
+        // The thread counts a packet once send() returns, which can be
+        // after the packet was read here: stop it before reading counters.
+        commands.send(TxCommand::Shutdown).unwrap();
+        thread.join().unwrap();
         let c = &shared.counters;
+        assert!(!c.tx_engine_failed.load(Ordering::Relaxed));
         assert!(c.tx_packets.load(Ordering::Relaxed) >= 200);
         assert_eq!(c.tx_send_errors.load(Ordering::Relaxed), 0);
         // Without a stall of more than 40 ms (which a loaded host can
@@ -1189,9 +1199,6 @@ mod tests {
                 .join()
                 .unwrap();
         assert_eq!(c.tx_not_realtime.load(Ordering::Relaxed), !realtime);
-        commands.send(TxCommand::Shutdown).unwrap();
-        thread.join().unwrap();
-        assert!(!c.tx_engine_failed.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -1216,9 +1223,11 @@ mod tests {
             assert!(Instant::now() < deadline, "no send error counted");
             std::thread::sleep(Duration::from_millis(10));
         }
-        let code = shared.counters.tx_last_send_error.load(Ordering::Relaxed);
-        assert_eq!(code, libc::ECONNREFUSED);
+        // The error code is stored just after the count: stop the thread
+        // before reading it.
         commands.send(TxCommand::Shutdown).unwrap();
         thread.join().unwrap();
+        let code = shared.counters.tx_last_send_error.load(Ordering::Relaxed);
+        assert_eq!(code, libc::ECONNREFUSED);
     }
 }
