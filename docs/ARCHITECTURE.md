@@ -71,7 +71,8 @@ as silence. This gives:
 
 **Receive.** A flow's real-time thread receives a packet, keeps it only if it
 comes from the flow's transmitter (its address, and the source port its audio
-has been coming from) and has the flow's size, splits it per slot, and writes
+has been coming from) and holds whole frames of the flow's slots (the frame
+count is read from the length, PROTOCOL.md §8.2), splits it per slot, and writes
 each slot's samples into the ring of every local channel routed to that slot,
 at the packet's timestamp, plus the extra latency the flow needs when its
 transmitter demands more than ours. Backends read at `now − latency`.

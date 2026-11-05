@@ -112,7 +112,7 @@ pub struct Counters {
     /// a sign that the transmitter's clock disagrees with ours.
     pub rx_early_packets: AtomicU64,
     /// Datagrams dropped by receive flows: not from the flow's transmitter,
-    /// or not the size of the flow's packets.
+    /// or not whole frames of the flow's slots.
     pub rx_rejected_packets: AtomicU64,
 }
 
@@ -138,7 +138,7 @@ pub struct FlowStats {
     /// since someone last took it.
     pub max_early: AtomicU32,
     /// Datagrams dropped: from another address or source port than the
-    /// flow's transmitter, or not the flow's packet size.
+    /// flow's transmitter, or not whole frames of the flow's slots.
     pub rejected_packets: AtomicU64,
     /// The last dropped datagram, for diagnostics: source IPv4 address
     /// (high 32 bits), source port (next 16) and length (low 16).

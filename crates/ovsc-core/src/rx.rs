@@ -310,11 +310,12 @@ impl RxFlow {
             let from = SocketAddrV4::new(Ipv4Addr::from((last >> 32) as u32), (last >> 16) as u16);
             parts.push(format!(
                 "{} datagrams dropped (the last from {from}, {} bytes; the flow's packets come \
-                 from {} and have {} bytes)",
+                 from {} and have {} bytes, or another whole number of {}-byte frames)",
                 t.rejected,
                 last & 0xffff,
                 self.control.ip(),
                 self.worker.params.packet_len(),
+                self.worker.params.stride(),
             ));
         }
         format!(
@@ -1697,10 +1698,24 @@ struct FlowParams {
 }
 
 impl FlowParams {
-    /// The size of the flow's packets (PROTOCOL.md §8.2).
+    /// The size of the flow's packets as requested (PROTOCOL.md §8.2).
     fn packet_len(&self) -> usize {
         audio::HEADER_LEN + self.slots * self.fpp * self.format.bytes()
     }
+
+    /// The bytes of one frame: a sample for every slot.
+    fn stride(&self) -> usize {
+        (self.slots * self.format.bytes()).max(1)
+    }
+}
+
+/// The receive buffer's size: more than any audio packet, which stays
+/// within an Ethernet frame.
+const RECV_BUFFER: usize = 2048;
+
+/// The most frames a received packet can carry for a flow.
+fn max_frames(params: &FlowParams) -> usize {
+    ((RECV_BUFFER - audio::HEADER_LEN) / params.stride()).max(1)
 }
 
 /// Receives one flow's packets into the rings and keeps the flow alive.
@@ -1710,7 +1725,7 @@ fn receive(
     mut rx: Receiver,
     stop: Arc<AtomicBool>,
 ) {
-    let mut buf = vec![0u8; 2048];
+    let mut buf = vec![0u8; RECV_BUFFER];
     // The first load on a thread registers it with arc-swap, which may
     // allocate: do it now rather than on the first packet.
     drop(rx.routing.load());
@@ -1761,7 +1776,9 @@ impl Receiver {
             routing,
             rings,
             probes,
-            samples: vec![0; params.fpp.max(1)],
+            // Room for any packet that fits the receive buffer: a
+            // transmitter may send another fpp than the one asked for.
+            samples: vec![0; max_frames(&params)],
             source: None,
             source_ns: 0,
             expected: None,
@@ -1786,7 +1803,8 @@ impl Receiver {
         let p = self.params;
         let Ok(packet) = AudioPacket::parse(data, p.slots, p.format) else { return };
         let ts = packet.timestamp(p.sample_rate);
-        self.sequence(ts, packet.frames() as u64);
+        let frames = packet.frames() as u64;
+        self.sequence(ts, frames);
         let Probes { last_packet_ns, counters, stats } = &self.probes;
         counters.rx_packets.fetch_add(1, Ordering::Relaxed);
         stats.packets.fetch_add(1, Ordering::Relaxed);
@@ -1802,7 +1820,7 @@ impl Receiver {
             // Stamped in our future: the transmitter's clock is ahead of
             // ours, which delays its audio by as much.
             let lead = ts.saturating_sub(now);
-            if lead > p.fpp as u64 {
+            if lead > frames {
                 counters.rx_early_packets.fetch_add(1, Ordering::Relaxed);
                 stats.early_packets.fetch_add(1, Ordering::Relaxed);
                 stats.max_early.fetch_max(lead.min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
@@ -1825,12 +1843,19 @@ impl Receiver {
 
     /// Whether a datagram is one of the flow's packets: from the
     /// transmitter's address and the source port its packets have been
-    /// coming from, and the flow's size. Anything else (a flow that a
-    /// previous receiver on this port left behind, a second flow created by
-    /// a retried request) would be mixed into this flow's channels, or
-    /// decoded with the wrong layout.
+    /// coming from, and whole frames of the flow's slots. Anything else (a
+    /// flow that a previous receiver on this port left behind, a second flow
+    /// created by a retried request) would be mixed into this flow's
+    /// channels, or decoded with the wrong layout.
+    ///
+    /// The frame count is not checked against the fpp we asked for:
+    /// receivers derive it from the length (PROTOCOL.md §8.2), so a
+    /// transmitter that picks another fpp still plays rather than going
+    /// silent for good.
     fn accept(&mut self, len: usize, from: SocketAddr, now_ns: u64) -> bool {
-        if from.ip() != IpAddr::V4(self.params.tx_ip) || len != self.params.packet_len() {
+        let payload = len.saturating_sub(audio::HEADER_LEN);
+        let whole = len > audio::HEADER_LEN && payload % self.params.stride() == 0;
+        if from.ip() != IpAddr::V4(self.params.tx_ip) || !whole {
             return false;
         }
         match self.source {
@@ -1843,13 +1868,14 @@ impl Receiver {
         true
     }
 
-    /// Counts packets missing from the timestamp sequence.
+    /// Counts packets missing from the timestamp sequence, in packets of
+    /// the size received.
     fn sequence(&mut self, ts: u64, frames: u64) {
         let Probes { counters, stats, .. } = &self.probes;
         let window = u64::from(self.params.sample_rate);
         let next = match self.expected {
             Some(exp) if ts > exp && ts - exp <= window => {
-                let lost = (ts - exp).div_ceil(self.params.fpp.max(1) as u64);
+                let lost = (ts - exp).div_ceil(frames.max(1));
                 counters.rx_lost_packets.fetch_add(lost, Ordering::Relaxed);
                 stats.lost_packets.fetch_add(lost, Ordering::Relaxed);
                 ts + frames
@@ -2038,7 +2064,7 @@ mod tests {
         SocketAddr::from((ip, port))
     }
 
-    /// Only the transmitter's packets of the flow's size, from the port they
+    /// Only the transmitter's packets of whole frames, from the port they
     /// have been coming from, reach the rings.
     #[test]
     fn packets_from_elsewhere_are_dropped() {
@@ -2052,8 +2078,9 @@ mod tests {
         t.send(a, 1_000, ts, 100);
         // Another port of the same transmitter, while the first is busy.
         t.send(b, 2_000, ts + 12, 200);
-        // The right source, the wrong size (another fpp).
-        let wrong = packet(ts + 24, 2, 6, 300);
+        // The right source, the wrong size: not whole frames of 2 slots.
+        let mut wrong = packet(ts + 24, 2, 6, 300);
+        wrong.pop();
         t.rx.datagram(&wrong, a, 3_000, &t.clock);
         assert_eq!(get(&t.stats.rejected_packets), 3);
         assert_eq!(get(&t.counters.rx_rejected_packets), 3);
@@ -2076,6 +2103,40 @@ mod tests {
         t.send(a, 1_000 + SOURCE_HOLD_NS + 2, ts + 48, 500);
         assert_eq!(t.rings[0].read_one(ts + 48), None);
         assert_eq!(get(&t.stats.rejected_packets), 4);
+    }
+
+    /// Receivers derive fpp from a packet's length (PROTOCOL.md §8.2): a
+    /// transmitter that sends another fpp than the one requested still
+    /// plays, every frame of it, and its gaps count in its own packets.
+    #[test]
+    fn packets_of_another_fpp_play_whole() {
+        let mut t = test_rx(2, 12, 0);
+        let src = from(TX, 5000);
+        let ts = t.now();
+        for (i, fpp) in [(0u64, 16usize), (1, 16), (3, 16)] {
+            let at = ts + i * fpp as u64;
+            let data = packet(at, 2, fpp, 10 * i as i32);
+            t.rx.datagram(&data, src, 1_000 + i, &t.clock);
+        }
+        assert_eq!(get(&t.stats.rejected_packets), 0);
+        assert_eq!(get(&t.stats.packets), 3);
+        for i in [0u64, 1, 3] {
+            for f in 0..16 {
+                let v = (10 * i as i32 + 1) << 8;
+                assert_eq!(t.rings[1].read_one(ts + i * 16 + f), Some(v), "packet {i} frame {f}");
+            }
+        }
+        assert_eq!(t.rings[0].read_one(ts + 2 * 16), None);
+        // One packet of 16 frames is missing, not two of the 12 asked for.
+        assert_eq!(get(&t.stats.lost_packets), 1);
+
+        // The largest packet that fits the receive buffer is read whole.
+        let big = max_frames(&t.rx.params);
+        let at = ts + 4 * 16;
+        let data = packet(at, 2, big, 7);
+        assert!(data.len() <= RECV_BUFFER);
+        t.rx.datagram(&data, src, 2_000, &t.clock);
+        assert_eq!(t.rings[0].read_one(at + big as u64 - 1), Some(7 << 8));
     }
 
     #[test]
