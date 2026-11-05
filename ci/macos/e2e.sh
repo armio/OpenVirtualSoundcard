@@ -282,6 +282,10 @@ s8() {
     wait_check 30 --inputs 4 --outputs 4 || return 1
     [ "$(coreaudiod_pid)" = "$pid" ] || { echo "coreaudiod restarted"; return 1; }
     limit 70 "$CHECK" wait-status "$DEV" clock=following 60 || return 1
+    # The driver's timeline goes on following through the restart, so the
+    # status reads clock=following at once; audio flows only once the new
+    # daemon's clock has locked and the gate opens.
+    limit 70 "$CHECK" wait-status "$DEV" gate=1 60 || return 1
     loopback s8 --seconds 5 --channels 4 --expect-device-delay 0 --max-bad "$STALL_FRAMES"
 }
 
@@ -316,6 +320,7 @@ s10() {
     sudo launchctl bootstrap system "$PLIST" || return 1
     limit 40 "$CHECK" wait-status "$DEV" daemon=attached 30 || return 1
     limit 70 "$CHECK" wait-status "$DEV" clock=following 60 || return 1
+    limit 70 "$CHECK" wait-status "$DEV" gate=1 60 || return 1
     loopback s10-back --seconds 5 --channels 8 --expect-device-delay 0 --max-bad "$STALL_FRAMES"
 }
 
