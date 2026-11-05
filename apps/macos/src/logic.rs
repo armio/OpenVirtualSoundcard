@@ -197,6 +197,15 @@ pub fn rebase(old: &Settings, edited: &Settings, new: &Settings) -> Settings {
     }
 }
 
+/// What is wrong with the name in the form, if the user changed it. An
+/// unchanged name is never a problem, even an empty one: a device without a
+/// name of its own (`name = ""`, named after its interface once it runs)
+/// shows an empty name while its engine waits for the network, and the
+/// other settings must still apply.
+pub fn edited_name_problem(current: &str, edited: &str) -> Option<&'static str> {
+    if edited == current { None } else { name_problem(edited) }
+}
+
 /// Why `name` cannot be the device name, if it cannot: the daemon takes 1–31
 /// ASCII letters, digits and inner hyphens.
 pub fn name_problem(name: &str) -> Option<&'static str> {
@@ -479,16 +488,24 @@ impl Problem {
             Problem::NotRunning => "The OpenVirtualSoundcard daemon is not running.".to_owned(),
             Problem::NotAdmin => "Only administrators can control OpenVirtualSoundcard.".to_owned(),
             Problem::NoAnswer => "The OpenVirtualSoundcard daemon does not answer.".to_owned(),
-            Problem::Lost => "The connection to the OpenVirtualSoundcard daemon was lost.".to_owned(),
+            Problem::Lost => {
+                "The connection to the OpenVirtualSoundcard daemon was lost.".to_owned()
+            }
             Problem::Version { daemon: Some((version, protocol)) } => format!(
                 "This app and the OpenVirtualSoundcard daemon (version {version}) are different versions: \
                  the app speaks control protocol {PROTOCOL_VERSION}, the daemon {protocol}."
             ),
-            Problem::Version { daemon: None } => "This app cannot read the OpenVirtualSoundcard daemon's \
+            Problem::Version { daemon: None } => {
+                "This app cannot read the OpenVirtualSoundcard daemon's \
                 answers: the app and the daemon are probably different versions."
-                .to_owned(),
-            Problem::Daemon(message) => format!("The OpenVirtualSoundcard daemon reports: {message}"),
-            Problem::Other(message) => format!("Cannot reach the OpenVirtualSoundcard daemon: {message}"),
+                    .to_owned()
+            }
+            Problem::Daemon(message) => {
+                format!("The OpenVirtualSoundcard daemon reports: {message}")
+            }
+            Problem::Other(message) => {
+                format!("Cannot reach the OpenVirtualSoundcard daemon: {message}")
+            }
         }
     }
 
@@ -714,6 +731,12 @@ mod tests {
         assert_eq!(name_problem(" studio "), None);
         assert_eq!(name_problem(&"a".repeat(31)), None);
         assert!(name_problem("").is_some());
+        // Only a changed name is checked: an empty one from the daemon
+        // must not block the other settings.
+        assert_eq!(edited_name_problem("", ""), None);
+        assert_eq!(edited_name_problem("vox-mac", "vox-mac"), None);
+        assert!(edited_name_problem("vox-mac", "").is_some());
+        assert!(edited_name_problem("", "bad name!").is_some());
         assert!(name_problem("   ").is_some());
         assert!(name_problem(&"a".repeat(32)).is_some());
         assert!(name_problem("studio mac").is_some());
@@ -875,9 +898,15 @@ mod tests {
         assert_eq!(problem(io::ErrorKind::WouldBlock), Problem::NoAnswer);
         assert_eq!(problem(io::ErrorKind::UnexpectedEof), Problem::Lost);
         assert_eq!(problem(io::ErrorKind::InvalidData), Problem::Version { daemon: None });
-        assert_eq!(Problem::NotRunning.message(), "The OpenVirtualSoundcard daemon is not running.");
+        assert_eq!(
+            Problem::NotRunning.message(),
+            "The OpenVirtualSoundcard daemon is not running."
+        );
         assert_eq!(Problem::NotRunning.command(), Some(START_COMMAND));
-        assert_eq!(Problem::NotAdmin.message(), "Only administrators can control OpenVirtualSoundcard.");
+        assert_eq!(
+            Problem::NotAdmin.message(),
+            "Only administrators can control OpenVirtualSoundcard."
+        );
         assert_eq!(Problem::NotAdmin.command(), None);
         assert!(matches!(problem(io::ErrorKind::OutOfMemory), Problem::Other(_)));
     }

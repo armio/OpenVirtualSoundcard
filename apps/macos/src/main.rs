@@ -23,7 +23,11 @@ fn main() -> eframe::Result {
             .with_min_inner_size([520.0, 400.0]),
         ..Default::default()
     };
-    eframe::run_native("OpenVirtualSoundcard", options, Box::new(|cc| Ok(Box::new(app::App::new(cc, socket)))))
+    eframe::run_native(
+        "OpenVirtualSoundcard",
+        options,
+        Box::new(|cc| Ok(Box::new(app::App::new(cc, socket)))),
+    )
 }
 
 /// The window's and the Dock's icon: the same artwork as the bundle's

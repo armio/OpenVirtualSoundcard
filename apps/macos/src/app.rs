@@ -349,7 +349,7 @@ impl App {
         };
         let usable = up && !self.applying;
         let before = form.edited.clone();
-        let name_problem = logic::name_problem(&form.edited.name);
+        let name_problem = logic::edited_name_problem(&form.current.name, &form.edited.name);
         ui.add_enabled_ui(usable, |ui| {
             section(ui, "Device", |ui| settings_form(ui, form, &self.interfaces, name_problem));
         });

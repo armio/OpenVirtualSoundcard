@@ -205,7 +205,9 @@ impl Link {
                 Ok(())
             }
             Ok(other) => {
-                self.applied(Err("OpenVirtualSoundcard gave an answer this app does not understand.".into()));
+                self.applied(Err(
+                    "OpenVirtualSoundcard gave an answer this app does not understand.".into(),
+                ));
                 Err(unexpected(&other))
             }
             Err(e) => {
