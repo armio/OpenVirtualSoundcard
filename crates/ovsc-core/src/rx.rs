@@ -949,8 +949,10 @@ impl RxManager {
         let Some(id) = (1..=MAX_RX_FLOWS as u16)
             .find(|id| self.flows.iter().all(|f| f.id != *id) && !self.reserved.contains(id))
         else {
-            warn!("all {MAX_RX_FLOWS} receive flows in use");
-            self.fail_chunk(&chunk, status::NO_RX, Retry::REFUSED);
+            // Logged once, not on every retry.
+            if self.fail_chunk(&chunk, status::NO_RX, Retry::REFUSED) {
+                warn!("all {MAX_RX_FLOWS} receive flows in use");
+            }
             return None;
         };
         let Some(format) = SampleFormat::from_bits(txt.bits_per_sample as u32) else {
@@ -962,13 +964,14 @@ impl RxManager {
         let latency = flow_latency(info.latency_samples, &txt, fpp, info.sample_rate);
         let most = max_latency_samples(info.sample_rate);
         if latency > most {
-            warn!(
-                "{} asks for {:.2} ms of latency, more than the {:.0} ms we can play at",
-                chunk[0].resolved.device,
-                latency as f64 * 1000.0 / info.sample_rate as f64,
-                crate::config::MAX_LATENCY_MS
-            );
-            self.fail_chunk(&chunk, status::CHANNEL_LATENCY, Retry::REFUSED);
+            if self.fail_chunk(&chunk, status::CHANNEL_LATENCY, Retry::REFUSED) {
+                warn!(
+                    "{} asks for {:.2} ms of latency, more than the {:.0} ms we can play at",
+                    chunk[0].resolved.device,
+                    latency as f64 * 1000.0 / info.sample_rate as f64,
+                    crate::config::MAX_LATENCY_MS
+                );
+            }
             return None;
         }
         // Every slot the flow may hold, unused ones 0, as Dante receivers
@@ -2321,6 +2324,55 @@ mod tests {
             let retry = mgr.failures[&0].retry_at.saturating_duration_since(Instant::now());
             assert!(retry <= Retry::FAST.first, "{retry:?}");
             assert!(mgr.flows.is_empty());
+        }
+
+        /// A subscription that keeps failing the same way is logged once,
+        /// not on every retry for the rest of the show.
+        #[tokio::test]
+        async fn a_lasting_failure_is_logged_once() {
+            use std::sync::atomic::AtomicUsize;
+
+            #[derive(Clone)]
+            struct Lines(Arc<AtomicUsize>);
+            impl std::io::Write for Lines {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    let lines = buf.iter().filter(|&&b| b == b'\n').count();
+                    self.0.fetch_add(lines, Ordering::Relaxed);
+                    Ok(buf.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let warnings = Lines(Arc::new(AtomicUsize::new(0)));
+            let writer = warnings.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || writer.clone())
+                .finish();
+            let _log = tracing::subscriber::set_default(subscriber);
+
+            // More latency than any device may run at.
+            let directory = StaticDirectory::new();
+            directory.insert(ResolvedChannel {
+                device: "slow-tx".into(),
+                channel: "01".into(),
+                addr: Ipv4Addr::LOCALHOST,
+                flow_control_port: 24799,
+                txt: txt(1, 50_000_000, 32, 4),
+            });
+            let iface = Interface::find("127.0.0.1").unwrap();
+            let mut mgr = manager(&config("unit-slow", 24790), iface, directory);
+            subscribe(&mgr, 0, "01", "slow-tx");
+            drive(&mut mgr, |m| status(m, 0) == status::CHANNEL_LATENCY).await;
+            // Retried, here at once rather than after 1, 2 and 4 s: still
+            // failing.
+            for tries in 2..=4 {
+                mgr.failures.get_mut(&0).unwrap().retry_at = Instant::now();
+                drive(&mut mgr, |m| m.failures.get(&0).is_some_and(|f| f.count == tries)).await;
+            }
+            assert_eq!(status(&mgr, 0), status::CHANNEL_LATENCY);
+            assert_eq!(warnings.0.load(Ordering::Relaxed), 1);
         }
     }
 }
