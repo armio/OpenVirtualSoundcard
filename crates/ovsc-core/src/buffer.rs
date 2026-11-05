@@ -167,11 +167,12 @@ impl TimedRing {
     }
 }
 
-/// How often a [`Sweeper`] sweeps its rings.
+/// How often a [`Sweeper`] sweeps each of its rings.
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
-/// A thread that sweeps a device's rings (see [`TimedRing::sweep`]) when it
-/// starts and every [`SWEEP_INTERVAL`] after, until stopped or dropped.
+/// A thread that sweeps a device's rings (see [`TimedRing::sweep`]): all of
+/// them when it starts, then one ring at a time, so that each is swept
+/// every [`SWEEP_INTERVAL`], until stopped or dropped.
 ///
 /// A slot keeps only the low 32 bits of its sample's timestamp, so the last
 /// lap of a ring whose writer stopped (a receive flow that died or was
@@ -181,8 +182,13 @@ pub const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 /// 48 kHz) would then reach the host or the console as if it were live.
 /// Sweeping every few seconds forgets such samples hours before that.
 ///
-/// A sweep of one ring loads its 32768 slots and takes tens of
+/// A sweep of one ring loads its 32768 slots (256 KiB) and takes tens of
 /// microseconds; it runs at normal priority, never on a real-time path.
+/// After the first pass the sweeps are spread evenly over the interval:
+/// every ring at once would stream tens of megabytes (32 MiB at 64 × 64
+/// channels) through the caches the plug-in host's IO thread shares, every
+/// few seconds, which could cost that thread its deadline at 32-frame
+/// buffers.
 pub struct Sweeper {
     stop: Option<std::sync::mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -190,25 +196,30 @@ pub struct Sweeper {
 
 impl Sweeper {
     /// Starts sweeping `rings` against `now`, the media time in samples
-    /// (`None` while there is no clock, which skips the sweep).
+    /// (`None` while there is no clock, which skips the sweep): all of them
+    /// at once, then one every `interval / rings.len()`, so that each is
+    /// swept every `interval`.
     pub fn spawn(
         rings: Vec<Arc<TimedRing>>,
         interval: Duration,
         mut now: impl FnMut() -> Option<u64> + Send + 'static,
     ) -> std::io::Result<Self> {
         let (stop, stopped) = std::sync::mpsc::channel::<()>();
+        let count = u32::try_from(rings.len()).unwrap_or(u32::MAX).max(1);
+        let pace = (interval / count).max(Duration::from_millis(1));
         let thread = std::thread::Builder::new().name("ovsc-sweep".into()).spawn(move || {
-            loop {
-                for ring in &rings {
-                    ring.sweep(&mut now);
-                    // Stopping only drops the sender: leave between rings.
-                    if !matches!(stopped.try_recv(), Err(TryRecvError::Empty)) {
-                        return;
-                    }
-                }
-                if !matches!(stopped.recv_timeout(interval), Err(RecvTimeoutError::Timeout)) {
+            // Stopping only drops the sender: leave between rings.
+            for ring in &rings {
+                ring.sweep(&mut now);
+                if !matches!(stopped.try_recv(), Err(TryRecvError::Empty)) {
                     return;
                 }
+            }
+            for ring in rings.iter().cycle() {
+                if !matches!(stopped.recv_timeout(pace), Err(RecvTimeoutError::Timeout)) {
+                    return;
+                }
+                ring.sweep(&mut now);
             }
         })?;
         Ok(Self { stop: Some(stop), thread: Some(thread) })
@@ -422,5 +433,35 @@ mod tests {
         drop(sweeper.unwrap());
         assert!(started.elapsed() < Duration::from_secs(10));
         assert_eq!(Arc::strong_count(&ring), 1);
+        // With no rings it has nothing to do.
+        drop(Sweeper::spawn(Vec::new(), Duration::ZERO, || Some(0)).unwrap());
+    }
+
+    #[test]
+    fn after_the_first_pass_the_sweeper_takes_one_ring_at_a_time() {
+        // Each ring holds one chunk of fresh samples, so each sweep of it
+        // reads the clock exactly once: the clock's log is the sweeps'.
+        let rings: Vec<_> = (0..4).map(|_| Arc::new(TimedRing::new(64))).collect();
+        for r in &rings {
+            r.write(1000, &[1; 64]);
+        }
+        let sweeps = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = sweeps.clone();
+        let interval = Duration::from_millis(120);
+        let mut sweeper = Sweeper::spawn(rings.clone(), interval, move || {
+            log.lock().unwrap().push(std::time::Instant::now());
+            Some(1000)
+        })
+        .unwrap();
+        assert!(eventually(|| sweeps.lock().unwrap().len() >= 4 + 6));
+        sweeper.stop();
+        let sweeps = sweeps.lock().unwrap();
+        // The first pass sweeps all four at once; after it, never two rings
+        // back to back (a whole pass would go through the caches at once),
+        // but one every interval / 4. Waits only ever run long.
+        for (i, w) in sweeps.windows(2).enumerate().skip(3) {
+            assert!(w[1] - w[0] >= interval / 4, "sweeps {i} and {}: {:?}", i + 1, w[1] - w[0]);
+        }
+        assert!(rings.iter().all(|r| r.read_one(1000) == Some(1)));
     }
 }
