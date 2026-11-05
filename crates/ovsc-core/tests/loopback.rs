@@ -637,8 +637,8 @@ async fn rx_flows(port: u16) -> Vec<arc::RxFlowInfo> {
 async fn a_new_receive_latency_leaves_the_transmit_flows_alone() {
     use ovsc_proto::dbcp::FlowRequest;
 
-    const OVSC: u16 = 24540;
-    const CONSOLE: u16 = 24550;
+    const OVSC: u16 = 25170;
+    const CONSOLE: u16 = 25180;
     let clock = system_clock();
     // The console asks its receivers for 1 ms only, so that flows from it
     // play at the device's latency.
