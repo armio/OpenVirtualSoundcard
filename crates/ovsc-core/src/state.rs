@@ -1,6 +1,6 @@
 //! Mutable device state shared by the servers, and change notification.
 
-use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::{mpsc, watch};
@@ -73,6 +73,36 @@ pub struct Counters {
     pub rx_packets: AtomicU64,
     /// Received packets older than the receive latency on arrival.
     pub rx_late_packets: AtomicU64,
+    /// Audio packets the network stack refused to send (a full queue,
+    /// no route, ...) or reported undeliverable (ICMP host or port
+    /// unreachable).
+    pub tx_send_errors: AtomicU64,
+    /// The OS error code of the latest failed send, 0 if none or unknown.
+    pub tx_last_send_error: AtomicI32,
+    /// Audio packets sent more than the transmit thread's late allowance
+    /// (250 µs) after their send time, timestamp + guard. The first packet
+    /// of a flow, and the first after a resync, are not counted: they are
+    /// up to one packet late by design.
+    pub tx_late_packets: AtomicU64,
+    /// The latest any audio packet left after its send time, in ns, since
+    /// the device started (the packets [`Counters::tx_late_packets`] skips
+    /// excluded).
+    pub tx_max_lateness_ns: AtomicU64,
+    /// Audio packets never sent: overdue by more than any receiver can
+    /// play after a stall or a media clock step, or (never expected) too
+    /// large to encode.
+    pub tx_skipped_packets: AtomicU64,
+    /// Times a flow's timeline restarted after a stall or a media clock
+    /// step.
+    pub tx_resyncs: AtomicU64,
+    /// Unicast flows removed after 4 s without keepalives.
+    pub tx_expired_flows: AtomicU64,
+    /// Set when the transmit thread runs without real-time scheduling.
+    pub tx_not_realtime: AtomicBool,
+    /// Set when the transmit thread has stopped on a panic: no flow sends
+    /// audio any more, and flow requests are refused until the device
+    /// restarts.
+    pub tx_engine_failed: AtomicBool,
 }
 
 /// When one receive flow's packets arrive, written by its receive thread.
