@@ -22,6 +22,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, warn};
 
+use crate::info::DeviceInfo;
+use crate::net::Interface;
 use crate::state::{Shared, State};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,6 +40,11 @@ pub struct SavedState {
     /// `lock_remote_settings`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lock_remote_settings: Option<bool>,
+    /// The device name the device holds on the network, and on which
+    /// computer. State files saved before claims were have none: the
+    /// device then probes for its name, as it always did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claim: Option<SavedClaim>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +53,35 @@ pub struct SavedSubscription {
     pub rx_channel: u16,
     pub tx_channel: String,
     pub tx_device: String,
+}
+
+/// A device name the device claimed on the network (it probed for it, RFC
+/// 6762 §8.1, or took it over from the device it replaced) and announces,
+/// with the MAC address of the interface it announces it on.
+///
+/// A new process on the same computer (the daemon started again after a
+/// crash, or at a reboot) that starts the device with that name, on that
+/// interface, announces the name again without probing for it, as a device
+/// restarted within its process does ([`crate::StartOptions::announced`]):
+/// any other device announcing the name too would answer a probe, and the
+/// device would take another name, which breaks every subscription to it.
+/// That other device is reported instead. On another computer, a copy of
+/// the state file (a cloned disk) holds a MAC address the interface there
+/// does not have, so the device there probes, as at a first start. See
+/// [`SavedState::claimed_name`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+// A claim missing a field (edited by hand) is read as no claim, rather
+// than making the whole state file unreadable.
+#[serde(default)]
+pub struct SavedClaim {
+    pub name: String,
+    /// The interface's MAC address, as `00:1d:c1:52:79:b6`.
+    pub mac: String,
+}
+
+/// `mac` as `00:1d:c1:52:79:b6`, the way `ifconfig` shows it.
+fn mac_text(mac: [u8; 6]) -> String {
+    mac.map(|b| format!("{b:02x}")).join(":")
 }
 
 /// The state a device starts from, as [`SavedState::recover`] found it.
@@ -194,9 +230,11 @@ impl SavedState {
         Recovered { state, intact: false, problem: Some(problem) }
     }
 
-    pub fn from_state(state: &State, factory_name: &str) -> Self {
+    /// The state of a device as it is saved: `state`, the device's shared
+    /// state, and its claim of the name it announces on `info`'s interface.
+    pub fn from_state(state: &State, info: &DeviceInfo) -> Self {
         Self {
-            name: (state.name != factory_name).then(|| state.name.clone()),
+            name: (state.name != info.factory_name).then(|| state.name.clone()),
             tx_names: state.tx_names.clone(),
             rx_names: state.rx_names.clone(),
             subscriptions: state
@@ -213,7 +251,26 @@ impl SavedState {
                 .collect(),
             latency_ns: state.latency_override_ns,
             lock_remote_settings: state.remote_settings_lock_set,
+            claim: state
+                .announced
+                .as_ref()
+                .map(|name| SavedClaim { name: name.clone(), mac: mac_text(info.iface.mac) }),
         }
+    }
+
+    /// The device name [`SavedState::claim`] says the device holds on the
+    /// network, if it claimed it on `iface`: this computer's interface, so
+    /// that a device starting from this state can announce the name again
+    /// without probing for it. `None` on another computer (a copy of the
+    /// state file on a cloned disk) or on another interface, whose MAC
+    /// address differs. An interface without a MAC address (all zeros)
+    /// cannot tell computers apart, unless it is loopback, which no other
+    /// computer hears.
+    pub fn claimed_name(&self, iface: &Interface) -> Option<&str> {
+        let claim = self.claim.as_ref()?;
+        let identifies_computer = iface.mac != [0; 6] || iface.ip.is_loopback();
+        let here = claim.mac.eq_ignore_ascii_case(&mac_text(iface.mac));
+        (identifies_computer && here).then_some(claim.name.as_str())
     }
 
     /// The receive and transmit channel names of a device whose own ones
@@ -346,7 +403,7 @@ pub async fn run(shared: Arc<Shared>, path: PathBuf, on_disk: Option<SavedState>
     let mut watch = shared.watch();
     let mut last = on_disk;
     loop {
-        let saved = SavedState::from_state(&shared.state(), &shared.info.factory_name);
+        let saved = SavedState::from_state(&shared.state(), &shared.info);
         if last.as_ref() != Some(&saved) {
             let (s, p) = (shared.clone(), path.clone());
             // A durable save waits for the disk, up to tens of
@@ -365,7 +422,7 @@ pub async fn run(shared: Arc<Shared>, path: PathBuf, on_disk: Option<SavedState>
 pub fn save(shared: &Shared, path: &Path) -> Option<SavedState> {
     let _lock = save_lock();
     // Taken under the lock: whichever save comes last writes the newest.
-    let saved = SavedState::from_state(&shared.state(), &shared.info.factory_name);
+    let saved = SavedState::from_state(&shared.state(), &shared.info);
     // Unchanged: a durable save would only wait for the disk.
     if matches!(read(path), Ok(Some(ref on_disk)) if *on_disk == saved) {
         return Some(saved);
@@ -432,6 +489,7 @@ mod tests {
             }],
             latency_ns: Some(2_000_000),
             lock_remote_settings: Some(true),
+            claim: Some(SavedClaim { name: "studio".into(), mac: "00:1d:c1:52:79:b6".into() }),
         };
         saved.save(&path).unwrap();
         assert_eq!(SavedState::load(&path), Some(saved.clone()));
@@ -458,6 +516,65 @@ mod tests {
             (vec!["Vox".into(), "02".into(), "03".into()], vec!["L".into(), "R".into()])
         );
         assert_eq!(SavedState::default().channel_names(&own(2), &own(1)), (own(2), own(1)));
+    }
+
+    fn interface(ip: [u8; 4], mac: [u8; 6]) -> Interface {
+        Interface {
+            name: "en7".into(),
+            ip: ip.into(),
+            netmask: std::net::Ipv4Addr::new(255, 255, 0, 0),
+            gateway: std::net::Ipv4Addr::UNSPECIFIED,
+            mac,
+            link_speed_mbps: 1000,
+        }
+    }
+
+    fn claim(name: &str, mac: &str) -> SavedState {
+        SavedState {
+            claim: Some(SavedClaim { name: name.into(), mac: mac.into() }),
+            ..Default::default()
+        }
+    }
+
+    /// A claim holds on the computer, and the interface, it was made on: a
+    /// new process there announces the name without probing for it.
+    #[test]
+    fn a_claim_holds_where_it_was_made() {
+        let mac = [0x00, 0x1d, 0xc1, 0x52, 0x79, 0xb6];
+        let saved = claim("vox", "00:1d:c1:52:79:b6");
+        assert_eq!(saved.claimed_name(&interface([169, 254, 3, 4], mac)), Some("vox"));
+        // A new address on the same interface, and capitals written by hand.
+        assert_eq!(saved.claimed_name(&interface([10, 0, 0, 9], mac)), Some("vox"));
+        let upper = claim("vox", "00:1D:C1:52:79:B6");
+        assert_eq!(upper.claimed_name(&interface([10, 0, 0, 9], mac)), Some("vox"));
+        // Another computer (a cloned disk), or another interface: probed for.
+        let other = [0x00, 0x1d, 0xc1, 0x08, 0x12, 0x58];
+        assert_eq!(saved.claimed_name(&interface([169, 254, 3, 4], other)), None);
+        // No claim saved, as before claims were.
+        assert_eq!(SavedState::default().claimed_name(&interface([169, 254, 3, 4], mac)), None);
+        // Without a MAC address only loopback, which no other computer
+        // hears, tells this computer from another.
+        let none = claim("vox", "00:00:00:00:00:00");
+        assert_eq!(none.claimed_name(&interface([127, 0, 0, 1], [0; 6])), Some("vox"));
+        assert_eq!(none.claimed_name(&interface([169, 254, 3, 4], [0; 6])), None);
+    }
+
+    /// State files from before claims were saved, or with a claim edited by
+    /// hand, are read as they are: no claim, nothing damaged.
+    #[test]
+    fn a_missing_or_partial_claim_is_no_claim() {
+        let dir = dir("claim-compat");
+        let path = dir.join("state.toml");
+        let loopback = interface([127, 0, 0, 1], [0; 6]);
+        std::fs::write(&path, "name = \"vox\"\ntx_names = []\nsubscriptions = []\n").unwrap();
+        let r = SavedState::recover(&path);
+        assert_eq!(r.problem, None);
+        assert_eq!(r.state, SavedState { name: Some("vox".into()), ..Default::default() });
+        std::fs::write(&path, "name = \"vox\"\n\n[claim]\nname = \"vox\"\n").unwrap();
+        let r = SavedState::recover(&path);
+        assert_eq!(r.problem, None);
+        assert_eq!(r.state.claimed_name(&loopback), None);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

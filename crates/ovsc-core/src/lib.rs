@@ -35,7 +35,7 @@ pub use device::{
 };
 pub use info::DeviceInfo;
 pub use mdns::NameConflict;
-pub use persist::SavedState;
+pub use persist::{SavedClaim, SavedState};
 pub use state::{FormatRequest, RemoteChange, RemoteChanges};
 
 /// Errors of the device engine.
