@@ -1000,10 +1000,26 @@ backend = "coreaudio"
         assert_eq!(r.rx.len(), 2);
         assert_eq!(r.rx[1].subscription, Some(("lead".into(), "stagebox".into())));
         assert_eq!(r.clock.state, ClockState::FreeRunning);
-        // The other daemons' tracker: nothing wrong with a fresh device.
+        // The other daemons' tracker: nothing wrong with a fresh device,
+        // except that a process without the privilege for real-time
+        // scheduling (an unprivileged Linux CI runner) gets a transmit
+        // thread that is not real-time, once that thread has started.
+        let realtime = std::thread::spawn(|| {
+            ovsc_core::rt::raise_priority("test", ovsc_core::rt::RtClass::Transmit)
+        })
+        .join()
+        .unwrap();
+        if !realtime {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !device.stats().tx_not_realtime {
+                assert!(Instant::now() < deadline, "the transmit thread did not start");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
         let mut health = Health::new();
         watch_device(&mut health, &cfg, &device, &clock, Duration::from_secs(3));
-        assert_eq!(health.summary(), "healthy");
+        let expected = if realtime { "healthy" } else { "warnings: transmit thread not real-time" };
+        assert_eq!(health.summary(), expected);
         device.shutdown().await;
     }
 
