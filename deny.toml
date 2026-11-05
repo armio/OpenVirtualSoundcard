@@ -9,6 +9,15 @@ ignore = [
     # paste is unmaintained, not vulnerable: a compile-time macro that
     # netdev's Linux netlink crates use.
     { id = "RUSTSEC-2024-0436", reason = "unmaintained compile-time macro, via netdev" },
+    # zvariant, zvariant_derive and zbus_names are unmaintained, not
+    # vulnerable, with no upgrade yet. The app's lockfile has them through
+    # accesskit_unix, eframe's Linux accessibility backend, which no build
+    # compiles: the macOS build enables `accesskit` but accesskit_unix is
+    # only for other Unixes, and the Linux development build leaves
+    # `accesskit` off. cargo-deny unifies features across targets.
+    { id = "RUSTSEC-2026-0370", reason = "unmaintained zvariant, via accesskit_unix, compiled by no build" },
+    { id = "RUSTSEC-2026-0371", reason = "unmaintained zbus_names, via accesskit_unix, compiled by no build" },
+    { id = "RUSTSEC-2026-0372", reason = "unmaintained zvariant_derive, via accesskit_unix, compiled by no build" },
 ]
 
 [licenses]
