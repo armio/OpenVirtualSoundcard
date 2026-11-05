@@ -29,6 +29,7 @@ use ovsc_core::{Device, SavedState, StartOptions};
 use ovsc_soundcard::{Bridge, BridgeConfig, BridgeStats};
 
 use crate::config::{self, AppConfig, BackendKind, ClockSource};
+use crate::control::{self, Health};
 use crate::coreaudio::{RETRY_FIRST, next_retry_delay};
 use crate::netwatch::{self, Verdict};
 use crate::supervise::Supervision;
@@ -46,7 +47,7 @@ pub async fn run(cfg: AppConfig, sup: Supervision, stop: &mut impl Stop) -> anyh
         }
     };
     loop {
-        let next = run_engine(&engine, &mut audio, sup, stop).await;
+        let next = run_engine(&cfg, &engine, &mut audio, sup, stop).await;
         audio.stop();
         let next = match next {
             Ok(next) => next,
@@ -110,14 +111,21 @@ enum Next {
 }
 
 /// Runs until a stop, a new latency or an interface change, supervising
-/// the audio backend and logging the status every 30 s. A fault is an
-/// error.
+/// the audio backend, following the device's health and logging the
+/// status every 30 s. A fault is an error.
 async fn run_engine(
+    cfg: &AppConfig,
     engine: &Engine,
     audio: &mut Audio,
     sup: Supervision,
     stop: &mut impl Stop,
 ) -> anyhow::Result<Next> {
+    // Each run follows a start or a restart: the device's counters start
+    // over, and so does the clock's age, which only tells the tracker that
+    // the clock has to be seen locked again (it is at once, if it is).
+    let started = Instant::now();
+    let mut health = Health::new();
+    health.restarted(started);
     let mut status = tokio::time::interval(Duration::from_secs(30));
     status.tick().await;
     let mut second = tokio::time::interval(Duration::from_secs(1));
@@ -136,7 +144,11 @@ async fn run_engine(
             r = stop.requested() => return Ok(Next::Stop(r?)),
             _ = status.tick() => {
                 let network = netwatch::status_note(watch.as_ref());
-                info!("{}{network}", status_line(&engine.device, &engine.clock));
+                info!(
+                    "{}{network}; {}",
+                    status_line(&engine.device, &engine.clock),
+                    health.summary()
+                );
                 audio.log_status();
             }
             _ = second.tick() => {
@@ -144,6 +156,13 @@ async fn run_engine(
                 if let Some(fault) = sup.fault(Some(&engine.device)) {
                     anyhow::bail!("{fault}: shutting down");
                 }
+                control::watch_device(
+                    &mut health,
+                    cfg,
+                    &engine.device,
+                    &engine.clock,
+                    started.elapsed(),
+                );
                 if let Some(w) = &mut watch {
                     if let Verdict::Restart(why) = w.poll(sup.probe, &engine.clock) {
                         warn!("{why}: restarting the network engine");

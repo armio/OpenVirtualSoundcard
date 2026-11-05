@@ -1,9 +1,13 @@
 //! The daemon's control socket ([`ovsc_control`]): the status the
-//! OpenVirtualSoundcard app shows and the settings it changes.
+//! OpenVirtualSoundcard app shows and the settings it changes, and the
+//! health tracker behind the status's warnings ([`health`]).
+
+mod health;
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, bail};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -11,7 +15,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
-use ovsc_clock::{ClockState, MediaClock};
+use ovsc_clock::{ClockState, MediaClock, local_now_ns};
 use ovsc_control::{
     self as ctl, ClockInfo, DeviceStatus, DriverInfo, InterfaceInfo, PacketCounts, Request,
     Response, Restart, RxChannelStatus, Settings, SettingsChange, Status, TxFlowStatus,
@@ -22,10 +26,14 @@ use ovsc_hal_server::HalStatus;
 use ovsc_proto::arc::SubscriptionStatus;
 use ovsc_proto::discovery::validate_device_name;
 
+pub use self::health::Health;
+use self::health::{Assessment, EngineReading, Reading};
 use crate::config::{AppConfig, ClockSource};
 
-/// How long the clock may take to lock before the app is told why it may not.
-const LOCK_WARNING_AFTER: Duration = Duration::from_secs(20);
+/// How long a controller's change stays a warning. After that it is listed
+/// in [`Status::earlier`]: a change made at sound check is no news at the
+/// end of the show.
+const RECENT_CHANGE: Duration = Duration::from_secs(600);
 
 /// A request from a control connection, and where its answer goes.
 pub struct Call {
@@ -160,6 +168,83 @@ pub struct View<'a> {
     pub hal: HalStatus,
     /// Why the engine does not run.
     pub engine_error: Option<&'a str>,
+    /// The daemon's health tracker, which keeps the recent readings. `None`
+    /// judges the current reading alone: states, but no counter rises.
+    pub health: Option<&'a Mutex<Health>>,
+}
+
+/// The health tracker, also after a panic while it was held: it only
+/// keeps readings.
+fn lock(health: &Mutex<Health>) -> MutexGuard<'_, Health> {
+    health.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Takes a reading for the health tracker and logs the warnings that
+/// appeared or cleared. The daemon calls it every second, so that the
+/// health is followed and logged whether or not the app asks.
+pub fn watch(view: &View<'_>) {
+    let Some(health) = view.health else { return };
+    let mut h = lock(health);
+    let now = Instant::now();
+    let a = h.observe(now, &reading(view));
+    h.log(now, &a.warnings);
+}
+
+/// The health in a few words, for the daemon's status line: `healthy`, or
+/// the warnings of the last reading.
+pub fn health_summary(health: &Mutex<Health>) -> String {
+    lock(health).summary()
+}
+
+/// The engine (re)started: its counters start over, and its first seconds
+/// do not count.
+pub fn restarted(health: &Mutex<Health>) {
+    lock(health).restarted(Instant::now());
+}
+
+/// [`watch`] for the daemons of the other backends, which have no Core
+/// Audio driver: the device's and clock's health only. `clock_age` is how
+/// long `clock` has run.
+pub fn watch_device(
+    health: &mut Health,
+    cfg: &AppConfig,
+    device: &Device,
+    clock: &MediaClock,
+    clock_age: Duration,
+) {
+    let now = Instant::now();
+    let reading =
+        Reading { hal: None, engine: Some(engine_reading(cfg, device, clock, clock_age)) };
+    let a = health.observe(now, &reading);
+    health.log(now, &a.warnings);
+}
+
+/// What the health tracker reads from `view`.
+fn reading(view: &View<'_>) -> Reading {
+    Reading {
+        hal: Some(view.hal),
+        engine: view.engine.map(|(d, clock, age)| engine_reading(view.cfg, d, clock, age)),
+    }
+}
+
+fn engine_reading(
+    cfg: &AppConfig,
+    d: &Device,
+    clock: &MediaClock,
+    clock_age: Duration,
+) -> EngineReading {
+    EngineReading {
+        stats: d.stats(),
+        clock: clock.status(),
+        ptp: cfg.clock.source == ClockSource::Ptp,
+        clock_age,
+        local_ns: local_now_ns(),
+        latency_ms: d.info().latency_ns as f64 / 1e6,
+        interface: d.info().iface.name.clone(),
+        rx: d.rx_channels(),
+        stopped_part: d.stopped_part(),
+        name_conflict: d.name_conflict(),
+    }
 }
 
 /// Answers `call`.
@@ -197,43 +282,45 @@ fn status(view: &View<'_>) -> Status {
             freq_offset_ppm: 0.0,
         },
     };
-    let hal = &view.hal;
-    let driver = DriverInfo {
-        connected: hal.peers > 0,
-        io_running: hal.io_clients > 0,
-        audio_flowing: hal.gate,
-        detail: hal.to_string(),
+    let reading = reading(view);
+    let now = Instant::now();
+    let health = match view.health {
+        Some(h) => lock(h).observe(now, &reading),
+        None => Health::new().observe(now, &reading),
     };
+    let hal = &view.hal;
+    let connected = hal.peers > 0;
+    let driver = driver_info(hal, &health);
+
+    // The urgent first: audio is down now in at least one direction.
     let mut warnings = Vec::new();
-    if !driver.connected {
+    if !connected {
         warnings.push(
-            "Core Audio has not loaded the OpenVirtualSoundcard driver. Restart Core Audio with \
-             `sudo killall coreaudiod`, or reinstall OpenVirtualSoundcard."
+            "Core Audio has not loaded the OpenVirtualSoundcard driver, so the device is \
+             missing. Restart Core Audio with `sudo killall coreaudiod`, or reinstall \
+             OpenVirtualSoundcard."
                 .into(),
         );
     }
+    let (urgent, other): (Vec<_>, Vec<_>) = health.warnings.into_iter().partition(|w| w.urgent);
+    warnings.extend(urgent.into_iter().map(|w| w.text));
+    let urgent_warnings = warnings.len();
     if let Some(problem) = view.engine.and_then(|(d, _, _)| d.saved_state_problem()) {
         warnings.push(format!(
             "The saved names and subscriptions could not be read at start: {problem}. Check \
              the subscriptions in Dante Controller."
         ));
     }
-    if let Some((d, _, running)) = view.engine {
-        if !clock.locked && cfg.clock.source == ClockSource::Ptp && running > LOCK_WARNING_AFTER {
-            warnings.push(format!(
-                "The clock has not locked: no Dante clock leader is reaching this Mac on {}. \
-                 Check the cable and the interface, and see \"The clock does not lock\" in \
-                 docs/MACOS.md.",
-                d.info().iface.name
-            ));
-        }
-        let now = SystemTime::now();
-        let locked = d.remote_settings_locked();
-        // Newest first: the change that explains a dropout is usually the
-        // last one.
-        for c in d.remote_changes().recent().iter().rev() {
-            warnings.push(remote_change_words(c, now, locked));
-        }
+    warnings.extend(other.into_iter().map(|w| w.text));
+    let mut earlier = Vec::new();
+    if let Some((d, _, _)) = view.engine {
+        let (recent, older) = remote_changes_words(
+            &d.remote_changes().recent(),
+            SystemTime::now(),
+            d.remote_settings_locked(),
+        );
+        warnings.extend(recent);
+        earlier = older;
     }
     Status {
         protocol: ctl::PROTOCOL_VERSION,
@@ -244,7 +331,45 @@ fn status(view: &View<'_>) -> Status {
         clock,
         driver,
         warnings,
+        urgent_warnings,
+        earlier,
     }
+}
+
+/// The driver as the app shows it, judged by the health tracker: audio
+/// does not flow through a failed driver, nor while Core Audio has stopped
+/// calling it, whatever the gate says.
+fn driver_info(hal: &HalStatus, health: &Assessment) -> DriverInfo {
+    let flowing = hal.gate && !health.driver_failed && !health.io_stalled;
+    DriverInfo {
+        connected: hal.peers > 0,
+        io_running: hal.io_clients > 0,
+        audio_flowing: flowing,
+        faulted: health.driver_failed,
+        audio_trouble: flowing && health.audible(),
+        detail: hal.to_string(),
+    }
+}
+
+/// Controllers' `changes` (oldest first, as kept) in words, newest first:
+/// those of the last [`RECENT_CHANGE`] as warnings, the older ones apart.
+/// The newest come first because the change that explains a dropout is
+/// usually the last one. A change from the future (the clock set back)
+/// counts as recent.
+fn remote_changes_words(
+    changes: &[RemoteChange],
+    now: SystemTime,
+    locked: bool,
+) -> (Vec<String>, Vec<String>) {
+    let (mut recent, mut older) = (Vec::new(), Vec::new());
+    for c in changes.iter().rev() {
+        let words = remote_change_words(c, now, locked);
+        match now.duration_since(c.at) {
+            Ok(ago) if ago >= RECENT_CHANGE => older.push(words),
+            _ => recent.push(words),
+        }
+    }
+    (recent, older)
 }
 
 /// A controller's change, or refused attempt, as a warning for the app:
@@ -308,9 +433,12 @@ fn clock_source(cfg: &AppConfig) -> &'static str {
 
 fn clock_info(cfg: &AppConfig, clock: &MediaClock) -> ClockInfo {
     let s = clock.status();
+    // Without a leader, a clock that runs on until a deadline holds over:
+    // audio still flows, for now (MACOS.md, "Clock states and silence").
+    let holdover = s.master.is_none() && s.holdover_until_ns.is_some();
     ClockInfo {
         source: clock_source(cfg).into(),
-        state: format!("{:?}", s.state),
+        state: if holdover { "Holdover".to_owned() } else { format!("{:?}", s.state) },
         locked: matches!(s.state, ClockState::Locked | ClockState::FreeRunning),
         leader: s.master.map(|m| m.addr.to_string()),
         offset_ns: s.offset_ns,
@@ -358,6 +486,7 @@ fn device_status(d: &Device) -> DeviceStatus {
             tx_underruns: stats.tx_underruns,
             rx: stats.rx_packets,
             rx_late: stats.rx_late_packets,
+            rx_lost: stats.rx_lost_packets,
         },
         remote_settings_locked: d.remote_settings_locked(),
     }
@@ -709,6 +838,155 @@ backend = "coreaudio"
             remote_change_words(&local, later(60), true)
                 .starts_with("A controller on this Mac tried to change")
         );
+    }
+
+    #[test]
+    fn controllers_changes_age_out_of_the_warnings() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let change = |ago: u64, what: &str| RemoteChange {
+            at: now - Duration::from_secs(ago),
+            from: "192.168.1.20:51000".parse().unwrap(),
+            what: what.into(),
+            refused: false,
+        };
+        // Oldest first, as the device keeps them; one from the future.
+        let changes = [
+            change(3_600, "the name to a"),
+            change(601, "the name to b"),
+            change(599, "the receive latency to 2 ms"),
+            RemoteChange { at: now + Duration::from_secs(5), ..change(0, "the name to c") },
+        ];
+        let (recent, older) = remote_changes_words(&changes, now, false);
+        let has = |list: &[String], what: &str| list.iter().any(|w| w.contains(what));
+        assert_eq!((recent.len(), older.len()), (2, 2));
+        // Newest first in both.
+        assert!(recent[0].contains("the name to c") && recent[1].contains("latency to 2 ms"));
+        assert!(older[0].contains("the name to b 10 min ago"), "{older:?}");
+        assert!(has(&older, "the name to a 1 h 0 min ago"));
+    }
+
+    fn view_with<'a>(cfg: &'a AppConfig, hal: HalStatus, health: &'a Mutex<Health>) -> View<'a> {
+        View { cfg, config_path: None, engine: None, hal, engine_error: None, health: Some(health) }
+    }
+
+    /// A driver connected, with an application doing IO through an open gate.
+    fn playing() -> HalStatus {
+        HalStatus {
+            peers: 1,
+            engine_running: true,
+            io_clients: 1,
+            gate: true,
+            min_output_margin: 40,
+            min_input_margin: 40,
+            io_heartbeat_age: Some(Duration::from_millis(1)),
+            plugin_instance: 3,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_failed_driver_is_not_flowing_and_says_how_to_recover() {
+        let cfg: AppConfig = toml::from_str(CONFIG).unwrap();
+        let failed = HalStatus { faulted: true, ..playing() };
+        // Without a tracker's history: the state alone says it.
+        let unused = Mutex::default();
+        let view = View { health: None, ..view_with(&cfg, failed, &unused) };
+        let s = status(&view);
+        // The gate is open, but nothing flows through a failed driver.
+        assert!(view.hal.gate);
+        assert!(s.driver.faulted && !s.driver.audio_flowing && !s.driver.audio_trouble);
+        assert_eq!(s.urgent_warnings, 1);
+        assert!(s.warnings[0].contains("`sudo killall coreaudiod`"), "{:?}", s.warnings);
+        // The detail still carries the raw status line.
+        assert!(s.driver.detail.ends_with("faulted=1"), "{}", s.driver.detail);
+    }
+
+    #[test]
+    fn a_closed_gate_while_an_application_plays_is_urgent() {
+        let cfg: AppConfig = toml::from_str(CONFIG).unwrap();
+        let health = Mutex::new(Health::new());
+        let closed = HalStatus { gate: false, ..playing() };
+        // The tracker saw the gate close five seconds ago.
+        let before = Instant::now().checked_sub(Duration::from_secs(5)).unwrap();
+        let view = view_with(&cfg, closed, &health);
+        lock(&health).observe(before, &reading(&view));
+        let s = status(&view);
+        assert!(!s.driver.audio_flowing && !s.driver.faulted && s.driver.io_running);
+        assert_eq!(s.urgent_warnings, 1);
+        assert!(s.warnings[0].contains("holds the audio back"), "{:?}", s.warnings);
+        assert!(s.warnings[0].contains("network engine is not running"), "{:?}", s.warnings);
+    }
+
+    #[test]
+    fn rising_driver_counters_make_flowing_audio_troubled() {
+        let cfg: AppConfig = toml::from_str(CONFIG).unwrap();
+        let health = Mutex::new(Health::new());
+        let now = Instant::now();
+        let ago = |s| now.checked_sub(Duration::from_secs(s)).unwrap();
+        // IO started 25 s ago and ran clean until 20 s ago.
+        lock(&health).observe(ago(25), &reading(&view_with(&cfg, playing(), &health)));
+        lock(&health).observe(ago(20), &reading(&view_with(&cfg, playing(), &health)));
+        let late = HalStatus { late_output_cycles: 3, min_output_margin: -12, ..playing() };
+        let s = status(&view_with(&cfg, late, &health));
+        assert!(s.driver.audio_flowing && s.driver.audio_trouble);
+        assert_eq!(s.urgent_warnings, 0);
+        assert!(
+            s.warnings[0].starts_with("3 output cycles from the application came too late"),
+            "{:?}",
+            s.warnings
+        );
+        assert!(s.warnings[0].contains("-12 frames"), "{:?}", s.warnings);
+        // The daemon's second tick logs it and the status line lists it.
+        watch(&view_with(&cfg, late, &health));
+        assert_eq!(health_summary(&health), "warnings: 3 late output cycles");
+        // Thirty seconds after the rise, it has cleared.
+        let mut h = lock(&health);
+        let a = h.observe(now + Duration::from_secs(31), &reading(&view_with(&cfg, late, &health)));
+        assert!(a.warnings.is_empty(), "{a:?}");
+    }
+
+    #[tokio::test]
+    async fn a_running_device_is_read_for_the_tracker() {
+        use ovsc_core::{Channels, DeviceConfig, Ports};
+
+        let base = 24886;
+        let config = DeviceConfig {
+            name: "health-dev".into(),
+            interface: "127.0.0.1".into(),
+            tx_channels: Channels::Count(2),
+            rx_channels: Channels::Count(2),
+            latency_ms: 2.0,
+            ports: Ports { arc: base, cmc: base + 1, flow_control: base + 2, settings: base + 3 },
+            discovery: false,
+            process_id: 64,
+            ..Default::default()
+        };
+        let clock = ovsc_clock::free_running_clock();
+        let device = Device::start(config, clock.clone()).await.unwrap();
+        device.subscribe(2, "lead", "stagebox").unwrap();
+        let mut cfg: AppConfig = toml::from_str(CONFIG).unwrap();
+        cfg.clock.source = ClockSource::Free;
+        let r = engine_reading(&cfg, &device, &clock, Duration::from_secs(3));
+        assert!(!r.ptp && r.stopped_part.is_none() && r.name_conflict.is_none());
+        assert_eq!((r.interface.as_str(), r.latency_ms, r.clock_age.as_secs()), ("lo", 2.0, 3));
+        assert_eq!(r.rx.len(), 2);
+        assert_eq!(r.rx[1].subscription, Some(("lead".into(), "stagebox".into())));
+        assert_eq!(r.clock.state, ClockState::FreeRunning);
+        // The other daemons' tracker: nothing wrong with a fresh device.
+        let mut health = Health::new();
+        watch_device(&mut health, &cfg, &device, &clock, Duration::from_secs(3));
+        assert_eq!(health.summary(), "healthy");
+        device.shutdown().await;
+    }
+
+    #[test]
+    fn a_missing_driver_is_urgent() {
+        let cfg: AppConfig = toml::from_str(CONFIG).unwrap();
+        let s = status(&view_with(&cfg, HalStatus::default(), &Mutex::default()));
+        assert!(!s.driver.connected && !s.driver.faulted);
+        assert_eq!(s.urgent_warnings, 1);
+        assert!(s.warnings[0].starts_with("Core Audio has not loaded"), "{:?}", s.warnings);
+        assert!(s.earlier.is_empty());
     }
 
     #[test]

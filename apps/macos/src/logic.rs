@@ -756,6 +756,8 @@ mod tests {
             connected,
             io_running: false,
             audio_flowing,
+            faulted: false,
+            audio_trouble: false,
             detail: String::new(),
         };
         assert_eq!(driver_light(&driver(true, false)).0, Light::Green);

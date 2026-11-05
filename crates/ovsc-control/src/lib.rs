@@ -110,8 +110,20 @@ pub struct Status {
     pub device: Option<DeviceStatus>,
     pub clock: ClockInfo,
     pub driver: DriverInfo,
-    /// Problems worth showing, in plain words.
+    /// Problems worth showing, in plain words, the most urgent first. Those
+    /// about counters (lost packets, late cycles) cover the last 30 s: each
+    /// stays for 30 s after its counter last rose.
     pub warnings: Vec<String>,
+    /// How many of [`Status::warnings`], from the first, mean that audio is
+    /// down now in at least one direction (a failed driver, a closed gate
+    /// while an application plays, a stopped transmit engine, a lost
+    /// clock): the app shows them in red. 0 from a daemon before it.
+    #[serde(default)]
+    pub urgent_warnings: usize,
+    /// Older news, no longer a warning but worth a look in the details:
+    /// controllers' changes more than 10 minutes ago, newest first.
+    #[serde(default)]
+    pub earlier: Vec<String>,
 }
 
 /// The running Dante device.
@@ -171,6 +183,10 @@ pub struct PacketCounts {
     pub rx: u64,
     /// Packets that arrived after their play-out time.
     pub rx_late: u64,
+    /// Packets missing from received flows (gaps in their timestamps). 0
+    /// from a daemon before it.
+    #[serde(default)]
+    pub rx_lost: u64,
 }
 
 /// The media clock.
@@ -199,8 +215,21 @@ pub struct DriverInfo {
     pub connected: bool,
     /// Whether an application is playing or recording through the device.
     pub io_running: bool,
-    /// Whether audio may flow: the driver's gate is open.
+    /// Whether audio may flow: the driver's gate is open, the driver has not
+    /// failed ([`DriverInfo::faulted`]) and, while an application plays or
+    /// records, Core Audio keeps calling it. True with no application too:
+    /// audio would flow.
     pub audio_flowing: bool,
+    /// Whether the driver caught a panic and went silent: every input and
+    /// output stays silent until Core Audio restarts (`sudo killall
+    /// coreaudiod`). False from a daemon before it.
+    #[serde(default)]
+    pub faulted: bool,
+    /// Whether audio flows but had audible problems in the last 30 s
+    /// (dropouts, late or lost packets, slips): [`Status::warnings`] says
+    /// which. False from a daemon before it.
+    #[serde(default)]
+    pub audio_trouble: bool,
     /// The driver's status line, for diagnostics.
     pub detail: String,
 }
@@ -391,6 +420,36 @@ mod tests {
             encode_line(&lock),
             "{\"op\":\"apply\",\"change\":{\"lock_remote_settings\":true}}\n"
         );
+    }
+
+    #[test]
+    fn the_health_fields_are_optional_on_the_wire() {
+        // A daemon from before them: no urgent warnings, no earlier news,
+        // a driver that has not failed and no trouble.
+        let old = r#"{"result":"status","protocol":1,"version":"0.1.0","engine_running":true,
+            "engine_error":null,"device":null,
+            "clock":{"source":"ptp","state":"Locked","locked":true,"leader":null,
+                "offset_ns":0,"path_delay_ns":0,"freq_offset_ppm":0.0},
+            "driver":{"connected":true,"io_running":true,"audio_flowing":true,"detail":""},
+            "warnings":["w"]}"#
+            .replace('\n', " ");
+        let Response::Status(s) = decode_line(&old).unwrap() else { panic!("no status") };
+        assert_eq!((s.urgent_warnings, s.earlier.len()), (0, 0));
+        assert!(!s.driver.faulted && !s.driver.audio_trouble);
+        let counts: PacketCounts =
+            decode_line(r#"{"tx":1,"tx_underruns":2,"rx":3,"rx_late":4}"#).unwrap();
+        assert_eq!(counts.rx_lost, 0);
+
+        // A newer daemon's status reads back whole, and its new fields are
+        // extra keys that an older app's decoder skips.
+        let mut new = *s;
+        new.urgent_warnings = 1;
+        new.earlier = vec!["e".into()];
+        new.driver.faulted = true;
+        new.driver.audio_flowing = false;
+        let line = encode_line(&Response::Status(Box::new(new.clone())));
+        assert_eq!(decode_line::<Response>(&line).unwrap(), Response::Status(Box::new(new)));
+        assert!(line.contains("\"urgent_warnings\":1") && line.contains("\"faulted\":true"));
     }
 
     #[test]

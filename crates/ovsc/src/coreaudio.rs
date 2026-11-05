@@ -26,7 +26,7 @@
 //! start a fresh one.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -42,7 +42,7 @@ use ovsc_hal_server::{EngineInfo, HalRegion, HalServer, ShmClockMirror};
 use ovsc_ipc::transport::ServerTransport;
 
 use crate::config::{self, AppConfig, ClockSource};
-use crate::control::{self, Control};
+use crate::control::{self, Control, Health};
 use crate::netwatch::{self, Verdict};
 use crate::supervise::Supervision;
 use crate::{ClockStateLog, Stop, StopSignals, status_line};
@@ -159,6 +159,7 @@ async fn serve(
     };
     let mut status = StatusTimer::new(log_every);
     let mut control = Control::listen(&cfg.coreaudio.control_socket);
+    let health = Mutex::new(Health::new());
     let mut ctx = Ctx {
         cfg: &cfg,
         config_path: config_path.as_deref(),
@@ -167,6 +168,7 @@ async fn serve(
         listener: &mut listener,
         status: &mut status,
         control: &mut control,
+        health: &health,
         sup,
     };
 
@@ -183,6 +185,7 @@ async fn serve(
         }
     };
     server.engine_started(&engine.device);
+    control::restarted(&health);
     let result = loop {
         match run_engine(&engine, &mut ctx, stop).await {
             Ok(Next::RestartDevice) => {
@@ -206,6 +209,7 @@ async fn serve(
                     }
                 };
                 server.engine_started(&engine.device);
+                control::restarted(&health);
             }
             Ok(Next::RestartEngine) => {
                 // The driver keeps the region and its configuration; it
@@ -221,6 +225,7 @@ async fn serve(
                     }
                 };
                 server.engine_started(&engine.device);
+                control::restarted(&health);
             }
             Ok(next) => {
                 log_next(&next);
@@ -274,10 +279,30 @@ struct Ctx<'a> {
     listener: &'a mut ListenerCheck,
     status: &'a mut StatusTimer,
     control: &'a mut Control,
+    /// Turns the counters into warnings for the app and the log.
+    health: &'a Mutex<Health>,
     sup: Supervision,
 }
 
 impl Ctx<'_> {
+    /// The engine as a control call or the health tracker sees it.
+    fn view<'v>(&'v self, engine: Option<&'v Engine>, error: Option<&'v str>) -> control::View<'v> {
+        control::View {
+            cfg: self.cfg,
+            config_path: self.config_path,
+            engine: engine.map(|e| (&e.device, &e.clock, e.started.elapsed())),
+            hal: self.server.status(),
+            engine_error: error,
+            health: Some(self.health),
+        }
+    }
+
+    /// Feeds the health tracker, which logs warnings as they appear and
+    /// clear; every second.
+    fn watch(&self, engine: Option<&Engine>) {
+        control::watch(&self.view(engine, None));
+    }
+
     /// Why the daemon must restart, if it must: a panic, a part of the
     /// running `engine`'s device, or the driver heartbeat, that stopped.
     fn fault(&self, engine: Option<&Engine>) -> Option<String> {
@@ -288,26 +313,13 @@ impl Ctx<'_> {
 
     /// Answers a control call; whether the daemon must restart.
     fn answer(&self, call: control::Call, engine: Option<&Engine>, error: &str) -> bool {
-        let view = control::View {
-            cfg: self.cfg,
-            config_path: self.config_path,
-            engine: engine.map(|e| (&e.device, &e.clock, e.started.elapsed())),
-            hal: self.server.status(),
-            engine_error: Some(error),
-        };
-        control::answer(call, &view) == control::After::RestartDaemon
+        control::answer(call, &self.view(engine, Some(error))) == control::After::RestartDaemon
     }
 
     /// Saves a sample rate or bit depth that a controller asked for;
     /// whether the daemon must restart to apply it.
     fn apply_format(&self, engine: &Engine, request: FormatRequest) -> bool {
-        let view = control::View {
-            cfg: self.cfg,
-            config_path: self.config_path,
-            engine: Some((&engine.device, &engine.clock, engine.started.elapsed())),
-            hal: self.server.status(),
-            engine_error: None,
-        };
+        let view = self.view(Some(engine), None);
         let change = SettingsChange {
             sample_rate: request.sample_rate.filter(|&r| r != self.cfg.device.sample_rate),
             bits_per_sample: request
@@ -373,10 +385,12 @@ async fn start_engine(
                     if let Some(fault) = ctx.fault(None) {
                         anyhow::bail!("{fault}: restarting the daemon");
                     }
+                    ctx.watch(None);
                 }
                 () = ctx.status.tick() => {
                     info!(
-                        "engine not running: {last_error} (attempts: {attempts}); hal: {}",
+                        "engine not running: {last_error} (attempts: {attempts}); {}; hal: {}",
+                        control::health_summary(ctx.health),
                         ctx.server.status()
                     );
                 }
@@ -422,8 +436,9 @@ async fn run_engine(
             () = ctx.status.tick() => {
                 let network = netwatch::status_note(watch.as_ref());
                 info!(
-                    "{}{network}; hal: {}",
+                    "{}{network}; {}; hal: {}",
                     status_line(&engine.device, &engine.clock),
+                    control::health_summary(ctx.health),
                     ctx.server.status()
                 );
             }
@@ -433,6 +448,7 @@ async fn run_engine(
                 if let Some(fault) = ctx.fault(Some(engine)) {
                     anyhow::bail!("{fault}: restarting the daemon");
                 }
+                ctx.watch(Some(engine));
                 if let Some(w) = &mut watch {
                     if let Verdict::Restart(why) = w.poll(ctx.sup.probe, &engine.clock) {
                         warn!("{why}: restarting the network engine");
@@ -1166,6 +1182,48 @@ mod tests {
         assert!(engine.device.remote_settings_locked());
         assert_eq!(engine.device.saved_state().subscriptions.len(), 1);
         engine.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_driver_turns_the_apps_audio_red() {
+        let dir = std::env::temp_dir().join(format!("ovsc-ca-health-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let socket = dir.join("control.sock");
+        let mut cfg = app_config("127.0.0.1", 24876);
+        cfg.coreaudio.control_socket = socket.to_str().unwrap().into();
+        let registry = MemRegistry::new();
+        let (stop_tx, mut stop) = mpsc::unbounded_channel();
+        let daemon = serve(cfg, None, service(&registry), quiet(), &mut stop);
+        let app = async {
+            let (_client, received, w) = attach(&registry).await;
+            let (_mapped, view) = map(&w);
+            let running =
+                || view.daemon().flags.load(Ordering::Acquire) & DAEMON_ENGINE_RUNNING != 0;
+            wait_for("the engine", running).await;
+            // The driver does IO through an open gate, as its threads would
+            // write it into the region.
+            let p = view.plugin();
+            p.plugin_instance.store(hello().instance, Ordering::Relaxed);
+            p.io_clients.store(1, Ordering::Relaxed);
+            p.gate.store(1, Ordering::Relaxed);
+            p.io_heartbeat_ns.store(ovsc_clock::local_now_ns(), Ordering::Relaxed);
+            let s = status(&socket).await;
+            assert!(s.driver.audio_flowing && !s.driver.faulted, "{:?}", s.driver);
+            assert_eq!(s.urgent_warnings, 0, "{:?}", s.warnings);
+
+            // It catches a panic: silent, whatever its gate says.
+            p.faulted.store(1, Ordering::Relaxed);
+            let s = status(&socket).await;
+            assert!(!s.driver.audio_flowing && s.driver.faulted, "{:?}", s.driver);
+            assert_eq!(s.urgent_warnings, 1, "{:?}", s.warnings);
+            assert!(s.warnings[0].contains("sudo killall coreaudiod"), "{:?}", s.warnings);
+
+            stop_tx.send("test").unwrap();
+            wait_for("the bye", || received.got_bye()).await;
+        };
+        let (result, ()) = tokio::join!(daemon, app);
+        result.unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
