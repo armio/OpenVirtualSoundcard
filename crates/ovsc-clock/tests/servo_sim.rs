@@ -247,6 +247,104 @@ fn locks_to_slow_master() {
     }
 }
 
+/// Runs the servo until `lose_after` past its first lock, then holds over
+/// for 30 s and returns the largest |clock - master| during the holdover,
+/// ns.
+fn holdover_error(
+    seed: u64,
+    drift_ppm: f64,
+    kind: JitterKind,
+    lose_after: u64,
+    config: ServoConfig,
+) -> i64 {
+    let master = Master { rate: 1.0 + drift_ppm * 1e-6 };
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut jitter = Jitter { rng: StdRng::seed_from_u64(seed ^ 0x5eed), kind, outlier_prob: 0.03 };
+    let path_delay = 60 * US;
+    let mut servo = Servo::new(config);
+    let mut sync_sent = START;
+    let mut next_delay_req = START + 300 * MS;
+    let mut lose_at = u64::MAX;
+    while sync_sent < lose_at {
+        let t1 = master.media_at(sync_sent);
+        let t2 = sync_sent + path_delay + jitter.sample();
+        let now = t2 + 20 * US;
+        servo.sync(t1, t2, now);
+        if servo.state() == ServoState::Locked && lose_at == u64::MAX {
+            lose_at = now + lose_after;
+        }
+        let next_sync = sync_sent + rng.random_range(125 * MS..=250 * MS);
+        while next_delay_req < next_sync {
+            let t3 = next_delay_req;
+            let arrival = t3 + jitter.sample() / 4 + path_delay;
+            let t4 = master.media_at(arrival + jitter.sample());
+            servo.delay_measurement(t1, t2, t3, t4);
+            let interval = if servo.wants_fast_delay_requests() { 250 * MS } else { SEC };
+            next_delay_req += (rng.random_range(0.75..1.25) * interval as f64) as u64;
+        }
+        sync_sent = next_sync;
+    }
+    let snap = servo.enter_holdover(lose_at).unwrap();
+    (0..=30)
+        .map(|s| {
+            let t = lose_at + s * SEC;
+            (snap.media_ns_at(t) as i64 - master.media_at(t) as i64).abs()
+        })
+        .max()
+        .unwrap()
+}
+
+/// Finding clock#3: a master lost a few seconds after lock. Holdover runs at
+/// the frequency estimate, which the frequency fit has by then refined over
+/// a baseline of several seconds; with jittery software timestamps 30 s of
+/// it stay within a few hundred microseconds. (Averages of the published
+/// rate, tried as an alternative, do worse: see `holdover_sweep`.)
+#[test]
+fn holdover_soon_after_lock_stays_close() {
+    let mut errs: Vec<(i64, u64)> = Vec::new();
+    for seed in 0..40 {
+        for (drift, kind) in [(40.0, JitterKind::Uniform), (-75.0, JitterKind::Exponential)] {
+            errs.push((holdover_error(seed, drift, kind, 4 * SEC, ServoConfig::default()), seed));
+        }
+    }
+    errs.sort();
+    let (p90, worst) = (errs[errs.len() * 9 / 10], errs[errs.len() - 1]);
+    eprintln!(
+        "holdover error p90 {} us, worst {} us (seed {})",
+        p90.0 / 1000,
+        worst.0 / 1000,
+        worst.1
+    );
+    // Most holdovers stay inside the 250 us within which the master is
+    // rejoined without a step (servo::ServoConfig::rejoin_step_threshold_ns).
+    // The driver follows the daemon's holdover either way.
+    assert!(p90.0 < 250 * US as i64, "holdover error p90 {} ns", p90.0);
+    assert!(worst.0 < 750 * US as i64, "holdover error {} ns in seed {}", worst.0, worst.1);
+}
+
+/// Holdover errors after losing the master at various times after lock:
+/// `cargo test -p ovsc-clock --release --test servo_sim holdover_sweep -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn holdover_sweep() {
+    for lose_after in [0, 4 * SEC, 10 * SEC, 30 * SEC] {
+        let mut errs: Vec<i64> = (0..200)
+            .flat_map(|seed| {
+                [(40.0, JitterKind::Uniform), (-75.0, JitterKind::Exponential)]
+                    .map(|(d, k)| holdover_error(seed, d, k, lose_after, config_from_env()))
+            })
+            .collect();
+        errs.sort();
+        println!(
+            "lost {:2} s after lock: p50 {:5.0} us, p90 {:5.0} us, max {:5.0} us",
+            lose_after / SEC,
+            errs[errs.len() / 2] as f64 / 1e3,
+            errs[errs.len() * 9 / 10] as f64 / 1e3,
+            errs[errs.len() - 1] as f64 / 1e3,
+        );
+    }
+}
+
 /// Worst cases over many seeds; for tuning:
 /// `cargo test -p ovsc-clock --release --test servo_sim sweep -- --ignored --nocapture`.
 #[test]

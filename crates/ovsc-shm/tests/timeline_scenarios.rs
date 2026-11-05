@@ -401,6 +401,84 @@ fn locking_and_unlocked_inputs_are_ignored() {
 }
 
 #[test]
+fn the_followed_clock_is_followed_while_it_relocks_and_holds_over() {
+    // The daemon's clock keeps its step_gen through everything the servo
+    // does short of a step: losing lock and slewing back (its correction is
+    // capped at 100 ppm), a new master whose time agrees, and holdover. The
+    // timeline keeps following it, so the gate never closes and nothing
+    // slips (finding driver#1: a leader change used to silence the device
+    // for the whole re-lock, and a re-lock to slip the audio).
+    let mut sim = Sim::new(48_000, 21);
+    let mut d = Daemon::locked(48_000, 45.0);
+    sim.run_until(START + 30 * SEC, Some(&d));
+    let st0 = sim.status();
+    assert_eq!(st0.regime, Regime::Following);
+    let open = |sim: &Sim, d: &Daemon| sim.tl.gate(sim.now, Some(&d.input(sim.now)));
+
+    // Lost lock: Locking, slewing at the capped 100 ppm one way, then back.
+    d.state = ClockState::Locking;
+    let mut worst = 0.0f64;
+    for (ppm, until) in [(145.0, 33), (-55.0, 36), (45.0, 40)] {
+        d.set_rate(sim.now, ppm);
+        while sim.now < START + until * SEC {
+            sim.step(Some(&d));
+            assert!(open(&sim, &d), "{ppm} ppm at {}", sim.now);
+            worst = worst.max(sim.error(&d).abs());
+        }
+    }
+    // A sudden rate change c leaves the timeline about c^2 / (2 x 200 ppm/s)
+    // behind: 25 us for 100 ppm, 100 us for the 200 ppm reversal, well
+    // inside the 250 us (12 frames) coherence window.
+    assert!(worst < 6.0, "{worst} frames");
+    // Locked again: nothing to realign.
+    d.state = ClockState::Locked;
+    sim.run_until(START + 45 * SEC, Some(&d));
+    assert_eq!((sim.status().absorbs, sim.status().regime), (st0.absorbs, Regime::Following));
+
+    // The master goes away: the daemon holds over at a rate 20 ppm off what
+    // it ran at, for 30 s. Holding over on its own rate the timeline would
+    // drift 250 us from it in 12.5 s; following it, it never does.
+    d.state = ClockState::Unlocked;
+    d.set_rate(sim.now, 65.0);
+    let lost = sim.now;
+    while sim.now < lost + 30 * SEC {
+        sim.step(Some(&d));
+        assert!(open(&sim, &d), "holdover at {}", sim.now - lost);
+        assert!(sim.error(&d).abs() < 2.0, "{}", sim.error(&d));
+    }
+    // A new master whose time agrees, then locked.
+    d.state = ClockState::Locking;
+    d.set_rate(sim.now, 45.0);
+    sim.run_until(lost + 33 * SEC, Some(&d));
+    d.state = ClockState::Locked;
+    sim.run_until(lost + 40 * SEC, Some(&d));
+    let st = sim.status();
+    assert_eq!((st.absorbs, st.seed_bumps, st.regime), (st0.absorbs, 0, Regime::Following));
+    assert!(open(&sim, &d));
+    let knots = sim.knots_between(1, START + 10 * SEC, sim.now);
+    let dev = max_second_difference(&knots);
+    assert!(dev < 30.0, "{dev} us");
+
+    // A new master whose time differs: the servo steps, which changes the
+    // key. That clock is shut out while it locks, then absorbed once.
+    d.state = ClockState::Locking;
+    d.step(sim.now, 10 * MS as i64);
+    let stepped = sim.now;
+    while sim.now < stepped + 2 * SEC {
+        sim.step(Some(&d));
+        assert!(!open(&sim, &d));
+    }
+    assert_eq!(sim.status().regime, Regime::Holdover);
+    d.state = ClockState::Locked;
+    sim.step(Some(&d));
+    assert!(open(&sim, &d));
+    sim.run_until(stepped + 10 * SEC, Some(&d));
+    let st = sim.status();
+    assert_eq!((st.absorbs, st.seed_bumps, st.regime), (st0.absorbs + 1, 0, Regime::Following));
+    assert!(sim.error(&d).abs() < 0.5);
+}
+
+#[test]
 fn a_stale_heartbeat_holds_over_and_a_new_generation_is_absorbed() {
     let mut sim = Sim::new(48_000, 5);
     let d = Daemon::locked(48_000, 60.0);
@@ -693,21 +771,33 @@ fn the_gate_needs_a_live_coherent_daemon() {
         x.snapshot.rate = rate;
         assert!(!gate(&x), "{rate}");
     }
-    // Whatever the daemon's state, as long as the clocks agree.
+    // Whatever the daemon's state, as long as the clocks agree. The clock
+    // the timeline follows is followed in any state, since its key would
+    // have changed had it jumped: re-locking, and the daemon's holdover.
     let mut x = d;
     x.state = ClockState::Locking;
     assert!(gate(&x));
     sim.step(Some(&x));
-    assert_eq!(sim.status().regime, Regime::Holdover);
+    assert_eq!(sim.status().regime, Regime::Following);
     assert!(sim.tl.gate(sim.now, Some(&x.input(sim.now))));
+    let mut held = x;
+    held.state = ClockState::Unlocked;
+    sim.step(Some(&held));
+    assert_eq!(sim.status().regime, Regime::Following);
+    assert!(sim.tl.gate(sim.now, Some(&held.input(sim.now))));
 
-    // In holdover, only the clock held over: not a step of it, and not a
-    // new daemon still locking, however close (a CI run saw one land 3
-    // frames away, then step when it locked).
-    let now = sim.now;
+    // Only that clock: not a step of it, and not a new daemon still
+    // locking, however close (a CI run saw one land 3 frames away, then
+    // step when it locked). The timeline holds over the clock it follows,
+    // and the gate stays open for that one.
     let mut stepped = x;
     stepped.step_gen += 1;
+    assert!(!sim.tl.gate(sim.now, Some(&stepped.input(sim.now))));
+    sim.step(Some(&stepped));
+    assert_eq!(sim.status().regime, Regime::Holdover);
+    let now = sim.now;
     assert!(!sim.tl.gate(now, Some(&stepped.input(now))));
+    assert!(sim.tl.gate(now, Some(&x.input(now))));
     let mut fresh = x;
     fresh.generation += 1;
     fresh.step_gen = 1;
