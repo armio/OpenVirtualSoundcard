@@ -17,7 +17,7 @@ use crate::kernel::HALF;
 use crate::rt;
 use crate::sample::DeviceSample;
 use crate::stats::{DirectionStats, StatsCell};
-use crate::stream::{Capture, Playout};
+use crate::stream::{Capture, Playout, transmit_lead};
 use crate::{Error, Result};
 
 /// Default extra safety margin, milliseconds.
@@ -53,7 +53,10 @@ pub struct BridgeConfig {
     pub input_map: Option<Vec<Option<usize>>>,
     /// Extra safety margin between the device streams and the network's
     /// edge, in milliseconds (default 1 ms). It absorbs callback jitter;
-    /// raise it if [`DirectionStats::underruns`] keeps growing.
+    /// raise it if [`DirectionStats::underruns`] (or the transmitter's
+    /// underruns in the daemon's status line) keep growing. Capture keeps
+    /// the transmitter's packet lead on top of it, computed for the default
+    /// `tx_guard_us` of 500 µs; a smaller guard needs a larger margin.
     pub margin_ms: Option<f64>,
 }
 
@@ -201,7 +204,10 @@ fn open_input(
     let sinks = map.iter().map(|m| m.map(|i| io.tx[i].clone())).collect();
     let stats = Arc::new(StatsCell::new());
     let bits = io.format.bits() as u32;
-    let capture = Capture::new(io.sample_rate, bits, sinks, margin, stats.clone());
+    // AudioIo doesn't carry the transmit guard; the default is what nearly
+    // every configuration uses.
+    let lead = transmit_lead(io.sample_rate, ovsc_core::DeviceConfig::default().tx_guard_us);
+    let capture = Capture::new(io.sample_rate, bits, sinks, margin, lead, stats.clone());
     let config = stream_config(io, &choice);
     let clock = io.clock.clone();
     let s = stats.clone();
@@ -216,12 +222,14 @@ fn open_input(
     let stream = built.map_err(|e| Error::audio(format!("{name}: cannot open input stream"), e))?;
     stream.play().map_err(|e| Error::audio(format!("{name}: cannot start input stream"), e))?;
     info!(
-        "capturing {} from {name:?}: {} channels {} at {} Hz, buffer {}",
+        "capturing {} from {name:?}: {} channels {} at {} Hz, buffer {}; latency: one buffer + \
+         {:.2} ms + device input",
         describe_map(&map, &io.tx_names, false),
         choice.channels,
         choice.format,
         io.sample_rate,
         describe_buffer(&choice),
+        (HALF as u64 + margin + lead) as f64 * 1000.0 / io.sample_rate as f64,
     );
     Ok(Half { stream, stats, device: name, channels: choice.channels, format: choice.format })
 }

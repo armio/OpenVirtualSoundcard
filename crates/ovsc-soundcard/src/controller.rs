@@ -54,13 +54,28 @@
 //!   rides out the burst of back-to-back callbacks most backends issue when
 //!   a stream starts, and lets the loop start from the *average* callback
 //!   timing instead of a single jittery reading.
-//! * **Realignment.** A running loop gives up and settles again if the raw
-//!   error exceeds the jump limit (≈ 50 ms: start-up, a stall, a media-clock
-//!   step), or if it stays on the side where audio gets lost (playback
-//!   reading samples that haven't arrived, capture writing samples after
-//!   they were sent) for 50 ms. Isolated late callbacks never trigger this.
-//!   If the loop was locked, its frequency estimate survives, so it relocks
-//!   within seconds.
+//! * **Jumps.** A running loop does not slew large errors: at ±1000 ppm it
+//!   would take a second per millisecond of error. Instead the stream jumps
+//!   back onto its target ([`Steer::shift`], without a mute; the stream fades
+//!   out and in around it):
+//!   - when the stream is losing audio (playback reading samples that
+//!     haven't arrived, capture writing samples after they were sent) and
+//!     three callbacks in a row agree on how far off it is (a device gap,
+//!     an xrun, early callbacks), or at once if the stream announced a step
+//!     ([`DriftController::expect_step`]: a reported xrun, a larger
+//!     callback). Late callbacks, alone or catching up, never cause a jump;
+//!   - after 50 ms on the other side, when the stream has fallen further
+//!     behind (playback) or ahead (capture) than one callback plus the
+//!     margin: a stall or a media-clock step, whose backlog would otherwise
+//!     add latency for tens of seconds;
+//!   - at once for an error beyond the jump limit (≈ 50 ms) once locked.
+//!
+//!   The jump moves by the smallest of the errors that triggered it (late
+//!   callbacks only ever add to the error), and the frequency estimate and
+//!   lock survive it. Errors beyond the limits feed the loop clamped to the
+//!   limit, so a discontinuity cannot wind up the integrator.
+//! * **Realignment.** Without a trustworthy frequency estimate (not locked
+//!   yet), an error beyond the jump limit resets the loop and settles again.
 //!
 //! The controller is pure and deterministic: it only sees the errors and
 //! frame counts it is given, which is how the tests at the bottom of this
@@ -88,10 +103,13 @@ const SETTLE_SECONDS: f64 = 0.1;
 const SETTLE_CALLBACKS: u32 = 8;
 /// A filtered error beyond this (seconds) widens the loop again.
 const REACQUIRE: f64 = 500e-6;
-/// The raw error must stay on the unsafe side for this long (seconds) and
-/// this many callbacks before the controller realigns.
-const UNSAFE_SECONDS: f64 = 0.05;
-const UNSAFE_CALLBACKS: u32 = 3;
+/// The raw error must stay beyond a limit for this long (seconds) and this
+/// many callbacks before the controller jumps...
+const PERSIST_SECONDS: f64 = 0.05;
+const PERSIST_CALLBACKS: u32 = 3;
+/// ...unless the stream is losing audio and this many callbacks in a row
+/// agree on the error.
+const AGREE_CALLBACKS: u32 = 3;
 /// The loop counts as locked once the filtered error has stayed within this
 /// many seconds (of media time) for `LOCK_HOLD_SECONDS`.
 const LOCK_TOLERANCE: f64 = 100e-6;
@@ -114,20 +132,44 @@ impl Steer {
     }
 }
 
-/// When the controller gives up tracking and realigns. All values are in
-/// media samples and positive.
+/// A side of the target a stream's position can be on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    /// `target - position < 0`.
+    Ahead,
+    /// `target - position > 0`.
+    Behind,
+}
+
+/// When the controller stops slewing and jumps or realigns. All distances
+/// are in media samples and positive.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Limits {
-    /// Largest raw error (either sign) the loop tries to pull in.
+    /// Largest raw error (either sign) the loop handles without starting
+    /// over (once locked: without jumping at once).
     pub jump: f64,
     /// Largest persistent error with the position *ahead* of its target
-    /// (`target - position < -ahead`). For playback this is the safety
-    /// margin: further ahead, it reads samples that haven't arrived.
+    /// (`target - position < -ahead`) left to the loop. For playback this
+    /// is the safety margin: further ahead, it reads samples that haven't
+    /// arrived.
     pub ahead: f64,
     /// Largest persistent error with the position *behind* its target
-    /// (`target - position > behind`). For capture this is the safety
-    /// margin: further behind, it writes samples after they were sent.
+    /// (`target - position > behind`) left to the loop. For capture this is
+    /// the safety margin: further behind, it writes samples after they were
+    /// sent.
     pub behind: f64,
+    /// The side on which the stream loses audio: [`Side::Ahead`] for
+    /// playback, [`Side::Behind`] for capture.
+    pub lossy: Side,
+}
+
+impl Limits {
+    fn on(&self, side: Side) -> f64 {
+        match side {
+            Side::Ahead => self.ahead,
+            Side::Behind => self.behind,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -139,6 +181,20 @@ enum Phase {
 }
 
 const SETTLING: Phase = Phase::Settling { frames: 0, callbacks: 0, sum: 0.0, count: 0 };
+
+/// Consecutive callbacks whose raw error lay beyond the limit on one side.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Excursion {
+    side: Side,
+    /// Device time spent beyond the limit, seconds.
+    time: f64,
+    callbacks: u32,
+    /// The smallest raw error seen: late callbacks only ever add to the
+    /// error, so this is the best estimate of how far off the stream is.
+    min: f64,
+    /// The raw errors of the previous two callbacks, newest first.
+    recent: [f64; 2],
+}
 
 /// Steers a stream's resampling ratio so that its position tracks a target
 /// on the media timeline. See the [module documentation](self).
@@ -155,8 +211,9 @@ pub struct DriftController {
     ratio: f64,
     locked: bool,
     in_tolerance: f64,
-    unsafe_time: f64,
-    unsafe_callbacks: u32,
+    excursion: Option<Excursion>,
+    /// The stream announced a step: trust the next error beyond a limit.
+    expect_step: bool,
     realigns: u64,
 }
 
@@ -174,19 +231,44 @@ impl DriftController {
             ratio: 1.0,
             locked: false,
             in_tolerance: 0.0,
-            unsafe_time: 0.0,
-            unsafe_callbacks: 0,
+            excursion: None,
+            expect_step: false,
             realigns: 0,
         }
+    }
+
+    /// Replaces the limits, e.g. when the callback size changes.
+    pub fn set_limits(&mut self, limits: Limits) {
+        self.limits = limits;
+    }
+
+    /// The limits in effect.
+    pub fn limits(&self) -> Limits {
+        self.limits
+    }
+
+    /// Announces that the stream's timing has just stepped (the device
+    /// reported an xrun, the target moved): if the next error is beyond a
+    /// limit, jump at once instead of waiting for a second callback to
+    /// confirm it.
+    pub fn expect_step(&mut self) {
+        self.expect_step = true;
     }
 
     /// Feeds one callback: `error` is `target - position` in media samples,
     /// measured at the start of the callback, and `frames` the number of
     /// device frames the callback processes.
     pub fn update(&mut self, error: f64, frames: usize) -> Steer {
+        let expect_step = std::mem::take(&mut self.expect_step);
         let dt = frames as f64 / self.rate;
-        if !error.is_finite() || error.abs() > self.limits.jump {
+        if !error.is_finite() {
             return self.realign(error);
+        }
+        if error.abs() > self.limits.jump {
+            // A long stall or a media-clock step. A locked loop knows the
+            // clocks' ratio, so the stream can carry on from the new
+            // position at once; otherwise start over.
+            return if self.locked { self.jump(error) } else { self.realign(error) };
         }
         let settle_frames = SETTLE_SECONDS * self.rate;
         let mut time = match &mut self.phase {
@@ -218,17 +300,13 @@ impl DriftController {
             Phase::Running { time } => *time,
         };
 
-        // Persistently on the side where audio gets lost: give up.
-        if error < -self.limits.ahead || error > self.limits.behind {
-            self.unsafe_time += dt;
-            self.unsafe_callbacks += 1;
-            if self.unsafe_time >= UNSAFE_SECONDS && self.unsafe_callbacks >= UNSAFE_CALLBACKS {
-                return self.realign(error);
-            }
-        } else {
-            self.unsafe_time = 0.0;
-            self.unsafe_callbacks = 0;
+        if let Some(shift) = self.excursion(error, frames, expect_step) {
+            return self.jump(shift);
         }
+        // Beyond a limit the loop sees the error clamped to that limit: it
+        // keeps pushing in the right direction, but a discontinuity that is
+        // about to be jumped over can't wind up the integrator.
+        let error = error.clamp(-self.limits.ahead, self.limits.behind);
 
         let a = 1.0 - (-dt * FILTER_RATIO * bandwidth(time)).exp();
         self.lp1 += a * (error - self.lp1);
@@ -271,10 +349,65 @@ impl DriftController {
         Steer { shift: 0.0, ratio: self.ratio, mute: false }
     }
 
+    /// Tracks runs of callbacks beyond a limit and decides when the stream
+    /// should jump, and by how much.
+    fn excursion(&mut self, error: f64, frames: usize, expect_step: bool) -> Option<f64> {
+        let side = if error < -self.limits.ahead {
+            Side::Ahead
+        } else if error > self.limits.behind {
+            Side::Behind
+        } else {
+            self.excursion = None;
+            return None;
+        };
+        if expect_step {
+            return Some(error);
+        }
+        let mut x = match self.excursion {
+            Some(x) if x.side == side => x,
+            _ => Excursion { side, time: 0.0, callbacks: 0, min: error, recent: [error; 2] },
+        };
+        let [previous, before] = x.recent;
+        x.time += frames as f64 / self.rate;
+        x.callbacks += 1;
+        x.min = x.min.min(error);
+        x.recent = [error, previous];
+        self.excursion = Some(x);
+        // Losing audio: as soon as three callbacks in a row agree on how far
+        // off the stream is, it is a step, not jitter. Late callbacks are
+        // rarely late three times running, and the back-to-back callbacks
+        // that catch up after one change the error by a whole callback
+        // each, hence the tolerance of half a callback.
+        let tolerance = self.limits.on(side).min(frames as f64 / 2.0);
+        let (lo, hi) = (error.min(previous).min(before), error.max(previous).max(before));
+        if side == self.limits.lossy && x.callbacks >= AGREE_CALLBACKS && hi - lo <= tolerance {
+            return Some(lo);
+        }
+        if x.time >= PERSIST_SECONDS && x.callbacks >= PERSIST_CALLBACKS {
+            return Some(x.min);
+        }
+        None
+    }
+
+    /// Moves the stream by `shift` onto its target without settling: the
+    /// frequency estimate (and lock) stay, the filters restart from zero.
+    fn jump(&mut self, shift: f64) -> Steer {
+        self.realigns += 1;
+        self.excursion = None;
+        self.lp1 = 0.0;
+        self.lp2 = 0.0;
+        self.ratio = 1.0 + self.integral;
+        Steer { shift, ratio: self.ratio, mute: false }
+    }
+
     /// Forgets the phase and goes back to settling: the stream realigns and
-    /// stays muted for a moment. Call when the media clock disappears or the
-    /// stream's timing changes.
+    /// stays muted for a moment. Call when the media clock disappears.
+    /// Calling it again while waiting to settle changes nothing, so a locked
+    /// loop's frequency estimate survives a clock outage of any length.
     pub fn reset(&mut self) {
+        if self.phase == SETTLING {
+            return;
+        }
         if self.running() {
             self.realigns += 1;
         }
@@ -287,8 +420,8 @@ impl DriftController {
         self.ratio = 1.0 + self.integral;
         self.locked = false;
         self.in_tolerance = 0.0;
-        self.unsafe_time = 0.0;
-        self.unsafe_callbacks = 0;
+        self.excursion = None;
+        self.expect_step = false;
     }
 
     /// Resets and treats this callback as the first one of the new settling
@@ -320,8 +453,9 @@ impl DriftController {
         matches!(self.phase, Phase::Running { .. })
     }
 
-    /// How many times the loop lost track and had to realign after it had
-    /// started running.
+    /// How many times the stream jumped or realigned after it had started
+    /// running: each is a short fade out and in (or, before the loop
+    /// locked, a settling mute).
     pub fn realigns(&self) -> u64 {
         self.realigns
     }
@@ -342,8 +476,25 @@ mod tests {
 
     const RATE: f64 = 48_000.0;
 
-    fn limits() -> Limits {
-        Limits { jump: 0.05 * RATE, ahead: 0.001 * RATE, behind: 0.05 * RATE }
+    /// The margin of the simulated streams, samples (1 ms).
+    const MARGIN: f64 = 0.001 * RATE;
+
+    /// Playback-style limits for callbacks of `period` frames: losing audio
+    /// ahead of the target, a callback plus the margin of slack behind it.
+    fn limits(period: usize) -> Limits {
+        let jump = 0.05 * RATE;
+        Limits {
+            jump,
+            ahead: MARGIN,
+            behind: (period as f64 + MARGIN).min(jump),
+            lossy: Side::Ahead,
+        }
+    }
+
+    /// The mirror image, for capture.
+    fn capture_limits(period: usize) -> Limits {
+        let Limits { jump, ahead, behind, .. } = limits(period);
+        Limits { jump, ahead: behind, behind: ahead, lossy: Side::Behind }
     }
 
     /// Small deterministic PRNG (SplitMix64) for reproducible jitter.
@@ -367,12 +518,99 @@ mod tests {
         locked: bool,
     }
 
-    /// Simulates a playback stream whose device clock runs `drift_ppm` fast
+    /// A simulation: a stream whose device clock runs `drift_ppm` fast
     /// relative to media time. Callbacks of `period` frames are measured
     /// late by a uniformly distributed delay in `[0, jitter)` seconds (one
     /// in a hundred three times that); the first `burst` callbacks arrive
     /// back to back. `clock_step` (time, samples) shifts the media clock
-    /// once.
+    /// once; `gap` (time, frames) makes the device lose that many frames
+    /// (an xrun), so that every later callback comes that much later, once
+    /// or, with `gap_every`, every that many seconds from then on.
+    #[derive(Clone, Copy)]
+    struct Sim {
+        drift_ppm: f64,
+        period: usize,
+        jitter: f64,
+        seconds: f64,
+        burst: usize,
+        clock_step: Option<(f64, f64)>,
+        gap: Option<(f64, usize)>,
+        gap_every: Option<f64>,
+        limits: Limits,
+    }
+
+    impl Sim {
+        fn new(drift_ppm: f64, period: usize, jitter: f64, seconds: f64) -> Self {
+            Sim {
+                drift_ppm,
+                period,
+                jitter,
+                seconds,
+                burst: 3,
+                clock_step: None,
+                gap: None,
+                gap_every: None,
+                limits: limits(period),
+            }
+        }
+
+        fn run(self) -> (DriftController, Vec<Step>) {
+            let Sim {
+                drift_ppm,
+                period,
+                jitter,
+                seconds,
+                burst,
+                clock_step,
+                gap,
+                gap_every,
+                limits,
+            } = self;
+            let mut c = DriftController::new(RATE, limits);
+            let mut rng = Rng(drift_ppm.to_bits() ^ period as u64);
+            let device_rate = RATE * (1.0 + drift_ppm * 1e-6);
+            let origin = 1.0e9; // arbitrary media-time origin, samples
+            let mut pos = 0.0f64;
+            let mut trace = Vec::new();
+            let callbacks = (seconds * device_rate / period as f64) as usize;
+            for i in 0..callbacks {
+                // When the device asks for callback i, in seconds of media
+                // time.
+                let mut due = (i.saturating_sub(burst) * period) as f64 / device_rate;
+                if let Some((at, frames)) = gap
+                    && due >= at
+                {
+                    let gaps = gap_every.map_or(1.0, |every| ((due - at) / every).floor() + 1.0);
+                    due += gaps * frames as f64 / device_rate;
+                }
+                let mut late = rng.next_f64() * jitter;
+                if rng.next_f64() < 0.01 {
+                    late *= 3.0;
+                }
+                let t = due + late;
+                let mut now = origin + t * RATE;
+                if let Some((at, step)) = clock_step
+                    && t >= at
+                {
+                    now += step;
+                }
+                let target = now - 192.0 - 400.0;
+                let raw_error = target - pos;
+                let steer = c.update(raw_error, period);
+                pos += steer.shift + steer.ratio * period as f64;
+                trace.push(Step {
+                    time: t,
+                    steer,
+                    error: c.error(),
+                    raw_error,
+                    locked: c.locked(),
+                });
+            }
+            (c, trace)
+        }
+    }
+
+    /// A playback simulation without gaps.
     fn simulate(
         drift_ppm: f64,
         period: usize,
@@ -381,34 +619,7 @@ mod tests {
         burst: usize,
         clock_step: Option<(f64, f64)>,
     ) -> (DriftController, Vec<Step>) {
-        let mut c = DriftController::new(RATE, limits());
-        let mut rng = Rng(drift_ppm.to_bits() ^ period as u64);
-        let device_rate = RATE * (1.0 + drift_ppm * 1e-6);
-        let origin = 1.0e9; // arbitrary media-time origin, samples
-        let mut pos = 0.0f64;
-        let mut trace = Vec::new();
-        let callbacks = (seconds * device_rate / period as f64) as usize;
-        for i in 0..callbacks {
-            // When the device asks for callback i, in seconds of media time.
-            let due = (i.saturating_sub(burst) * period) as f64 / device_rate;
-            let mut late = rng.next_f64() * jitter;
-            if rng.next_f64() < 0.01 {
-                late *= 3.0;
-            }
-            let t = due + late;
-            let mut now = origin + t * RATE;
-            if let Some((at, step)) = clock_step
-                && t >= at
-            {
-                now += step;
-            }
-            let target = now - 192.0 - 400.0;
-            let raw_error = target - pos;
-            let steer = c.update(raw_error, period);
-            pos += steer.shift + steer.ratio * period as f64;
-            trace.push(Step { time: t, steer, error: c.error(), raw_error, locked: c.locked() });
-        }
-        (c, trace)
+        Sim { burst, clock_step, ..Sim::new(drift_ppm, period, jitter, seconds) }.run()
     }
 
     fn ppm(ratio: f64) -> f64 {
@@ -538,34 +749,159 @@ mod tests {
         assert!((ppm(c.ratio()) - 900.81).abs() < 2.0, "{}", ppm(c.ratio()));
     }
 
+    /// The first discontinuity after `from` seconds, if any.
+    fn first_jump(trace: &[Step], from: f64) -> Option<&Step> {
+        trace.iter().find(|s| s.time >= from && s.steer.is_discontinuous())
+    }
+
+    /// Mean raw error of the callbacks in `[from, to)`.
+    fn mean_error(trace: &[Step], from: f64, to: f64) -> f64 {
+        let errors: Vec<f64> =
+            trace.iter().filter(|s| s.time >= from && s.time < to).map(|s| s.raw_error).collect();
+        errors.iter().sum::<f64>() / errors.len() as f64
+    }
+
+    /// Checks that after a disturbance at `at`, the stream jumped exactly
+    /// once, without muting, within `within` seconds, stayed locked, and
+    /// was back where it was before (on average, jitter included) half a
+    /// second later.
+    fn check_one_jump(c: &DriftController, trace: &[Step], at: f64, within: f64) {
+        assert_eq!(c.realigns(), 1);
+        assert!(trace.iter().filter(|s| s.time > 1.0).all(|s| !s.steer.mute), "muted");
+        let jump = first_jump(trace, 1.0).expect("never jumped");
+        let delay = jump.time - at;
+        assert!((0.0..within).contains(&delay), "jumped after {delay:.4} s");
+        let lock = trace.iter().position(|s| s.locked).unwrap();
+        assert!(trace[lock..].iter().all(|s| s.locked), "lost lock");
+        let before = mean_error(trace, at - 2.0, at);
+        let after = mean_error(trace, at + 0.5, at + 2.5);
+        assert!(
+            (after - before).abs() < MARGIN / 2.0,
+            "error {before:.1} before, {after:.1} after"
+        );
+    }
+
     #[test]
-    fn clock_step_realigns_and_relocks_quickly() {
+    fn clock_step_jumps_once_locked() {
+        // 200 ms: far beyond what the loop pulls in. Locked, the stream
+        // jumps at once and keeps its frequency estimate and lock.
         let (c, trace) = simulate(30.0, 256, 0.5e-3, 90.0, 3, Some((60.0, 0.2 * RATE)));
+        check_one_jump(&c, &trace, 60.0, 0.006);
+        assert!((first_jump(&trace, 1.0).unwrap().steer.shift - 0.2 * RATE).abs() < MARGIN);
+    }
+
+    #[test]
+    fn clock_step_before_lock_settles_again() {
+        let (c, trace) = simulate(30.0, 256, 0.5e-3, 30.0, 3, Some((1.0, 0.2 * RATE)));
         assert_eq!(c.realigns(), 1);
-        let jump = trace.iter().position(|s| s.time >= 60.0).unwrap();
-        assert!(trace[jump].steer.mute);
-        assert!(trace[..jump].iter().filter(|s| s.time > 1.0).all(|s| !s.steer.mute));
-        // The frequency estimate survived: relocked within a few seconds.
-        let relock = trace[jump..].iter().find(|s| s.locked).expect("no relock");
-        assert!(relock.time < 66.0, "relocked at {:.1} s", relock.time);
+        let at = trace.iter().position(|s| s.time >= 1.0).unwrap();
+        assert!(trace[at].steer.mute);
         assert!(trace.last().unwrap().locked);
     }
 
     #[test]
-    fn backwards_step_on_unsafe_side_realigns_promptly() {
+    fn backwards_step_on_lossy_side_jumps_promptly() {
         // A 5 ms step back puts playback 5 ms ahead of what has arrived:
-        // beyond the 1 ms margin, so the controller realigns at once.
+        // beyond the 1 ms margin. Three callbacks confirm it; the stream
+        // jumps back without muting.
         let (c, trace) = simulate(30.0, 256, 0.5e-3, 60.0, 3, Some((40.0, -0.005 * RATE)));
-        assert_eq!(c.realigns(), 1);
-        let at = trace.iter().position(|s| s.steer.mute && s.time > 1.0).unwrap();
-        let delay = trace[at].time - 40.0;
-        assert!((0.0..0.1).contains(&delay), "realigned after {delay:.3} s");
-        assert!(trace.last().unwrap().locked);
+        check_one_jump(&c, &trace, 40.0, 3.0 * 256.0 / RATE + 1e-3);
     }
 
     #[test]
-    fn small_forward_step_is_pulled_in_without_realigning() {
-        // 2 ms behind is on the safe side for playback: slew, don't mute.
+    fn capture_gap_jumps_within_three_callbacks() {
+        // A capture stream whose device loses one 128-frame buffer: from
+        // then on it is 128 samples behind, writing audio after it was
+        // sent. It must not wait 50 ms, nor settle for 100 ms.
+        for period in [64, 128, 256] {
+            let sim = Sim {
+                gap: Some((20.0, 128)),
+                limits: capture_limits(period),
+                ..Sim::new(30.0, period, 0.3e-3, 40.0)
+            };
+            let (c, trace) = sim.run();
+            // The callbacks after the gap come 128 frames late; the third
+            // confirms the step.
+            check_one_jump(&c, &trace, 20.0, (128 + 3 * period) as f64 / RATE + 1e-3);
+            let jump = first_jump(&trace, 1.0).unwrap();
+            // Smallest consistent shift: the gap, give or take the jitter.
+            assert!((jump.steer.shift - 128.0).abs() < 0.3e-3 * RATE, "{}", jump.steer.shift);
+        }
+    }
+
+    #[test]
+    fn announced_step_jumps_at_once() {
+        let sim = Sim { limits: capture_limits(128), ..Sim::new(30.0, 128, 0.3e-3, 20.0) };
+        let (mut c, _) = sim.run();
+        assert!(c.locked());
+        // A device-reported xrun: the very next error is trusted.
+        c.expect_step();
+        let steer = c.update(140.0, 128);
+        assert_eq!(steer.shift, 140.0);
+        assert!(!steer.mute);
+        assert!(c.locked());
+        // An announcement doesn't make a stream jump that is on target.
+        c.expect_step();
+        assert!(!c.update(3.0, 128).is_discontinuous());
+    }
+
+    #[test]
+    fn late_callbacks_never_jump() {
+        let sim = Sim { limits: capture_limits(128), ..Sim::new(30.0, 128, 0.3e-3, 20.0) };
+        let (mut c, _) = sim.run();
+        // One callback 4 ms late, then the backlog back to back: the error
+        // drops by a callback each time. Not a step.
+        for error in [192.0, 64.0, 0.0, 192.0, 64.0, 2.0] {
+            assert!(!c.update(error, 128).is_discontinuous(), "jumped at {error}");
+        }
+        // Late callbacks beyond the margin that don't agree either.
+        for error in [100.0, 2.0, 150.0, 40.0, 60.0] {
+            assert!(!c.update(error, 128).is_discontinuous(), "jumped at {error}");
+        }
+        assert!(c.locked());
+        assert_eq!(c.realigns(), 0);
+    }
+
+    #[test]
+    fn forward_step_drops_the_backlog() {
+        // 20 ms behind is on the safe side for playback, but slewing it
+        // back at 1000 ppm would take 20 s of extra latency. Jump after
+        // 50 ms instead.
+        let (c, trace) = simulate(30.0, 256, 0.5e-3, 60.0, 3, Some((30.0, 0.02 * RATE)));
+        check_one_jump(&c, &trace, 30.0, 0.07);
+    }
+
+    #[test]
+    fn playback_stall_drops_the_backlog() {
+        // The device stalls for 20 ms: playback falls 20 ms behind.
+        let sim = Sim { gap: Some((30.0, 960)), ..Sim::new(30.0, 128, 0.3e-3, 60.0) };
+        let (c, trace) = sim.run();
+        check_one_jump(&c, &trace, 30.0, 0.07);
+    }
+
+    #[test]
+    fn repeated_stalls_dont_ratchet_the_latency_up() {
+        // One lost 128-frame buffer every second: each leaves playback a
+        // buffer further behind. Slewing alone (at most 48 samples per
+        // second) would let the latency climb to the jump limit.
+        let sim = Sim {
+            gap: Some((10.0, 128)),
+            gap_every: Some(1.0),
+            ..Sim::new(30.0, 128, 0.3e-3, 60.0)
+        };
+        let (c, trace) = sim.run();
+        let worst = trace.iter().filter(|s| s.time > 10.0).fold(0f64, |w, s| w.max(s.raw_error));
+        // At most a callback plus the margin of slack, one more gap and
+        // the jitter.
+        assert!(worst < 128.0 + MARGIN + 128.0 + 0.3e-3 * RATE, "{worst:.1} samples behind");
+        assert!(c.realigns() < 50, "{} jumps for 50 gaps", c.realigns());
+        assert!(trace.iter().filter(|s| s.time > 1.0).all(|s| !s.steer.mute));
+    }
+
+    #[test]
+    fn small_forward_step_is_pulled_in_without_jumping() {
+        // 2 ms behind is within a callback plus the margin on the safe
+        // side for playback: slew, don't jump.
         let (c, trace) = simulate(30.0, 256, 0.5e-3, 60.0, 3, Some((30.0, 0.002 * RATE)));
         assert_eq!(c.realigns(), 0);
         let after = trace.iter().filter(|s| s.time > 30.0);
@@ -575,8 +911,26 @@ mod tests {
     }
 
     #[test]
+    fn clock_outage_keeps_the_frequency_estimate() {
+        let (mut c, _) = simulate(-900.0, 256, 0.3e-3, 60.0, 3, None);
+        assert!(c.locked());
+        let ratio = c.ratio();
+        // The media clock is gone for a while: the stream resets at every
+        // callback.
+        for _ in 0..100 {
+            c.reset();
+        }
+        assert!(!c.running());
+        assert_eq!(c.realigns(), 1);
+        // The integral (the frequency estimate) survives; only the
+        // proportional part of the correction goes.
+        assert!((ppm(c.ratio()) - ppm(ratio)).abs() < 10.0, "{} vs {ratio}", c.ratio());
+        assert!(ppm(c.ratio()) > 850.0, "{}", ppm(c.ratio()));
+    }
+
+    #[test]
     fn settles_before_running() {
-        let mut c = DriftController::new(RATE, limits());
+        let mut c = DriftController::new(RATE, limits(4800));
         let first = c.update(123.0, 4800);
         assert_eq!(first, Steer { shift: 123.0, ratio: 1.0, mute: true });
         for _ in 2..SETTLE_CALLBACKS {

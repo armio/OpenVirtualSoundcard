@@ -84,15 +84,20 @@
 //!   clock at every callback, jitter filtered out) and steers the ratio,
 //!   within ±1000 ppm. It locks in a few seconds and then holds the ratio
 //!   within a ppm or two of the true clock ratio, an inaudible pitch
-//!   modulation. Start-up, stalls and clock steps realign the stream after a
-//!   short mute instead of slewing for minutes.
+//!   modulation. A device gap or xrun, a stall or a media-clock step makes
+//!   the stream jump back onto its target within a few callbacks (at once
+//!   for an xrun the backend reports), with a dip of a few milliseconds:
+//!   the audio before the break ramps down over up to 2 ms, the audio after
+//!   it fades in over 5 ms. Only start-up and the loss of the media clock
+//!   mute the stream while it settles (100 ms).
 //! * The resampler is a 64-tap Kaiser-windowed sinc interpolator with 1024
 //!   tabulated phases, accurate to better than −100 dB up to 20 kHz at
 //!   48 kHz; it reads the rings (or a short capture history) at arbitrary
 //!   fractional positions, so the ratio can change at every sample.
 //!
 //! Audio callbacks don't allocate, lock or log; statistics are atomics read
-//! by [`Bridge::stats`].
+//! by [`Bridge::stats`]. Device input is sanitised: NaN and infinities
+//! become silence, subnormal floats zero.
 //!
 //! # Real-time priority
 //!
@@ -110,7 +115,11 @@
 //! `safety` is one device buffer, the interpolator's 32-sample look-ahead and
 //! the margin (1 ms by default, [`BridgeConfig::margin_ms`]); the device's
 //! own output latency comes on top. Capture stamps the newest captured frame
-//! `safety` ahead of the media clock. Small device buffers keep both short.
+//! `safety` ahead of the media clock, plus the transmitter's packet lead
+//! (7 samples at 48 kHz with the default guard). Small device buffers keep
+//! both short. The buffer counted is the largest callback of the last 10 to
+//! 20 s, so a one-off oversized callback costs latency only for that long.
+//! [`DirectionStats::latency_ms`] reports what each direction adds.
 //!
 //! # Limitations
 //!
