@@ -81,6 +81,12 @@ async fn a_damaged_state_file_is_kept_and_the_backup_restored() {
     })
     .await;
     device.shutdown().await;
+
+    // A restart of the device (a new latency, a new address) reads the
+    // file saved meanwhile, but still reports the problem found at start.
+    let device = Device::start(config(&path, 26100), system_clock()).await.unwrap();
+    assert_eq!(device.saved_state_problem(), Some(problem.as_str()));
+    device.shutdown().await;
     std::fs::remove_dir_all(dir).unwrap();
 }
 

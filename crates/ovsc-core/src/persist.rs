@@ -110,6 +110,27 @@ fn save_lock() -> MutexGuard<'static, ()> {
     SAVE_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// The problems [`SavedState::recover`] found in this process, by state
+/// file. A device started again later (a new latency, a new network
+/// address) reads the file its predecessor saved, intact by then; the
+/// warning must outlive that restart, which can follow within seconds of
+/// the start (a power cut also brings the network up late), or nobody
+/// sees it.
+static PROBLEMS: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
+
+/// What [`SavedState::recover`] last found wrong with the state file at
+/// `path` in this process, if anything.
+pub fn problem_at_start(path: &Path) -> Option<String> {
+    let problems = PROBLEMS.lock().unwrap_or_else(PoisonError::into_inner);
+    problems.iter().find(|(p, _)| p == path).map(|(_, problem)| problem.clone())
+}
+
+fn remember_problem(path: &Path, problem: &str) {
+    let mut problems = PROBLEMS.lock().unwrap_or_else(PoisonError::into_inner);
+    problems.retain(|(p, _)| p != path);
+    problems.push((path.to_owned(), problem.to_owned()));
+}
+
 impl SavedState {
     /// The state saved at `path`, or in its backup if `path` cannot be
     /// read; `None` if neither holds one. Moves nothing: for showing the
@@ -165,6 +186,7 @@ impl SavedState {
             }
         };
         error!("{problem}");
+        remember_problem(path, &problem);
         Recovered { state, intact: false, problem: Some(problem) }
     }
 

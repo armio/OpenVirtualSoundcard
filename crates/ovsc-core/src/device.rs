@@ -140,6 +140,10 @@ impl Device {
         };
         let saved = recovered.state.clone();
         let on_disk = recovered.intact.then_some(recovered.state);
+        // Also a problem found by a device this one replaces.
+        let state_problem = recovered
+            .problem
+            .or_else(|| config.state_file.as_deref().and_then(persist::problem_at_start));
         let config = with_saved_latency(config, &saved);
         let iface = Interface::find(&config.interface)?;
         let info = DeviceInfo::new(&config, iface)?;
@@ -242,7 +246,7 @@ impl Device {
             tx_commands,
             tx_thread: Some(tx_thread),
             state_file: config.state_file,
-            state_problem: recovered.problem,
+            state_problem,
         })
     }
 
@@ -254,7 +258,8 @@ impl Device {
 
     /// Why the saved state (names, subscriptions, latency) could not be
     /// used at start, if it could not: the device then started from the
-    /// backup or without it (see [`SavedState::recover`]).
+    /// backup or without it (see [`SavedState::recover`]). It stays for
+    /// the life of the process, through restarts of the device.
     pub fn saved_state_problem(&self) -> Option<&str> {
         self.state_problem.as_deref()
     }
