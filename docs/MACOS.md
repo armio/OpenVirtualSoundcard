@@ -639,11 +639,12 @@ save is flushed to the disk before it replaces the file, and the previous
 version is kept as `state.toml.bak`. If the file cannot be read at start
 (empty or damaged, after a power cut during a save on an older version, or
 a disk fault), the daemon logs `the saved state ... could not be read` as
-an error, moves the file aside as `state.toml.corrupt-<time>`, starts from
-`state.toml.bak`, and the app shows a warning. Check the subscriptions in
-Dante Controller then. The damaged file is never overwritten, so it can
-still be repaired by hand: stop the daemon, copy the repaired file over
-`state.toml`, and start it again.
+an error, starts from `state.toml.bak`, and the app shows a warning. Once
+the engine runs, the daemon saves the state it runs with, keeping the
+damaged file as `state.toml.corrupt-<unix time>` first. Check the
+subscriptions in Dante Controller then. The damaged file is never
+overwritten, so it can still be repaired by hand: stop the daemon, copy the
+repaired file over `state.toml`, and start it again.
 
 ### The Mac must not sleep
 

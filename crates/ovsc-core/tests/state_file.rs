@@ -72,15 +72,46 @@ async fn a_damaged_state_file_is_kept_and_the_backup_restored() {
     // The previous generation: the name, without the subscription.
     assert_eq!(device.name(), "vocal-fx");
     assert_eq!(device.rx_channels()[0].subscription, None);
-    // The damaged file is kept aside, untouched.
-    let aside = corrupt_files(&dir);
-    assert_eq!(aside.len(), 1, "{aside:?}");
-    assert_eq!(std::fs::read(&aside[0]).unwrap(), b"");
-    // The device saves the state it runs with in its place.
+    // The device saves the state it runs with in its place, keeping the
+    // damaged file aside, untouched.
+    eventually("the damaged file kept aside", || corrupt_files(&dir).len() == 1).await;
+    assert_eq!(std::fs::read(&corrupt_files(&dir)[0]).unwrap(), b"");
     eventually("the restored state saved", || {
         SavedState::load(&path).is_some_and(|s| s.name.as_deref() == Some("vocal-fx"))
     })
     .await;
+    device.shutdown().await;
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_that_fails_does_not_lose_the_backup() {
+    let dir = dir("retried");
+    let path = dir.join("state.toml");
+    let device = Device::start(config(&path, 26120), system_clock()).await.unwrap();
+    for name in ["fx-a", "fx-b"] {
+        device.rename(name).unwrap();
+        eventually("the name saved", || {
+            SavedState::load(&path).is_some_and(|s| s.name.as_deref() == Some(name))
+        })
+        .await;
+    }
+    device.shutdown().await;
+    std::fs::write(&path, "").unwrap();
+
+    // The first start after the power cut fails after reading the state
+    // file (here a port in use; at boot, an address that is not up yet).
+    let blocker = std::net::UdpSocket::bind(("127.0.0.1", 26120)).unwrap();
+    assert!(Device::start(config(&path, 26120), system_clock()).await.is_err());
+    drop(blocker);
+
+    // The retry still finds the damaged file and the backup: it starts
+    // from the backup and says so, instead of starting empty.
+    let device = Device::start(config(&path, 26120), system_clock()).await.unwrap();
+    assert_eq!(device.name(), "fx-a");
+    let problem = device.saved_state_problem().expect("a problem reported");
+    assert!(problem.contains("restored the previous copy"), "{problem}");
+    eventually("the damaged file kept aside", || corrupt_files(&dir).len() == 1).await;
     device.shutdown().await;
     std::fs::remove_dir_all(dir).unwrap();
 }

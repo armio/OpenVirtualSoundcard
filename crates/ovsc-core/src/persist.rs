@@ -8,10 +8,10 @@
 //!   disk (`sync_all`, which is `F_FULLFSYNC` on macOS) before it replaces
 //!   the state file, and the directory is flushed after the rename;
 //! * the previous, readable generation stays next to it as `<file>.bak`;
-//! * a file that cannot be read (empty or damaged) is never overwritten: it
-//!   is moved aside to `<file>.corrupt-<unix time>`, the backup is used in
-//!   its place, and the problem is logged and reported (see
-//!   [`SavedState::recover`]).
+//! * a file that cannot be read (empty or damaged) is never overwritten:
+//!   the backup is used in its place, the problem is logged and reported
+//!   (see [`SavedState::recover`]), and the save that replaces it first
+//!   keeps it as `<file>.corrupt-<unix time>`.
 
 use std::fs::File;
 use std::io::{self, Write};
@@ -125,10 +125,15 @@ impl SavedState {
     }
 
     /// The state a device runs from: the one saved at `path`, if it can be
-    /// read. If it cannot, a damaged file is moved aside (it is never
-    /// overwritten: it may still be repaired by hand), the previous
-    /// generation in the backup is used instead, and the problem is logged
-    /// as an error and returned. No file at all is a first start.
+    /// read. If it cannot, the previous generation in the backup is used
+    /// instead, and the problem is logged as an error and returned. No file
+    /// at all is a first start.
+    ///
+    /// Moves nothing: a device start can still fail after this (the
+    /// network not up yet) and is then retried, and the retry must find
+    /// the damaged file and the backup as they were. The save that
+    /// replaces a damaged file keeps it aside first (it may still be
+    /// repaired by hand).
     pub fn recover(path: &Path) -> Recovered {
         let why = match read(path) {
             Ok(Some(state)) => return Recovered { state, intact: true, problem: None },
@@ -137,14 +142,10 @@ impl SavedState {
         };
         let mut problem = format!("the saved state {} could not be read ({why})", path.display());
         if let Unreadable::Damaged(_) = why {
-            let secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs());
-            let aside = sibling(path, &format!(".corrupt-{secs}"));
-            match std::fs::rename(path, &aside) {
-                Ok(()) => problem.push_str(&format!("; it was moved to {}", aside.display())),
-                Err(e) => problem.push_str(&format!("; it could not be moved aside: {e}")),
-            }
+            problem.push_str(&format!(
+                "; it is kept as {}-<unix time>, never overwritten",
+                sibling(path, ".corrupt").display()
+            ));
         }
         let backup = backup_path(path);
         let state = match read(&backup) {
@@ -218,7 +219,7 @@ impl SavedState {
             // drive's cache: plain fsync does not survive a power cut there.
             f.sync_all()?;
             drop(f);
-            keep_backup(path);
+            keep_previous(path)?;
             std::fs::rename(&tmp, path)?;
             sync_dir(dir);
             Ok(())
@@ -236,27 +237,55 @@ impl SavedState {
     }
 }
 
-/// Keeps the current state file as the backup, before a save replaces it.
-/// Only a readable file becomes the backup, so a damaged one never replaces
-/// a good backup. Best effort: a save without a backup is still a save.
-fn keep_backup(path: &Path) {
-    if !matches!(read(path), Ok(Some(_))) {
-        return;
+/// Keeps what the state file at `path` holds before a save replaces it. A
+/// readable file becomes the backup; a damaged one never does: it is kept
+/// as `<file>.corrupt-<unix time>` instead, and if that fails the save
+/// fails rather than overwrite it.
+fn keep_previous(path: &Path) -> io::Result<()> {
+    match read(path) {
+        Ok(Some(_)) => {
+            // Best effort: a save without a backup is still a save.
+            let backup = backup_path(path);
+            if let Err(e) = keep_copy(path, &backup) {
+                debug!("cannot keep {} as {}: {e}", path.display(), backup.display());
+            }
+            Ok(())
+        }
+        Err(Unreadable::Damaged(_)) => {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let aside = sibling(path, &format!(".corrupt-{secs}"));
+            keep_copy(path, &aside).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("cannot keep the damaged {} aside: {e}", path.display()),
+                )
+            })?;
+            warn!("kept the damaged state file as {}", aside.display());
+            Ok(())
+        }
+        // Nothing there, or nothing known about it.
+        Ok(None) | Err(Unreadable::Io(_)) => Ok(()),
     }
-    let backup = backup_path(path);
-    let tmp = sibling(path, &format!(".bak-tmp-{}", std::process::id()));
+}
+
+/// Makes `to` hold what `path` holds now, without touching `path`.
+fn keep_copy(path: &Path, to: &Path) -> io::Result<()> {
+    let tmp = sibling(path, &format!(".keep-tmp-{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
-    // A hard link shares the file already on disk: nothing to flush. Where
+    // A hard link shares the file already on disk: nothing to flush, and
+    // `path` stays in place until the save's rename replaces it. Where
     // links are not supported, a flushed copy does the same.
     let made = std::fs::hard_link(path, &tmp).or_else(|_| {
         std::fs::copy(path, &tmp)?;
         File::open(&tmp)?.sync_all()
     });
-    let kept = made.and_then(|()| std::fs::rename(&tmp, &backup));
-    if let Err(e) = kept {
+    let kept = made.and_then(|()| std::fs::rename(&tmp, to));
+    if kept.is_err() {
         let _ = std::fs::remove_file(&tmp);
-        debug!("cannot keep {} as {}: {e}", path.display(), backup.display());
     }
+    kept
 }
 
 /// Flushes directory `dir`, so that a rename in it survives a power cut.
@@ -398,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_file_is_moved_aside_and_the_backup_used() {
+    fn an_empty_file_is_kept_aside_and_the_backup_used() {
         let dir = dir("empty");
         let path = dir.join("state.toml");
         named("one").save(&path).unwrap();
@@ -412,10 +441,22 @@ mod tests {
         let r = SavedState::recover(&path);
         assert_eq!(r.state, named("one"));
         assert!(!r.intact);
-        let problem = r.problem.unwrap();
+        let problem = r.problem.clone().unwrap();
         assert!(problem.contains("it is empty"), "{problem}");
         assert!(problem.contains("restored the previous copy"), "{problem}");
-        assert!(!path.exists());
+        assert!(problem.contains("state.toml.corrupt-<unix time>"), "{problem}");
+        // Nothing moved: a device start that fails after this and is
+        // retried (the network not up yet) finds the same, and restores
+        // the backup again instead of starting empty.
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+        assert!(files(&dir, "state.toml.corrupt-").is_empty());
+        assert_eq!(SavedState::recover(&path), r);
+
+        // The save that replaces it keeps it aside first; the good backup
+        // stays.
+        named("three").save(&path).unwrap();
+        assert_eq!(SavedState::load(&path), Some(named("three")));
+        assert_eq!(read(&backup_path(&path)).ok().flatten(), Some(named("one")));
         let aside = files(&dir, "state.toml.corrupt-");
         assert_eq!(aside.len(), 1, "{aside:?}");
         assert_eq!(std::fs::read(dir.join(&aside[0])).unwrap(), b"");
@@ -432,13 +473,36 @@ mod tests {
         assert_eq!(r.state, SavedState::default());
         assert!(!r.intact);
         assert!(r.problem.unwrap().contains("no usable backup"));
+        assert_eq!(std::fs::read(&path).unwrap(), garbage);
+
+        // Saving again keeps it aside, and does not make it the backup.
+        named("fresh").save(&path).unwrap();
         let aside = files(&dir, "state.toml.corrupt-");
         assert_eq!(std::fs::read(dir.join(&aside[0])).unwrap(), garbage);
-
-        // Saving again does not make the damaged file the backup.
-        named("fresh").save(&path).unwrap();
+        assert!(!backup_path(&path).exists());
         named("fresher").save(&path).unwrap();
         assert_eq!(read(&backup_path(&path)).ok().flatten(), Some(named("fresh")));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_damaged_file_that_cannot_be_kept_is_not_overwritten() {
+        let dir = dir("unkeepable");
+        let path = dir.join("state.toml");
+        std::fs::write(&path, "[[[").unwrap();
+        // Directories in the way of every name it could be kept as for the
+        // next minute: keeping it fails.
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        for secs in now..now + 60 {
+            let blocker = sibling(&path, &format!(".corrupt-{secs}"));
+            std::fs::create_dir_all(blocker.join("x")).unwrap();
+        }
+        let e = named("new").save(&path).unwrap_err();
+        assert!(e.to_string().contains("cannot keep the damaged"), "{e}");
+        // Not overwritten, and nothing left behind.
+        assert_eq!(std::fs::read(&path).unwrap(), b"[[[");
+        assert_eq!(files(&dir, "state.toml").len(), 61, "{:?}", files(&dir, "state.toml"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
