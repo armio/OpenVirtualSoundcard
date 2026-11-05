@@ -69,7 +69,7 @@ impl RtClass {
 /// platform, the function returns false, so that the caller can record it
 /// where the status shows it, and logs one warning that says "the {what}
 /// thread is not real-time", what it got instead and why, so that a single
-/// search of the log finds every case. It does once per process for each
+/// search of the log finds every case. It warns once per process for each
 /// [`RtClass`], since every thread of a kind fares the same.
 pub fn raise_priority(what: &str, class: RtClass) -> bool {
     // Why the thread is not real-time, should it end up so.
