@@ -36,9 +36,15 @@ is meant for scripts.
 It exits 0 only if every channel locked and stayed within `--max-bad` and
 `--max-slips` (both 0 by default). When Core Audio itself skips IO (an
 overload, visible as a jump in the device's timeline, common on loaded CI
-machines) it also allows 4 IO buffers of bad frames and 2 slips per jump,
-for at most `--max-jumps` jumps (3 by default). `--allow-outage SECS`
-accepts one run of bad frames up to that long (a daemon restart, say);
+machines) it also allows 4 IO buffers of bad frames per jump, for at most
+`--max-jumps` jumps (3 by default). A skip changes the delay in captured
+frames up to three times without moving any frame in device time, and
+where Core Audio wrote no output the device plays what its IO buffer held
+a lap earlier, whole zero time stamp periods late: none of that is a slip
+or a misplaced frame. A slip is any other change of the device-time delay,
+and with `--expect-device-delay` every other frame must come back at that
+device delay. `--allow-outage SECS` accepts one run of bad frames up to
+that long (a daemon restart, say) and two more slips;
 `--expect-silent-input` instead requires the inputs to be exactly silent.
 
 `check` prints the properties a host relies on (rates, channel counts,

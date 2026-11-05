@@ -53,12 +53,27 @@ pub struct ChannelReport {
     pub zeros: u64,
     /// How often the delay changed after the first lock.
     pub delay_changes: u64,
+    /// Each delay the channel locked to, in order: the first lock, then one
+    /// per delay change.
+    pub locks: Vec<Lock>,
     /// Runs of bad frames after lock; bad frames less than `RUN_MERGE_GAP`
     /// apart count as one run.
     pub bad_runs: Vec<BadRun>,
     /// Some matched frames, as (received index, sent index): the first after
     /// each lock or slip, then every `MATCH_SAMPLE_EVERY`th.
     pub samples: Vec<(usize, u64)>,
+}
+
+/// The frames matched at one delay, from the lock to that delay until the
+/// next change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Lock {
+    /// Received index of the first frame matched at this delay.
+    pub start: usize,
+    /// The sent index of that frame.
+    pub sent: u64,
+    /// Received index of the last frame matched at this delay.
+    pub end: usize,
 }
 
 /// A run of bad frames after lock, with whatever matched in between.
@@ -106,7 +121,10 @@ pub fn analyze(input: usize, output: usize, sent_frames: u64, received: &[f32]) 
     while i < received.len() {
         let Some(delay) = report.delay else {
             match locate(i) {
-                Some(n) => report.delay = Some(i as i64 - n as i64),
+                Some(n) => {
+                    report.delay = Some(i as i64 - n as i64);
+                    report.locks.push(Lock { start: i, sent: n, end: i });
+                }
                 None => {
                     report.lead_in += 1;
                     i += 1;
@@ -126,12 +144,16 @@ pub fn analyze(input: usize, output: usize, sent_frames: u64, received: &[f32]) 
             }
             fresh_lock = false;
             report.matched += 1;
+            if let Some(lock) = report.locks.last_mut() {
+                lock.end = i;
+            }
         } else {
             if let Some(m) = locate(i) {
                 let d = i as i64 - m as i64;
                 if d != delay {
                     report.delay_changes += 1;
                     report.delay = Some(d);
+                    report.locks.push(Lock { start: i, sent: m, end: i });
                     fresh_lock = true;
                     // Re-check this frame at the new delay.
                     continue;
@@ -184,6 +206,20 @@ impl CycleMap {
         let (start, frames, t) = self.cycles[k];
         (index < start + frames as u64).then(|| t + (index - start) as f64)
     }
+
+    /// Whether device time `t` lies in a gap of this timeline: after its
+    /// first cycle began and before its last ended, yet in no cycle, because
+    /// the host skipped IO there.
+    pub fn in_gap(&self, t: f64) -> bool {
+        let (Some(&(_, _, first)), Some(&(_, frames, last))) =
+            (self.cycles.first(), self.cycles.last())
+        else {
+            return false;
+        };
+        first <= t
+            && t < last + f64::from(frames)
+            && !self.cycles.iter().any(|&(_, n, s)| s <= t && t < s + f64::from(n))
+    }
 }
 
 /// Delay in device time between when each sampled frame was played and when
@@ -203,29 +239,123 @@ pub fn device_delays(
     hist
 }
 
-/// Splits the sampled frames of a device-delay histogram that are not at
-/// `want` into (stale, wrong). Stale frames are whole multiples of `period`
-/// (the zero time stamp period, the length of the host's IO buffer) away,
-/// and only while the host skipped IO: it then hands over buffer data left
-/// from an earlier lap. Every other delay is wrong.
-pub fn split_delays(
-    hist: &std::collections::BTreeMap<i64, u64>,
-    want: i64,
-    period: i64,
-    host_skipped: bool,
-) -> (u64, u64) {
-    let (mut stale, mut wrong) = (0, 0);
-    for (&k, &n) in hist {
-        if k == want {
-            continue;
-        }
-        if host_skipped && period > 0 && (k - want) % period == 0 {
-            stale += n;
-        } else {
-            wrong += n;
+/// Where a frame came back, in device time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    /// At the expected device delay.
+    InPlace,
+    /// Whole zero time stamp periods late, and played where the output
+    /// timeline has a gap: the host skipped IO there and wrote no output, so
+    /// the device played what the host's IO buffer held from an earlier lap.
+    /// That is the host's loss, not a misplaced frame.
+    Stale,
+    /// Anywhere else, or where the timelines cannot tell.
+    Misplaced,
+}
+
+/// A channel's delay changes, by cause (`DeviceTime::split_changes`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Changes {
+    /// Changes that moved audio in device time: the device's slips.
+    pub slips: u64,
+    /// Changes that skipped host IO explains.
+    pub host: u64,
+}
+
+/// Judges where in device time the frames of one run came back, from the
+/// input and output timelines of its IO cycles.
+pub struct DeviceTime<'a> {
+    pub input: &'a CycleMap,
+    pub output: &'a CycleMap,
+    /// The device delay every frame should come back at.
+    pub want: i64,
+    /// The zero time stamp period, the length of the host's IO buffer: what
+    /// the buffer holds from its previous lap is this many frames old. 0 if
+    /// unknown.
+    pub period: i64,
+}
+
+impl DeviceTime<'_> {
+    /// Input sample time minus output sample time of the frame received at
+    /// index `received` that was sent at index `sent`.
+    pub fn delay(&self, received: usize, sent: u64) -> Option<i64> {
+        let (ti, to) = (self.input.time_of(received as u64)?, self.output.time_of(sent)?);
+        Some((ti - to).round() as i64)
+    }
+
+    /// Whether the frame received at `received` was played at a device time
+    /// the host wrote no output for.
+    fn played_in_gap(&self, received: usize) -> bool {
+        self.input
+            .time_of(received as u64)
+            .is_some_and(|t| self.output.in_gap(t - self.want as f64))
+    }
+
+    pub fn place(&self, received: usize, sent: u64) -> Placement {
+        match self.delay(received, sent) {
+            Some(d) if d == self.want => Placement::InPlace,
+            Some(d)
+                if self.period > 0
+                    && (d - self.want) % self.period == 0
+                    && self.played_in_gap(received) =>
+            {
+                Placement::Stale
+            }
+            _ => Placement::Misplaced,
         }
     }
-    (stale, wrong)
+
+    /// How many of `samples`, matched frames as (received index, sent index),
+    /// came back stale and how many misplaced.
+    pub fn split_samples(&self, samples: &[(usize, u64)]) -> (u64, u64) {
+        let (mut stale, mut misplaced) = (0, 0);
+        for &(i, n) in samples {
+            match self.place(i, n) {
+                Placement::InPlace => {}
+                Placement::Stale => stale += 1,
+                Placement::Misplaced => misplaced += 1,
+            }
+        }
+        (stale, misplaced)
+    }
+
+    /// Sorts a channel's delay changes, between consecutive `locks`, into
+    /// the device's slips and the host's.
+    ///
+    /// The delay in captured frames changes when the host skips IO although
+    /// the device placed every frame right. A skip moves the input timeline
+    /// at one point of the captured stream and the output timeline at
+    /// another, so the frames played just before it come back at one
+    /// captured delay and the frames after it at another, at the same device
+    /// delay. Where the host wrote no output, the device plays what the
+    /// host's buffer held a lap earlier, whole zero time stamp periods late.
+    /// One skip can so make three changes: across the gap, into the earlier
+    /// lap and out of it. None of them moved a frame in device time, so none
+    /// is a slip. A change is a slip when the device delay changed between
+    /// two locks and one of them was anywhere but in place or stale. Judging
+    /// each change this way, rather than allowing so many slips per skip,
+    /// still fails a device that slips next to a skip.
+    pub fn split_changes(&self, locks: &[Lock]) -> Changes {
+        // Lap-old data starts and ends inside a gap.
+        let judge = |l: &Lock| {
+            let place = match self.place(l.start, l.sent) {
+                Placement::Stale if !self.played_in_gap(l.end) => Placement::Misplaced,
+                p => p,
+            };
+            (self.delay(l.start, l.sent), place)
+        };
+        let mut changes = Changes::default();
+        for w in locks.windows(2) {
+            let ((a, pa), (b, pb)) = (judge(&w[0]), judge(&w[1]));
+            let same_device_delay = a.is_some() && a == b;
+            if same_device_delay || (pa != Placement::Misplaced && pb != Placement::Misplaced) {
+                changes.host += 1;
+            } else {
+                changes.slips += 1;
+            }
+        }
+        changes
+    }
 }
 
 /// True when every captured sample is exactly zero.
@@ -361,14 +491,204 @@ mod tests {
         assert_eq!(r.mismatched, 1_999);
     }
 
+    /// The zero time stamp period of the OpenVirtualSoundcard device.
+    const PERIOD: i64 = 16_384;
+
+    /// One channel of a loopback, recorded as on the CI runners: IO cycles of
+    /// `frames`, the output timeline `lead` frames ahead of the input, and
+    /// the device recording each frame at device delay 0 unless `delays`
+    /// says otherwise. After each cycle in `skips` the host skips IO for the
+    /// frames given, on both timelines at once; where it wrote no output, the
+    /// device plays what the host's buffer held a zero time stamp period
+    /// earlier, or silence before the buffer's first lap.
+    struct Loop {
+        frames: u32,
+        lead: i64,
+        cycles: u64,
+        /// (cycle, frames skipped after it)
+        skips: Vec<(u64, i64)>,
+        /// (input time, device delay from then on)
+        delays: Vec<(i64, i64)>,
+    }
+
+    struct Recorded {
+        input: CycleMap,
+        output: CycleMap,
+        received: Vec<f32>,
+        sent: u64,
+    }
+
+    impl Loop {
+        fn new(frames: u32, lead: i64, cycles: u64) -> Loop {
+            Loop { frames, lead, cycles, skips: Vec::new(), delays: Vec::new() }
+        }
+
+        /// The input time cycle `k` starts at.
+        fn input_time(&self, k: u64) -> i64 {
+            let skipped: i64 = self.skips.iter().filter(|s| s.0 < k).map(|s| s.1).sum();
+            100_000 + (k * u64::from(self.frames)) as i64 + skipped
+        }
+
+        fn record(&self) -> Recorded {
+            let n = u64::from(self.frames);
+            let (mut input, mut output) = (CycleMap::default(), CycleMap::default());
+            let mut played: HashMap<i64, f32> = HashMap::new();
+            for k in 0..self.cycles {
+                let t = self.input_time(k);
+                input.push(k * n, self.frames, t as f64);
+                output.push(k * n, self.frames, (t + self.lead) as f64);
+                for j in 0..n {
+                    played.insert(t + self.lead + j as i64, sample(0, k * n + j));
+                }
+            }
+            let play = |t: i64| {
+                (0..4).find_map(|lap| played.get(&(t - lap * PERIOD)).copied()).unwrap_or(0.0)
+            };
+            let delay = |t: i64| self.delays.iter().rev().find(|d| t >= d.0).map_or(0, |d| d.1);
+            let mut received = Vec::new();
+            for k in 0..self.cycles {
+                for j in 0..self.frames as i64 {
+                    let t = self.input_time(k) + j;
+                    received.push(play(t - delay(t)));
+                }
+            }
+            Recorded { input, output, received, sent: self.cycles * n }
+        }
+
+        /// The analysis, the delay changes by cause, and the sampled frames
+        /// that came back stale and misplaced.
+        fn judge(&self) -> (ChannelReport, Changes, (u64, u64)) {
+            let rec = self.record();
+            let r = analyze(0, 0, rec.sent, &rec.received);
+            let time =
+                DeviceTime { input: &rec.input, output: &rec.output, want: 0, period: PERIOD };
+            let changes = time.split_changes(&r.locks);
+            let split = time.split_samples(&r.samples);
+            (r, changes, split)
+        }
+    }
+
     #[test]
-    fn stale_host_buffer_data_is_whole_periods_late() {
-        let hist: std::collections::BTreeMap<i64, u64> =
-            [(0, 500), (16_384, 7), (32_768, 2), (-16_384, 1), (3, 4)].into();
-        assert_eq!(split_delays(&hist, 0, 16_384, true), (10, 4));
-        assert_eq!(split_delays(&hist, 0, 16_384, false), (0, 14));
-        assert_eq!(split_delays(&hist, 0, 0, true), (0, 14));
-        assert_eq!(split_delays(&hist, 3, 16_384, true), (0, 510));
+    fn a_skip_makes_three_delay_changes_and_no_slip() {
+        // S10 on a macos-latest runner: 512-frame cycles, output 1295 frames
+        // ahead of input, Core Audio skipping 756 frames once.
+        let mut l = Loop::new(512, 1295, 400);
+        l.skips.push((200, 756));
+        let (r, changes, (stale, misplaced)) = l.judge();
+        // Across the gap, into the earlier lap, out of it: more than the 2
+        // per jump the checker used to allow.
+        assert_eq!(r.delay_changes, 3);
+        assert_eq!(r.locks.len(), 4);
+        assert_eq!(changes, Changes { slips: 0, host: 3 });
+        assert!(stale > 0);
+        assert_eq!(misplaced, 0);
+        assert!(r.bad_runs.is_empty(), "{:?}", r.bad_runs);
+    }
+
+    #[test]
+    fn a_skip_longer_than_the_lead_makes_two() {
+        let mut l = Loop::new(512, 1295, 400);
+        l.skips.push((200, 2_000));
+        let (r, changes, (stale, misplaced)) = l.judge();
+        assert_eq!(r.delay_changes, 2);
+        assert_eq!(changes, Changes { slips: 0, host: 2 });
+        assert!(stale > 0);
+        assert_eq!(misplaced, 0);
+    }
+
+    #[test]
+    fn many_skips_at_32_frames_make_no_slip() {
+        // S5 at 32 frames on a runner: tens of skips in 5 s, some back to
+        // back, of 44 to 600 frames.
+        let mut l = Loop::new(32, 335, 7_500);
+        let mut k = 900;
+        for s in 0..60 {
+            l.skips.push((k, 44 + (s * 97) % 557));
+            k += if s % 5 == 0 { 1 } else { 90 + (s as u64 * 31) % 40 };
+        }
+        let (r, changes, (stale, misplaced)) = l.judge();
+        assert!(r.delay_changes > 2 * 60, "{}", r.delay_changes);
+        assert_eq!(changes.slips, 0);
+        assert_eq!(changes.host, r.delay_changes);
+        assert!(stale > 0);
+        assert_eq!(misplaced, 0);
+    }
+
+    #[test]
+    fn a_device_slip_is_a_slip() {
+        // The device drops 3 frames: everything after comes back 3 early.
+        let mut l = Loop::new(512, 1295, 400);
+        l.delays.push((l.input_time(150) + 100, -3));
+        let (r, changes, (_, misplaced)) = l.judge();
+        assert_eq!(r.delay_changes, 1);
+        assert_eq!(changes, Changes { slips: 1, host: 0 });
+        assert!(misplaced > 0);
+    }
+
+    #[test]
+    fn a_device_slip_next_to_a_skip_is_a_slip() {
+        // The skip of the first test, and the device then slipping by 7
+        // frames where the frames after the skip come back: it repeats the
+        // last 7 frames of the earlier lap, then the rest comes 7 late.
+        let mut l = Loop::new(512, 1295, 400);
+        l.skips.push((200, 756));
+        let after_gap = l.input_time(201) + 1295;
+        l.delays.push((after_gap, 7));
+        let (r, changes, (_, misplaced)) = l.judge();
+        assert_eq!(r.delay_changes, 4);
+        assert_eq!(changes, Changes { slips: 2, host: 2 });
+        assert!(misplaced > 0);
+        // 100 frames later, among the frames that came back in place.
+        l.delays[0].0 = after_gap + 100;
+        let (r, changes, _) = l.judge();
+        assert_eq!(r.delay_changes, 4);
+        assert_eq!(changes, Changes { slips: 1, host: 3 });
+        // A slip that comes back is two.
+        l.delays.push((l.input_time(260), 0));
+        let (_, changes, _) = l.judge();
+        assert_eq!(changes, Changes { slips: 2, host: 3 });
+    }
+
+    #[test]
+    fn an_earlier_lap_where_the_host_wrote_output_is_misplaced() {
+        // A device that replays its ring a lap late for a while, with no skip.
+        let mut l = Loop::new(512, 1295, 400);
+        l.delays.push((l.input_time(150), PERIOD));
+        l.delays.push((l.input_time(170), 0));
+        let (r, changes, (stale, misplaced)) = l.judge();
+        assert_eq!(r.delay_changes, 2);
+        assert_eq!(changes, Changes { slips: 2, host: 0 });
+        assert_eq!(stale, 0);
+        assert!(misplaced > 0);
+    }
+
+    #[test]
+    fn an_earlier_lap_that_outlasts_the_gap_is_misplaced() {
+        // The device goes on replaying the earlier lap after the host's gap.
+        let mut l = Loop::new(512, 1295, 400);
+        l.skips.push((200, 756));
+        let gap_start = l.input_time(200) + 512 + 1295;
+        l.delays.push((gap_start, PERIOD));
+        l.delays.push((gap_start + 756 + 2_000, 0));
+        let (r, changes, (_, misplaced)) = l.judge();
+        assert_eq!(r.delay_changes, 3);
+        assert_eq!(changes, Changes { slips: 2, host: 1 });
+        assert!(misplaced > 0);
+    }
+
+    #[test]
+    fn gaps_in_a_timeline() {
+        let mut m = CycleMap::default();
+        m.push(0, 512, 1_000.0);
+        m.push(512, 512, 2_000.0);
+        assert!(m.in_gap(1_512.0));
+        assert!(m.in_gap(1_999.0));
+        assert!(!m.in_gap(1_511.0));
+        assert!(!m.in_gap(2_000.0));
+        // Outside the run is no gap.
+        assert!(!m.in_gap(999.0));
+        assert!(!m.in_gap(2_512.0));
+        assert!(!CycleMap::default().in_gap(0.0));
     }
 
     #[test]
