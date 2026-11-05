@@ -253,13 +253,15 @@ ov_finish_files() {
 }
 
 # This Mac's local host name made into a valid Dante device name (1 to 31 of
-# A-Z a-z 0-9 and inner hyphens), or "ovsc" if nothing usable is left.
+# A-Z a-z 0-9 and inner hyphens), or nothing if nothing usable is left: the
+# device then takes its default name, which is unique to this Mac. A fixed
+# fallback would give every such Mac the same name.
 ov_device_name() {
     local raw name
     raw=$(scutil --get LocalHostName 2>/dev/null || true)
     name=$(printf '%s' "$raw" | tr -c 'A-Za-z0-9-' '-' | tr -s '-' |
         sed 's/^-*//' | cut -c 1-31 | sed 's/-*$//')
-    echo "${name:-ovsc}"
+    echo "$name"
 }
 
 # Writes the configuration from TEMPLATE, with the device named after this
@@ -271,7 +273,7 @@ ov_default_config() {
         return 0
     fi
     name=$(ov_device_name)
-    ov_log "writing $OV_CONFIG (device name $name)"
+    ov_log "writing $OV_CONFIG (device name ${name:-the default})"
     mkdir -p "$OV_SUPPORT" || return 1
     tmp=$OV_CONFIG.new
     # The first `name = ` line is the device's, in [device].

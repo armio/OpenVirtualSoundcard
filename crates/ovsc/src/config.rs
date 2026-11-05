@@ -320,7 +320,9 @@ pub const EXAMPLE: &str = r#"# OpenVirtualSoundcard configuration.
 
 [device]
 # Name shown in Dante Controller: 1-31 of A-Z a-z 0-9 and inner hyphens.
-name = "ovsc"
+# Two devices must not share one. Empty: "ovsc-" and the end of the
+# interface's MAC address.
+name = ""
 # Network interface name or IPv4 address. Empty: interface of the default route.
 interface = ""
 sample_rate = 48000          # 44100, 48000, 88200, 96000, 176400 or 192000
@@ -362,7 +364,13 @@ mod tests {
     fn example_parses() {
         let cfg: AppConfig = toml::from_str(EXAMPLE).unwrap();
         cfg.device.validate().unwrap();
-        assert_eq!(cfg.device.name, "ovsc");
+        // No fixed name: every device that kept it would share it.
+        assert_eq!(cfg.device.name, "");
+        // The macOS installer writes this Mac's name into the first
+        // `name = ` line (packaging/macos/install-lib.sh).
+        assert_eq!(EXAMPLE_MACOS.lines().find(|l| l.starts_with("name = ")), Some("name = \"\""));
+        let macos: AppConfig = toml::from_str(EXAMPLE_MACOS).unwrap();
+        assert_eq!(macos.device.name, "");
         assert_eq!(cfg.clock.source, ClockSource::Ptp);
         assert_eq!(cfg.audio.backend, BackendKind::None);
     }
