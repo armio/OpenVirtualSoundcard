@@ -2,7 +2,7 @@
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot, watch};
@@ -51,8 +51,6 @@ pub struct Device {
     state_file: Option<std::path::PathBuf>,
     /// Why the saved state could not be used, if it could not.
     state_problem: Option<String>,
-    /// The device name [`advertise`] announces, once it has claimed it.
-    announced: Arc<Mutex<Option<String>>>,
 }
 
 /// Status of a receive channel.
@@ -110,6 +108,12 @@ pub struct StartOptions {
     /// subscription to it. That conflict is reported instead
     /// ([`Device::name_conflict`], `renamed_to: None`). Any other name is
     /// probed for, as at a first start.
+    ///
+    /// Without it, the device takes the name over in the same way from a
+    /// device that ran before it on this computer, in an earlier process:
+    /// when the state (the state file, or [`StartOptions::state`]) holds
+    /// that device's claim of the name, made on this interface (see
+    /// [`crate::SavedClaim`]).
     pub announced: Option<String>,
 }
 
@@ -208,7 +212,7 @@ impl Device {
         }
         let iface = Interface::find(&config.interface)?;
         let info = DeviceInfo::new(&config, iface)?;
-        let state = initial_state(&config, &info, saved);
+        let state = initial_state(&config, &info, saved, options.announced);
         let ip = info.iface.ip;
         let ports = info.ports;
         let (shared, notify_rx) = Shared::new(
@@ -287,11 +291,8 @@ impl Device {
         let rx = RxManager::new(shared.clone(), directory, rx_threads_tx);
         tasks.push(("receive manager", tokio::spawn(rx.run(rx_shutdown_rx))));
 
-        let announced = Arc::new(Mutex::new(None));
         if let Some(m) = &mdns {
-            let claimed = options.announced;
-            let advertiser = advertise(shared.clone(), m.clone(), claimed, announced.clone());
-            tasks.push(("mDNS advertiser", tokio::spawn(advertiser)));
+            tasks.push(("mDNS advertiser", tokio::spawn(advertise(shared.clone(), m.clone()))));
         }
         if let Some(path) = config.state_file.clone() {
             tasks.push(("state saver", tokio::spawn(persist::run(shared.clone(), path, on_disk))));
@@ -319,23 +320,27 @@ impl Device {
             sweeper,
             state_file: config.state_file,
             state_problem,
-            announced,
         })
     }
 
     /// The device name this device announces on the network, once it has
-    /// claimed it (probed for it, RFC 6762 §8.1, or taken it over from the
-    /// device it replaces); `None` before that, and without discovery. A
-    /// device that replaces this one in the same process takes it over
-    /// through [`StartOptions::announced`].
+    /// claimed it (probed for it, RFC 6762 §8.1), or from the start if it
+    /// holds it already: taken over from the device it replaces in this
+    /// process, or claimed on this computer before (see
+    /// [`StartOptions::announced`]). `None` before that, and without
+    /// discovery. A device that replaces this one in the same process takes
+    /// it over through [`StartOptions::announced`]; one in a later process,
+    /// through the state file, which saves it with the interface's MAC
+    /// address ([`crate::SavedClaim`]).
     pub fn announced_name(&self) -> Option<String> {
-        self.announced.lock().unwrap_or_else(PoisonError::into_inner).clone()
+        self.shared.state().announced.clone()
     }
 
     /// The names, subscriptions and latency a controller or the app set,
-    /// as they would be saved; see [`StartOptions::state`].
+    /// and the device's claim of the name it announces, as they would be
+    /// saved; see [`StartOptions::state`].
     pub fn saved_state(&self) -> SavedState {
-        SavedState::from_state(&self.shared.state(), &self.shared.info.factory_name)
+        SavedState::from_state(&self.shared.state(), &self.shared.info)
     }
 
     /// Why the saved state (names, subscriptions, latency) could not be
@@ -667,9 +672,24 @@ fn stats(shared: &Shared) -> DeviceStats {
 }
 
 /// The state a device starts in. `config` already holds the saved name and
-/// latency ([`DeviceConfig::with_saved`]).
-fn initial_state(config: &DeviceConfig, info: &DeviceInfo, saved: SavedState) -> State {
+/// latency ([`DeviceConfig::with_saved`]). `predecessor` is the name the
+/// device this one replaces in this process announced
+/// ([`StartOptions::announced`]).
+fn initial_state(
+    config: &DeviceConfig,
+    info: &DeviceInfo,
+    saved: SavedState,
+    predecessor: Option<String>,
+) -> State {
     let name = if config.name.is_empty() { info.factory_name.clone() } else { config.name.clone() };
+    // A name the device holds already is announced again without a probe
+    // (see [`advertise`]): the one its predecessor in this process
+    // announced, or else one claimed on this computer before, as saved
+    // ([`SavedState::claimed_name`]). Without discovery the device
+    // announces nothing, so it holds no name.
+    let held = predecessor.as_deref().or_else(|| saved.claimed_name(&info.iface));
+    let holds = info.discovery && held.is_some_and(|h| h.eq_ignore_ascii_case(&name));
+    let announced = holds.then(|| name.clone());
     let (rx_names, tx_names) = saved.channel_names(&info.rx_channels, &info.tx_channels);
     let mut subscriptions = vec![None; info.rx_channels.len()];
     let initial = config.subscriptions.iter().map(|s| (s.rx_channel, &s.tx_channel, &s.tx_device));
@@ -689,6 +709,7 @@ fn initial_state(config: &DeviceConfig, info: &DeviceInfo, saved: SavedState) ->
     State {
         name,
         name_conflict: None,
+        announced,
         tx_names,
         rx_names,
         subscriptions,
@@ -728,23 +749,20 @@ struct Renaming {
 /// it, and neither changes name at its next start. A conflict that only
 /// shows once a name is announced renames nothing (see [`crate::mdns`]).
 ///
-/// `claimed` is the name the device this one replaces in this process
-/// announced ([`StartOptions::announced`]): already this device's on the
-/// network, it is announced again without a probe, which another device
-/// announcing it too would answer. Such a device is a conflict reported
-/// with `renamed_to: None`, as one that appears while the name is
-/// announced. The device name whose records are announced goes to
-/// `announced` ([`Device::announced_name`]).
-async fn advertise(
-    shared: Arc<Shared>,
-    mdns: Mdns,
-    mut claimed: Option<String>,
-    announced: Arc<Mutex<Option<String>>>,
-) {
+/// A name the device holds already, [`State::announced`] at the start
+/// (taken over from the device it replaces in this process, or claimed on
+/// this computer before, as saved: see [`StartOptions::announced`]), is
+/// announced again without a probe, which another device announcing it too
+/// would answer. Such a device is a conflict reported with `renamed_to:
+/// None`, as one that appears while the name is announced. The device name
+/// whose records are announced goes to [`State::announced`]
+/// ([`Device::announced_name`]), and so to the state file.
+async fn advertise(shared: Arc<Shared>, mdns: Mdns) {
     let mut watch = shared.watch();
     let mut conflicts = mdns.conflicts();
     let mut renaming: Option<Renaming> = None;
     let mut last = None;
+    let mut claimed = shared.state().announced.clone();
     loop {
         let (name, records) = advertisement(&shared);
         if !claimed.as_ref().is_some_and(|c| c.eq_ignore_ascii_case(&name)) {
@@ -791,7 +809,12 @@ async fn advertise(
         if last.as_ref() != Some(&records) {
             mdns.set_records(records.clone()).await;
             last = Some(records);
-            *announced.lock().unwrap_or_else(PoisonError::into_inner) = claimed.clone();
+            // Saved, so that a new process on this computer keeps the
+            // name. Only when it changes (not when channels are renamed):
+            // `modify` wakes every task that follows the state.
+            if shared.state().announced != claimed {
+                shared.modify(|s| s.announced = claimed.clone());
+            }
         }
         report_name_conflict(&shared, renaming.as_ref(), &conflicts.borrow_and_update());
         tokio::select! {

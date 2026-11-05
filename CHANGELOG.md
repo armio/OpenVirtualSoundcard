@@ -76,11 +76,13 @@ The first public version, not released yet.
 - Latencies below 1 ms are refused from the app and controllers, and raised
   to the minimum, with a warning, in the configuration: packets leave 0.5 ms
   after their time.
-- A device restarted in-process (a latency change, an address change) keeps
-  the name it announced instead of probing it again, so a name conflict can
-  no longer rename it mid-show. The daemon offers Core Audio the saved
-  latency and names at start, so its restart does not reconfigure the device
-  twice.
+- A device restarted in-process (a latency change, an address change), or
+  by a new daemon on the same Mac (after a crash, at a reboot), keeps the
+  name it announced instead of probing it again, so a name conflict can no
+  longer rename it mid-show. The state file keeps the name with the
+  interface's MAC address; a copy on another Mac (a cloned disk) probes as
+  before. The daemon offers Core Audio the saved latency and names at
+  start, so its restart does not reconfigure the device twice.
 - While the show lock is on, controllers see the sample rate and encoding as
   fixed.
 - Transmit flows accept 2 to 32 frames per packet and 1 to 8 channels, as
