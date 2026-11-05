@@ -34,6 +34,10 @@ latency_ms = 4.0             # receive latency, 1 to 40
 # tx_latency_ms = 1.0
 # Remember renames and subscriptions made from a controller.
 state_file = "/Library/Application Support/OpenVirtualSoundcard/state.toml"
+# The show lock: refuse controllers' changes to the latency, sample rate,
+# encoding and names (routing stays open). Usually set from the app, which
+# saves it in the state file; that choice then replaces this one.
+# lock_remote_settings = false
 
 # Audinate's ConMon service, installed with Dante Controller, Dante Virtual
 # Soundcard and Dante Via, listens on UDP 8800 and 8700 on every interface.

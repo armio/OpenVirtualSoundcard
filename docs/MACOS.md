@@ -587,7 +587,11 @@ open when all of these hold:
   `clock=synthetic`);
 * the daemon's clock agrees with the driver's timeline to within 250 µs.
 
-Otherwise the inputs read silence and the outputs are dropped. So:
+Otherwise the inputs read silence and the outputs are dropped. The driver
+ramps both over 5 ms when the gate opens and when it closes (240 frames at
+48 kHz), so a gate edge is a short fade, not a click. A faulted driver goes
+silent at once, and audio that stops arriving (a daemon that died) is not
+faded. So:
 
 * before the daemon's clock first locks, the device is silent;
 * when Syncs are delayed for a few seconds (a network without
@@ -931,8 +935,12 @@ log or call the host; everything else runs on one serial queue,
 ring slots `t + off − read_delay` into Core Audio's buffer, WriteMix stores
 the mix at TX ring slots `t + off`, where `t` is Core Audio's sample time and
 `off` the timeline's ring offset. A ring slot holds the sample and the low 32
-bits of its timestamp, so a stale slot reads as silence. Every 24-bit sample
-survives the trip through Float32 bit for bit.
+bits of its timestamp, so a stale slot reads as silence; the daemon's ring
+sweeper clears slots older than two ring lengths every 5 s, so that a slot
+left unwritten for 2^32 samples (about 25 h at 48 kHz) cannot match again.
+Every 24-bit sample survives the trip through Float32 bit for bit, and a
+non-finite output sample (NaN or infinity from a plug-in) is sent as silence
+and counted (`non_finite_out` in the plug-in status).
 
 **IPC.** The driver's Info.plist lists `org.openvirtualsoundcard.audio` under
 `AudioServerPlugIn_MachServices`. Messages are XPC dictionaries with an `op`:

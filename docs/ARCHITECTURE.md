@@ -63,7 +63,9 @@ Each channel has a `TimedRing`: a power-of-two array of `AtomicU64` slots.
 Each slot packs the low 32 bits of a sample's timestamp with the sample. A
 reader asking for timestamp `t` gets the sample only if the tag matches.
 Otherwise the slot is stale, from a lost packet or from a lap ago, and reads
-as silence. This gives:
+as silence. A sweeper thread per device clears slots more than two ring
+lengths from the media clock every 5 s, so that a slot left alone for 2^32
+samples (about 25 h at 48 kHz) can never pass for fresh. This gives:
 
 * no locks and no blocking between the network and audio sides;
 * automatic silence on packet loss, no read/write pointers to keep in sync;

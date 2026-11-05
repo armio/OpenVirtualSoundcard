@@ -1787,6 +1787,9 @@ Sources: INF `device_server/arc_server.rs`, `channels_subscriber.rs`,
 | 0x1100 / 0x1102 | zero-filled stubs | full property lists (CAP) | implement real properties so DC can show and set latency |
 | 0x1001 set name, 0x1101 set latency, conmon 0x81/0x83 sample rate and encoding, 0x63 identify, 0x90 reboot | not implemented | formats known ([§4.3](#43-0x1001-set-device-name), [§4.6.3](#463-0x1101-write-properties-setting-latency), [§7.5](#75-settings-commands-writes-and-probes)) | implement. Replies to 0x1101 still need captures. |
 | `pcm` TXT | `3 e` | real `3 e`; netaudio's encoder `3 0xe` | `3 e` |
+| `latency_ns` TXT of transmit channels | the device's receive latency (a FIXME in Inferno) | DVS advertises 6 ms | OpenVirtualSoundcard advertises its own transmit latency (`tx_latency_ms`, else the receive latency); receivers play at the larger of it and their own ([§8.4](#84-timestamps-and-ptp)) |
+| Received packet size | fpp derived from the length, slot count fixed | — | Derive fpp from the length ([§8.2](#82-payload)); OpenVirtualSoundcard accepts 1 to 256 whole frames of the flow's slots, only from the transmitter's address and the source port its audio comes from |
+| QoS marking | none | Audinate's QoS guidance: DSCP 56 (CS7) for PTP, 46 (EF) for audio, strict priority | OpenVirtualSoundcard marks audio EF (TOS `0xB8`), PTP event messages CS7 (`0xE0`) and PTP general messages EF; unverified that macOS keeps the marking on the wire |
 
 ### 11.2 Unknowns worth capturing with Wireshark
 
