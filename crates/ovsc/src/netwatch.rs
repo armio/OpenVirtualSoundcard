@@ -35,6 +35,13 @@ use ovsc_clock::{ClockState, MediaClock};
 /// again within a few seconds of the link returning.
 pub const RELOCK_GRACE: Duration = Duration::from_secs(15);
 
+/// How long after the interface got its address back a locked clock shows
+/// that Sync messages arrive again. Before that it proves nothing: the PTP
+/// follower reads Locked until its master timeout (5 s, see
+/// `PtpConfig::master_timeout`) after the last Sync it heard, which may
+/// have come before the link went down.
+const LOCK_EVIDENCE: Duration = Duration::from_secs(6);
+
 /// What the system says about an interface at one moment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Seen {
@@ -213,7 +220,7 @@ impl InterfaceWatch {
             self.back_at = Some(now);
         }
         match self.back_at {
-            Some(_) if clock_locked => {
+            Some(at) if clock_locked && now.duration_since(at) >= LOCK_EVIDENCE => {
                 self.back_at = None;
                 None
             }
@@ -373,6 +380,21 @@ mod tests {
         let v = run(&looks);
         // Back at look 2; the grace runs out at look 17, confirmed at 18.
         assert_eq!(restarts(&v)[0], 2 + RELOCK_GRACE.as_secs() as usize + 1, "{v:?}");
+    }
+
+    #[test]
+    fn a_clock_that_only_still_reads_locked_does_not_count() {
+        // A 3 s outage: the clock still reads Locked when the address comes
+        // back, from Syncs heard before it went (the master timeout is
+        // 5 s), then drops: no Sync arrives any more (the memberships went
+        // with an adapter that re-attached between two looks).
+        let mut looks = vec![(seen(4, &[IP]), true)];
+        looks.extend(vec![(seen(4, &[]), true); 3]);
+        looks.extend(vec![(seen(4, &[IP]), true); 2]);
+        looks.extend(vec![(seen(4, &[IP]), false); 20]);
+        let v = run(&looks);
+        // Back at look 4; the grace runs out at look 19, confirmed at 20.
+        assert_eq!(restarts(&v)[0], 4 + RELOCK_GRACE.as_secs() as usize + 1, "{v:?}");
     }
 
     #[test]
