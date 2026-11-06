@@ -169,7 +169,7 @@ the transmit latency stays the file's (`tx_latency_ms`, or else its
 ### The show lock
 
 Once the latency, sample rate, encoding and names are set at soundcheck, turn
-on the show lock in the app (Settings, "Lock settings from the network"). It
+on the show lock in the app (Settings, **Show lock**). It
 applies at once and interrupts nothing. While it is on, Dante Controller and
 other controllers cannot change OVSC's latency, sample rate, encoding, device
 name or channel names; routing stays open, and changes made in the app still
@@ -251,10 +251,11 @@ With the show session running at the show's buffer size:
 2. **Clock.** The app's Clock is **Locked**, its Leader is the console (or
    the Preferred Leader), and Dante Controller shows OVSC as a follower of
    the same leader. No other leader is reported.
-3. **Status.** The app's Audio light is green **Flowing**, the Status tab
-   shows no warnings, and every subscribed receive channel reads
-   **receiving**. The log's status line reads `healthy` (before its
-   `hal:` part).
+3. **Status.** While the host plays, the app's Audio tile is green
+   **Flowing** (grey **Idle** means no application uses the device: check
+   the host's audio settings), the Status tab shows no warnings, and every
+   subscribed receive channel reads **Receiving**. The log's status line
+   reads `healthy` (before its `hal:` part).
 4. **Returns.** Each return arrives at the console: check its meters, and that
    the console shows OVSC's flows without late packets.
 5. **Real-time.** The log has no line saying a thread "is not real-time"
@@ -316,21 +317,29 @@ any of them.
 
 ## Health and warnings
 
-The app's header has three lights. **Audio** is the one to watch:
+The app's header has three tiles, Audio, Clock and Driver. **Audio** is the
+one to watch:
 
-| Audio light | Meaning | What to do |
+| Audio tile | Meaning | What to do |
 |---|---|---|
-| green **Flowing** | Audio can flow, and nothing audible went wrong in the last 30 s. | Nothing. |
+| green **Flowing** | An application plays through OVSC, and nothing audible went wrong in the last 30 s. | Nothing. |
+| grey **Idle** | No application uses OVSC: the returns carry silence. | Choose **Open Virtual Soundcard** as the host's input and output. |
 | amber **Dropouts** | Audio flows, but something audible happened in the last 30 s. | Read the warnings: they say what and what to do. |
-| amber **Stopped** | The driver holds the audio back: inputs and returns are silent. Usually for seconds while the clock settles or the engine restarts. | If it lasts, read the warnings (clock, engine). |
+| amber **Held back** | The driver holds the audio back: inputs and returns are silent, usually for a second or two while the clock settles. After 2 s it turns red **Down**. | If it lasts, read the warnings (clock, engine). |
 | red **Silent**, with Driver red **Failed** | The Core Audio driver hit an internal error and is silent until Core Audio restarts. | Run `sudo killall coreaudiod` (the app has a button to copy it), then restart the host's audio. All audio on the Mac stops for a few seconds. |
+| red **No driver**, **No network** or **Down** | Audio is down: Core Audio has not loaded the driver, the network engine is not running, or the daemon reports another outage. | Read the red panel under the header: it says what and what to do. |
+| red **Off**, **No answer** or **Lost** | The daemon is not running, does not answer, or the app lost its connection: OVSC is silent, or may be. | The app shows the command that starts the daemon. Check the console's meters. |
+| amber **Restarting** | The daemon restarts after a change from the app. | Wait 10 to 20 s; the app says when it is back. |
 
-The Status tab lists warnings in plain words, red ones first. A red warning
-means audio is down now in at least one direction: a failed driver, Core
-Audio no longer calling the driver, the driver's gate closed for 2 s while
-an application plays, a stopped transmit engine (the daemon then restarts
-itself), a clock that has not locked, or a clock that lost its leader after
-the holdover. Amber warnings follow:
+While audio is down, a red **Audio is down** panel stays under the header
+on both tabs, the window's title starts with "Audio down", and the Dock icon
+bounces if the window is in the background. The panel lists what the
+daemon reports as audio down now in at least one direction: a failed
+driver, Core Audio no longer calling the driver, the driver's gate closed
+for 2 s while an application plays, a stopped transmit engine (the daemon
+then restarts itself), a clock that has not locked, or a clock that lost
+its leader after the holdover. The Status tab lists the other warnings, in
+amber:
 
 * **Counters that rose** in the last 30 s, with how many and what to do:
   lost or late received packets (from the first one), early packets and
@@ -346,8 +355,10 @@ the holdover. Amber warnings follow:
   before audio stops; the clock relocking; a jump of the clock; a new clock
   leader; subscribed channels without audio for 10 s; a transmit thread
   without real-time priority; another device using this one's name.
-* **Controllers' changes** for 10 minutes, then under **Earlier** at the
-  bottom.
+
+Controllers' changes are not warnings: they have their own section at the
+bottom of the Status tab, **Changes from controllers**, with those older
+than 10 minutes greyed.
 
 The same warnings reach the log at
 `/Library/Logs/OpenVirtualSoundcard/ovsc.log`: `health: <warning>` (WARN)

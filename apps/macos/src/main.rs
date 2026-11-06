@@ -1,10 +1,14 @@
 //! OpenVirtualSoundcard: the app that shows what the OpenVirtualSoundcard daemon is doing and
 //! changes its settings, through the daemon's control socket
 //! (`ovsc_control::SOCKET_PATH`, or `OVSC_CONTROL_SOCKET` for
-//! testing).
+//! testing; `OVSC_APP_THEME=light|dark` forces an appearance).
 
 mod app;
 mod logic;
+mod settings;
+mod status;
+mod theme;
+mod widgets;
 mod worker;
 
 use std::path::PathBuf;
@@ -19,8 +23,10 @@ fn main() -> eframe::Result {
             .with_title("OpenVirtualSoundcard")
             .with_icon(icon())
             .with_app_id("org.openvirtualsoundcard.app")
-            .with_inner_size([720.0, 560.0])
-            .with_min_inner_size([520.0, 400.0]),
+            // Fits a 13-inch MacBook beside a plug-in host; the window's
+            // size and place are remembered after that.
+            .with_inner_size([760.0, 720.0])
+            .with_min_inner_size([520.0, 420.0]),
         ..Default::default()
     };
     eframe::run_native(
