@@ -324,10 +324,10 @@ fn status_line(
         return;
     }
     // A refusal explains why the edit is still pending: it comes first.
-    if let Some(Outcome::Failed(text)) = &app.outcome {
+    if let Some(Outcome::Failed { text, kept }) = &app.outcome {
         ui.vertical(|ui| {
             line(ui, Some(Light::Red), RichText::new(text).color(p.red_ink));
-            if !lines.is_empty() {
+            if *kept && !lines.is_empty() {
                 ui.label(theme::caption("The edit stays here: change it, or Revert."));
             }
         });
@@ -360,7 +360,7 @@ fn status_line(
     match &app.outcome {
         Some(Outcome::Saved { text, .. }) => line(ui, Some(Light::Green), RichText::new(text)),
         Some(Outcome::ToDo(text)) => line(ui, Some(Light::Amber), RichText::new(text)),
-        Some(Outcome::Restarting { since }) => {
+        Some(Outcome::Restarting { since, .. }) if app.restarting(ui.ctx()) => {
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.add(
@@ -373,6 +373,19 @@ fn status_line(
             });
             ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
         }
+        // The restart's time is up and audio is still down.
+        Some(Outcome::Restarting { since, .. }) => {
+            line(
+                ui,
+                Some(Light::Red),
+                RichText::new(format!(
+                    "Audio is not back {} after the restart: the Status tab says why.",
+                    logic::ago_label(since.elapsed())
+                ))
+                .color(p.red_ink),
+            );
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+        }
         Some(Outcome::Back { after, .. }) => line(
             ui,
             Some(Light::Green),
@@ -381,7 +394,7 @@ fn status_line(
                 logic::ago_label(*after)
             )),
         ),
-        Some(Outcome::Failed(text)) => {
+        Some(Outcome::Failed { text, .. }) => {
             line(ui, Some(Light::Red), RichText::new(text).color(p.red_ink))
         }
         None => {

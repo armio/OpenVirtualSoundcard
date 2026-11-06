@@ -329,11 +329,11 @@ one to watch:
 | red **Silent**, with Driver red **Failed** | The Core Audio driver hit an internal error and is silent until Core Audio restarts. | Run `sudo killall coreaudiod` (the app has a button to copy it), then restart the host's audio. All audio on the Mac stops for a few seconds. |
 | red **No driver**, **No network** or **Down** | Audio is down: Core Audio has not loaded the driver, the network engine is not running, or the daemon reports another outage. | Read the red panel under the header: it says what and what to do. |
 | red **Off**, **No answer** or **Lost** | The daemon is not running, does not answer, or the app lost its connection: OVSC is silent, or may be. | The app shows the command that starts the daemon. Check the console's meters. |
-| amber **Restarting** | The daemon restarts after a change from the app. | Wait 10 to 20 s; the app says when it is back. |
+| amber **Restarting** | The daemon restarts after a change from the app, until audio is back. | Wait 10 to 20 s; the app says when audio is back. |
 
 While audio is down, a red **Audio is down** panel stays under the header
 on both tabs, the window's title starts with "Audio down", and the Dock icon
-bounces if the window is in the background. The panel lists what the
+bounces once if the window is in the background. The panel lists what the
 daemon reports as audio down now in at least one direction: a failed
 driver, Core Audio no longer calling the driver, the driver's gate closed
 for 2 s while an application plays, a stopped transmit engine (the daemon

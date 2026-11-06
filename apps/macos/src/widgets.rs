@@ -94,8 +94,15 @@ pub fn section<R>(
         if let Some((light, text)) = summary {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let words = if light == Light::Grey { p.text2 } else { p.ink(light) };
-                ui.add(egui::Label::new(RichText::new(text).color(words)).truncate());
-                if matches!(light, Light::Amber | Light::Red) {
+                let marked = matches!(light, Light::Amber | Light::Red);
+                // Leave the mark its room, or a long summary pushes it
+                // over the title.
+                let room = if marked { 11.0 + ui.spacing().item_spacing.x } else { 0.0 };
+                ui.scope(|ui| {
+                    ui.set_max_width((ui.available_width() - room).max(0.0));
+                    ui.add(egui::Label::new(RichText::new(text).color(words)).truncate());
+                });
+                if marked {
                     mark(ui, light, 11.0);
                 }
             });
@@ -350,14 +357,17 @@ pub fn tile(ui: &mut Ui, title: &str, lamp: &Lamp, size: Vec2, large: bool) -> R
     if lamp.detail.is_empty() { response } else { response.on_hover_text(&lamp.detail) }
 }
 
+/// A segment's badge: its light, and what it means, for VoiceOver.
+pub type Badge<'a> = Option<(Light, &'a str)>;
+
 /// A segmented control in the macOS style: one segment per choice, the
-/// selected one raised. A segment can carry a mark (warnings on a tab the
+/// selected one raised. A segment can carry a badge (warnings on a tab the
 /// user is not on).
 pub fn segmented<T: PartialEq + Copy>(
     ui: &mut Ui,
     id: Id,
     selected: &mut T,
-    choices: &[(T, &str, Option<Light>)],
+    choices: &[(T, &str, Badge<'_>)],
 ) -> bool {
     let p = theme::palette(ui);
     let segment_w = 96.0;
@@ -395,13 +405,19 @@ pub fn segmented<T: PartialEq + Copy>(
             FontId::proportional(13.0)
         };
         ui.painter().text(seg.center(), egui::Align2::CENTER_CENTER, label, font, p.text);
-        if let Some(light) = badge {
+        if let Some((light, _)) = badge {
             paint_mark(ui.painter(), pos2(seg.right() - 12.0, seg.center().y), 9.0, light, p);
         }
         if response.has_focus() {
             ui.painter().rect_stroke(seg, 5, Stroke::new(2.0, p.focus), egui::StrokeKind::Inside);
         }
-        response.widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, on, label));
+        // VoiceOver hears the badge too: "Status, warnings".
+        let spoken = match badge {
+            Some((_, meaning)) => format!("{label}, {meaning}"),
+            None => label.to_owned(),
+        };
+        response
+            .widget_info(|| WidgetInfo::selected(WidgetType::SelectableLabel, true, on, &spoken));
         if response.clicked() && !on {
             *selected = value;
             changed = true;

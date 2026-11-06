@@ -27,6 +27,10 @@ const STALE_AFTER: Duration = Duration::from_millis(3500);
 /// How long a plain confirmation stays.
 const SAVED_FOR: Duration = Duration::from_secs(10);
 
+/// How long an application must have played before packets sent without
+/// its audio count, as for the daemon's warning.
+const IO_SETTLE: Duration = Duration::from_secs(3);
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Tab {
     Status,
@@ -55,16 +59,23 @@ pub enum Outcome {
     },
     /// Saved, with something left for the user to do.
     ToDo(String),
-    /// The daemon restarts to apply it.
+    /// The daemon restarts to apply it; `todo`: what is left to do once
+    /// it is back (re-patch after a rename).
     Restarting {
         since: Instant,
+        todo: Option<String>,
     },
-    /// The daemon is back after the restart.
+    /// The daemon is back after the restart, and audio with it.
     Back {
         after: Duration,
         at: Instant,
     },
-    Failed(String),
+    /// Not applied, and why. `kept`: the edit is still in the form (a show
+    /// lock that failed to switch goes back instead).
+    Failed {
+        text: String,
+        kept: bool,
+    },
 }
 
 pub struct App {
@@ -83,10 +94,16 @@ pub struct App {
     /// The change sent last.
     pub sent: SettingsChange,
     pub outcome: Option<Outcome>,
-    /// Until when the daemon is expected to be restarting.
+    /// Until when the daemon is expected to be restarting, or coming back
+    /// from the restart with audio still down; cleared once audio is back.
     pub restart_until: Option<Instant>,
+    /// The connection dropped since the restart began: a status from
+    /// before that is the old daemon's.
+    restart_seen_down: bool,
     /// When the daemon last answered.
     pub last_alive: Option<Instant>,
+    /// Since when an application has been playing through the device.
+    io_since: Option<Instant>,
     /// The packet counters of the last half minute.
     pub packets: PacketWindow,
     pub copied: Copied,
@@ -115,7 +132,9 @@ impl App {
             sent: SettingsChange::default(),
             outcome: None,
             restart_until: None,
+            restart_seen_down: false,
             last_alive: None,
+            io_since: None,
             packets: PacketWindow::default(),
             copied: Copied::default(),
             ask_discard: false,
@@ -131,19 +150,17 @@ impl App {
             Event::Problem(problem) => {
                 self.connection = Connection::Down(problem);
                 self.last_alive = None;
+                self.io_since = None;
                 self.packets.clear();
+                self.restart_seen_down |= self.restart_until.is_some();
             }
             Event::Status(status) => {
-                if matches!(self.connection, Connection::Down(_)) {
-                    // Back from the restart, if one was expected.
-                    if self.restart_until.take().is_some()
-                        && let Some(Outcome::Restarting { since }) = self.outcome
-                    {
-                        self.outcome = Some(Outcome::Back { after: since.elapsed(), at: now });
-                    }
-                }
+                self.io_since = match (status.driver.io_running, self.io_since) {
+                    (true, since) => Some(since.unwrap_or(now)),
+                    (false, _) => None,
+                };
                 if let Some(device) = &status.device {
-                    self.packets.push(now, device.packets);
+                    self.packets.push(now, device.packets, self.playing(now));
                 }
                 // A controller (or the daemon) changed a setting: read the
                 // settings again; the user's own edits survive (rebase).
@@ -154,13 +171,15 @@ impl App {
                     self.worker.send(Command::Reload);
                 }
                 self.connection = Connection::Up(status);
+                self.check_back(now);
             }
             Event::Alive => {
                 self.last_alive = Some(now);
+                let playing = self.playing(now);
                 if let Connection::Up(status) = &self.connection
                     && let Some(device) = &status.device
                 {
-                    self.packets.push(now, device.packets);
+                    self.packets.push(now, device.packets, playing);
                 }
             }
             Event::Settings(new) => {
@@ -177,7 +196,7 @@ impl App {
                 self.outcome = Some(match logic::applied(&self.sent, restart, &receivers) {
                     logic::Applied::Saved(text) => Outcome::Saved { text, at: now },
                     logic::Applied::ToDo(text) => Outcome::ToDo(text),
-                    logic::Applied::Restarting => Outcome::Restarting { since: now },
+                    logic::Applied::Restarting { todo } => Outcome::Restarting { since: now, todo },
                 });
                 // Saved: those fields are the daemon's now; other edits
                 // stay pending.
@@ -189,19 +208,64 @@ impl App {
                 }
                 if restart == Restart::Daemon {
                     self.restart_until = Some(now + RESTART_GRACE);
+                    self.restart_seen_down = false;
                 }
             }
             Event::Applied(Err(why)) => {
                 self.applying = false;
                 // A refused show lock goes back to what the daemon holds.
+                let lock = logic::lock_only(&self.sent);
                 if let (Some(form), Some(_)) = (&mut self.form, self.sent.lock_remote_settings) {
                     form.edited.lock_remote_settings = form.current.lock_remote_settings;
                 }
-                self.outcome = Some(Outcome::Failed(match why {
-                    Unapplied::Refused(message) => logic::refusal(&message),
+                let text = match why {
+                    Unapplied::Refused(message) => {
+                        // What the daemon holds may have moved meanwhile.
+                        self.worker.send(Command::Reload);
+                        if lock { logic::lock_refusal(&message) } else { logic::refusal(&message) }
+                    }
                     Unapplied::Unsure(message) | Unapplied::NotSent(message) => message,
-                }));
+                };
+                self.outcome = Some(Outcome::Failed { text, kept: !lock });
             }
+        }
+    }
+
+    /// Ends the restart's grace once its time is up: an outage is news
+    /// again, and the Settings bar says that audio is not back.
+    fn age_restart(&mut self, now: Instant) {
+        if self.restart_until.is_some_and(|until| now >= until) {
+            self.restart_until = None;
+            self.check_back(now);
+        }
+    }
+
+    /// Whether an application has played through the device long enough
+    /// for packets sent without its audio to mean something.
+    fn playing(&self, now: Instant) -> bool {
+        self.io_since.is_some_and(|since| now.saturating_duration_since(since) >= IO_SETTLE)
+    }
+
+    /// Ends an expected restart once the new daemon answers and audio is no
+    /// longer down: until then the outage is the restart's, not news.
+    fn check_back(&mut self, now: Instant) {
+        let Connection::Up(status) = &self.connection else { return };
+        let expected = self.restart_until.is_some()
+            || matches!(self.outcome, Some(Outcome::Restarting { .. }));
+        // Until the connection drops, the old daemon is still answering.
+        let old = self.restart_until.is_some() && !self.restart_seen_down;
+        if !expected || old || logic::audio_lamp(status).light == Light::Red {
+            return;
+        }
+        self.restart_until = None;
+        if let Some(Outcome::Restarting { since, todo }) = &self.outcome {
+            let after = since.elapsed();
+            self.outcome = Some(match todo {
+                Some(todo) => {
+                    Outcome::ToDo(format!("Back after {}. {todo}", logic::ago_label(after)))
+                }
+                None => Outcome::Back { after, at: now },
+            });
         }
     }
 
@@ -221,11 +285,13 @@ impl App {
         }
     }
 
-    /// Whether the daemon is away because a change restarts it.
+    /// Whether a change the user accepted restarts the daemon, and audio is
+    /// not back yet: the daemon is away, or back with its clock still
+    /// locking. After [`RESTART_GRACE`] an outage is news again.
     pub fn restarting(&self, ctx: &egui::Context) -> bool {
         let Some(until) = self.restart_until else { return false };
         let left = until.saturating_duration_since(Instant::now());
-        if left.is_zero() || !matches!(self.connection, Connection::Down(_)) {
+        if left.is_zero() {
             return false;
         }
         // Show the problem, if there still is one, when the time is up.
@@ -264,11 +330,14 @@ impl App {
                         grey(logic::NONE, ""),
                     ];
                 }
-                [
-                    logic::audio_lamp(status),
-                    logic::clock_lamp(&status.clock),
-                    logic::driver_lamp(&status.driver),
-                ]
+                // Back from a restart, with the clock still locking: the
+                // silence is the restart's.
+                let audio = if self.restarting(ctx) {
+                    logic::restarting_lamp()
+                } else {
+                    logic::audio_lamp(status)
+                };
+                [audio, logic::clock_lamp(&status.clock), logic::driver_lamp(&status.driver)]
             }
             Connection::Connecting => logic::absent_lamps(None, false),
             Connection::Down(problem) => logic::absent_lamps(Some(problem), self.restarting(ctx)),
@@ -290,26 +359,35 @@ impl App {
     fn header(&mut self, ui: &mut Ui) {
         let p = theme::palette(ui);
         let locked = self.device().is_some_and(|d| d.remote_settings_locked);
-        // Controllers' news has a section of its own on Status: no badge.
+        // Controllers' news has a section of its own on Status, and a
+        // restart's alarms are expected: no badge for either.
         let warnings = match &self.connection {
+            Connection::Up(_) if self.restarting(ui.ctx()) => None,
             Connection::Up(status) => {
                 let (urgent, other) = logic::split_warnings(status);
                 let (problems, _) = logic::problems_and_news(other);
                 if !urgent.is_empty() || !status.engine_running {
-                    Some(Light::Red)
+                    Some((Light::Red, "audio is down"))
                 } else {
-                    (!problems.is_empty()).then_some(Light::Amber)
+                    (!problems.is_empty()).then_some((Light::Amber, "warnings"))
                 }
             }
             _ => None,
         };
         let status_badge = if self.tab == Tab::Status { None } else { warnings };
-        let settings_badge = (self.tab != Tab::Settings && self.pending()).then_some(Light::Amber);
+        let settings_badge = (self.tab != Tab::Settings && self.pending())
+            .then_some((Light::Amber, "changes not applied"));
         let mut tab = self.tab;
         egui::Sides::new().shrink_left().show(
             ui,
             |ui| {
-                ui.add(Label::new(RichText::new(self.device_name()).heading()).truncate());
+                // The name gives way to the badge, not the badge to the
+                // tabs.
+                let badge = if locked { 100.0 } else { 0.0 };
+                ui.scope(|ui| {
+                    ui.set_max_width((ui.available_width() - badge).max(48.0));
+                    ui.add(Label::new(RichText::new(self.device_name()).heading()).truncate());
+                });
                 if locked {
                     lock_badge(ui);
                 }
@@ -348,8 +426,11 @@ impl App {
         let lamps = self.lamps(ui.ctx());
         let gap = 8.0;
         let width = ui.available_width();
-        let audio = (width * 0.40).max(180.0).min(width - 2.0 * (120.0 + gap));
-        let other = ((width - audio - 2.0 * gap) / 2.0).max(80.0);
+        // Audio takes 40 % (180 pt at least) while the others keep 120 pt;
+        // when even that does not fit (a narrow window, zoomed in), thirds.
+        let third = ((width - 2.0 * gap) / 3.0).max(0.0);
+        let audio = (width * 0.40).max(180.0).min(width - 2.0 * (120.0 + gap)).max(third);
+        let other = ((width - audio - 2.0 * gap) / 2.0).max(0.0);
         let height = 76.0;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
@@ -372,9 +453,12 @@ impl App {
 
     /// Whether anything is pinned under the header.
     fn has_alerts(&self, ctx: &egui::Context) -> bool {
+        if self.restarting(ctx) {
+            return true;
+        }
         match &self.connection {
             Connection::Connecting => false,
-            Connection::Down(_) => self.restarting(ctx) || self.tab == Tab::Settings,
+            Connection::Down(_) => self.tab == Tab::Settings,
             Connection::Up(status) => {
                 self.stale().is_some() || !status.engine_running || status.urgent_warnings > 0
             }
@@ -384,28 +468,25 @@ impl App {
     /// What is pinned under the header on both tabs: an outage, a restart,
     /// a stale status. It never scrolls away.
     fn alerts(&mut self, ui: &mut Ui) {
-        let restarting = self.restarting(ui.ctx());
         let compact = self.tab == Tab::Settings;
+        if self.restarting(ui.ctx()) {
+            // Expected: the user accepted it. Until audio is back, the
+            // daemon's own alarms are the restart's.
+            let since = match self.outcome {
+                Some(Outcome::Restarting { since, .. }) => Some(since.elapsed()),
+                _ => None,
+            };
+            widgets::notice(ui, Severity::Progress, "OpenVirtualSoundcard is restarting", |ui| {
+                let mut text = "Audio returns in 10–20 s, in both directions.".to_owned();
+                if let Some(since) = since {
+                    text = format!("{} so far. {text}", logic::ago_label(since));
+                    ui.ctx().request_repaint_after(Duration::from_secs(1));
+                }
+                ui.label(text);
+            });
+            return;
+        }
         match &self.connection {
-            Connection::Down(_) if restarting => {
-                let since = match self.outcome {
-                    Some(Outcome::Restarting { since }) => Some(since.elapsed()),
-                    _ => None,
-                };
-                widgets::notice(
-                    ui,
-                    Severity::Progress,
-                    "OpenVirtualSoundcard is restarting",
-                    |ui| {
-                        let mut text = "Audio returns in 10–20 s, in both directions.".to_owned();
-                        if let Some(since) = since {
-                            text = format!("{} so far. {text}", logic::ago_label(since));
-                            ui.ctx().request_repaint_after(Duration::from_secs(1));
-                        }
-                        ui.label(text);
-                    },
-                );
-            }
             Connection::Down(problem) => {
                 let problem = problem.clone();
                 widgets::notice(ui, Severity::Urgent, &problem.title(), |ui| {
@@ -469,15 +550,15 @@ impl App {
     }
 
     /// Cmd-1 and Cmd-2 for the tabs, Cmd-comma for Settings, Cmd-W to
-    /// close, Cmd-M to minimise.
+    /// close. No Cmd-M: egui-winit marks a window it minimises as minimised
+    /// for good on macOS, and eframe would stop drawing it once restored.
     fn shortcuts(&mut self, ctx: &egui::Context) {
         let cmd = |key| KeyboardShortcut::new(Modifiers::COMMAND, key);
-        let (status, settings, close, minimise) = ctx.input_mut(|i| {
+        let (status, settings, close) = ctx.input_mut(|i| {
             (
                 i.consume_shortcut(&cmd(Key::Num1)),
                 i.consume_shortcut(&cmd(Key::Num2)) || i.consume_shortcut(&cmd(Key::Comma)),
                 i.consume_shortcut(&cmd(Key::W)),
-                i.consume_shortcut(&cmd(Key::M)),
             )
         });
         if status {
@@ -488,9 +569,6 @@ impl App {
         }
         if close {
             ctx.send_viewport_cmd(ViewportCommand::Close);
-        }
-        if minimise {
-            ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
         }
     }
 
@@ -553,9 +631,12 @@ impl App {
     }
 
     /// Outside the window: its title names the device and says when audio
-    /// is down, and an outage asks for attention (the Dock icon bounces)
-    /// while the window is in the background. No sound: the Mac's default
-    /// output may be this very device.
+    /// is down, and an outage asks for attention while the window is in the
+    /// background: the Dock icon bounces once, since macOS cannot be told
+    /// to stop a critical request when audio comes back. No sound: the
+    /// Mac's default output may be this very device. Called from
+    /// [`eframe::App::logic`], which runs while the window is covered or
+    /// minimised too.
     fn window_signals(&mut self, ctx: &egui::Context, audio: &Lamp) {
         let name = self.device_name();
         let down = audio.light == Light::Red;
@@ -574,7 +655,7 @@ impl App {
         if down && !self.alerted {
             if !ctx.input(|i| i.viewport().focused.unwrap_or(true)) {
                 ctx.send_viewport_cmd(ViewportCommand::RequestUserAttention(
-                    egui::UserAttentionType::Critical,
+                    egui::UserAttentionType::Informational,
                 ));
             }
             self.alerted = true;
@@ -637,11 +718,16 @@ fn lock_badge(ui: &mut Ui) {
 }
 
 impl eframe::App for App {
-    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    /// Runs before every frame, and while the window is hidden too (covered
+    /// or minimised), whenever the worker has news.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let events: Vec<Event> = self.worker.events().collect();
         for event in events {
             self.handle(event);
         }
+        self.age_restart(Instant::now());
+        let audio = self.lamps(ctx)[0].clone();
+        self.window_signals(ctx, &audio);
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
@@ -649,8 +735,6 @@ impl eframe::App for App {
         self.shortcuts(&ctx);
         self.guard_close(&ctx);
         self.age_outcome(&ctx);
-        let audio = self.lamps(&ctx)[0].clone();
-        self.window_signals(&ctx, &audio);
         if matches!(self.connection, Connection::Up(_)) {
             // Ticks the stale check and the counters' half minute.
             ctx.request_repaint_after(Duration::from_secs(1));

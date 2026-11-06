@@ -175,28 +175,45 @@ pub fn confirmation(
 ) -> Option<Confirmation> {
     let restart = expected_restart(change);
     let rename = change.name.as_ref().map(|new| rename_warning(&current.name, new, receivers));
-    let (cost, mut text) = match (interruption(restart), &rename) {
-        (Some((cost, details)), _) => (cost.to_owned(), vec![details.to_owned()]),
-        (None, Some(_)) => {
-            ("Other devices lose their subscriptions to this one.".to_owned(), vec![])
-        }
-        (None, None) => return None,
+    let (title, button) = match (restart, rename.is_some()) {
+        (Restart::None, false) => return None,
+        (Restart::None, true) => ("Rename the device?", "Rename"),
+        (Restart::Receive, false) => ("Change the receive latency?", "Change"),
+        (Restart::Receive, true) => ("Rename the device and change its latency?", "Apply"),
+        (Restart::Device, false) => ("Restart the network engine?", "Restart"),
+        (Restart::Daemon, false) => ("Restart OpenVirtualSoundcard?", "Restart"),
+        (Restart::Device | Restart::Daemon, true) => ("Rename the device and restart?", "Restart"),
     };
-    text.extend(rename);
-    let (title, button) = match restart {
-        Restart::Daemon => ("Restart OpenVirtualSoundcard?", "Restart"),
-        Restart::Device => ("Restart the network engine?", "Restart"),
-        Restart::Receive => ("Change the receive latency?", "Change"),
-        Restart::None => ("Rename the device?", "Rename"),
-    };
+    let mut costs = Vec::new();
+    let mut text = Vec::new();
+    if let Some((cost, details)) = interruption(restart) {
+        costs.push(cost);
+        // A rename stops the returns whatever restarts: the latency's
+        // details must not say that they carry on.
+        text.push(if rename.is_some() && restart == Restart::Receive {
+            RECEIVE_WITH_RENAME.to_owned()
+        } else {
+            details.to_owned()
+        });
+    }
+    if let Some(warning) = rename {
+        costs.push("Other devices lose their subscriptions to this one.");
+        text.push(warning);
+    }
     Some(Confirmation {
         title,
         changes: change_lines(current, change, interfaces),
-        cost,
+        cost: costs.join(" "),
         text: text.join("\n\n"),
         button,
     })
 }
+
+/// [`interruption`]'s details for a new latency that comes with a new name,
+/// which stops the returns: without the sentence that they carry on.
+const RECEIVE_WITH_RENAME: &str = "This device requests its inputs again at the new latency. Core \
+    Audio sees the inputs' timing change, and some applications restart their audio engine on \
+    that.";
 
 /// One line per changed field, old value to new: `Latency: 1 ms → 2 ms`.
 pub fn change_lines(
@@ -256,46 +273,70 @@ pub enum Applied {
     Saved(String),
     /// Done, and the user has something to do (re-patch after a rename).
     ToDo(String),
-    /// The daemon restarts to apply it: the app follows the restart.
-    Restarting,
+    /// The daemon restarts to apply it: the app follows the restart, and
+    /// says what is left to do once it is back.
+    Restarting { todo: Option<String> },
+}
+
+/// What a rename to `new` leaves to do; `receivers` received from this
+/// device.
+pub fn rename_todo(new: &str, receivers: &[String]) -> String {
+    let who = if receivers.is_empty() {
+        String::new()
+    } else {
+        format!(" ({} received from this device)", list_words(receivers))
+    };
+    format!(
+        "To do: patch the subscriptions to this device's channels again, to “{new}”, in Dante \
+         Controller{who}."
+    )
 }
 
 /// What the user is told once the daemon accepted `change`, which restarts
 /// `restart`. `receivers` receive from this device.
 pub fn applied(change: &SettingsChange, restart: Restart, receivers: &[String]) -> Applied {
+    let todo = change.name.as_deref().map(|new| rename_todo(new, receivers));
+    let saved = |text: &str| match &todo {
+        Some(todo) => Applied::ToDo(format!("{text} {todo}")),
+        None => Applied::Saved(text.to_owned()),
+    };
     match restart {
-        Restart::Daemon => Applied::Restarting,
-        Restart::Device => Applied::Saved(
-            "Saved. The network engine restarts; audio returns in a second or two, and the \
-             console requests the returns again on its own."
-                .into(),
-        ),
-        Restart::Receive => Applied::Saved(
-            "Saved. The inputs return at the new latency in about a second; the returns carried \
-             on."
-            .into(),
-        ),
-        Restart::None if change.name.is_some() => {
-            let new = change.name.as_deref().unwrap_or_default();
-            let who = if receivers.is_empty() {
-                String::new()
-            } else {
-                format!(" ({} received from this device)", list_words(receivers))
-            };
-            Applied::ToDo(format!(
-                "Renamed. To do: patch the subscriptions to this device's channels again, to \
-                 “{new}”, in Dante Controller{who}."
-            ))
+        Restart::Daemon => Applied::Restarting { todo },
+        // With a rename the console cannot request the returns again
+        // until it is re-patched.
+        Restart::Device if todo.is_some() => {
+            saved("Saved. The network engine restarts; the inputs return in a second or two.")
         }
-        Restart::None => Applied::Saved(
-            match change.lock_remote_settings {
-                Some(true) => "Show lock on: Dante Controller can no longer change these settings.",
-                Some(false) => "Show lock off: Dante Controller can change these settings again.",
-                None => "Saved.",
-            }
-            .into(),
+        Restart::Device => saved(
+            "Saved. The network engine restarts; audio returns in a second or two, and the \
+             console requests the returns again on its own.",
         ),
+        Restart::Receive if todo.is_some() => {
+            saved("Saved. The inputs return at the new latency in about a second.")
+        }
+        Restart::Receive => saved(
+            "Saved. The inputs return at the new latency in about a second; the returns carried \
+             on.",
+        ),
+        Restart::None if todo.is_some() => saved("Renamed."),
+        Restart::None => saved(match change.lock_remote_settings {
+            Some(true) => "Show lock on: Dante Controller can no longer change these settings.",
+            Some(false) => "Show lock off: Dante Controller can change these settings again.",
+            None => "Saved.",
+        }),
     }
+}
+
+/// Whether `change` only turns the show lock on or off, which the form
+/// applies as soon as it is switched.
+pub fn lock_only(change: &SettingsChange) -> bool {
+    change.lock_remote_settings.is_some()
+        && SettingsChange { lock_remote_settings: None, ..change.clone() }.is_empty()
+}
+
+/// A show lock the daemon refused to switch, in words.
+pub fn lock_refusal(message: &str) -> String {
+    refusal(message).replacen("Not saved:", "Show lock not changed:", 1)
 }
 
 /// A change the daemon refused, in words: `Not saved: The name is taken.`
@@ -697,13 +738,25 @@ pub fn audio_lamp(status: &Status) -> Lamp {
                           silence. Choose it as the host's input and output."
             .to_owned();
         if !driver.audio_flowing {
-            detail.push_str(&format!(
-                " Audio would not flow yet: the clock is {}.",
-                clock_light(&status.clock).1.to_lowercase()
-            ));
+            let why = match status.clock.state.as_str() {
+                "Locked" => "the driver holds it back for a moment".to_owned(),
+                _ => format!("the clock is {}", clock_light(&status.clock).1.to_lowercase()),
+            };
+            detail.push_str(&format!(" Audio would not flow yet: {why}."));
         }
         Lamp::new(Light::Grey, "Idle", "No application is playing", detail)
     }
+}
+
+/// The audio lamp while a change the user accepted restarts the daemon,
+/// until audio is back: the outage is expected.
+pub fn restarting_lamp() -> Lamp {
+    Lamp::new(
+        Light::Amber,
+        "Restarting",
+        "Back in 10–20 s",
+        "OpenVirtualSoundcard is restarting: audio returns in 10–20 s.",
+    )
 }
 
 /// The lamps while the app has no status: what it knows about the audio
@@ -712,12 +765,7 @@ pub fn audio_lamp(status: &Status) -> Lamp {
 pub fn absent_lamps(problem: Option<&Problem>, restarting: bool) -> [Lamp; 3] {
     let unknown = || Lamp::new(Light::Grey, NONE, "", "");
     let audio = if restarting {
-        Lamp::new(
-            Light::Amber,
-            "Restarting",
-            "Back in 10–20 s",
-            "OpenVirtualSoundcard is restarting: audio returns in 10–20 s.",
-        )
+        restarting_lamp()
     } else {
         match problem {
             Some(Problem::NotRunning) => Lamp::new(
@@ -984,17 +1032,19 @@ pub fn ago_label(d: Duration) -> String {
 /// rose lately rather than since the engine started.
 #[derive(Default)]
 pub struct PacketWindow {
-    samples: VecDeque<(Instant, PacketCounts)>,
+    /// When, the counters, and whether an application was playing then.
+    samples: VecDeque<(Instant, PacketCounts, bool)>,
 }
 
 /// How far back [`PacketWindow`] looks.
 pub const PACKET_WINDOW: Duration = Duration::from_secs(30);
 
 impl PacketWindow {
-    /// Records `counts` read at `now`. A counter that went back (the engine
-    /// restarted) starts the window again.
-    pub fn push(&mut self, now: Instant, counts: PacketCounts) {
-        if let Some((_, last)) = self.samples.back()
+    /// Records `counts` read at `now`; `playing`: an application has been
+    /// playing through the device for a few seconds. A counter that went
+    /// back (the engine restarted) starts the window again.
+    pub fn push(&mut self, now: Instant, counts: PacketCounts, playing: bool) {
+        if let Some((_, last, _)) = self.samples.back()
             && (counts.rx_late < last.rx_late
                 || counts.rx_lost < last.rx_lost
                 || counts.tx_underruns < last.tx_underruns
@@ -1002,7 +1052,7 @@ impl PacketWindow {
         {
             self.samples.clear();
         }
-        self.samples.push_back((now, counts));
+        self.samples.push_back((now, counts, playing));
         // Keep the newest sample from before the window as the baseline.
         while self.samples.len() > 1
             && now.saturating_duration_since(self.samples[1].0) >= PACKET_WINDOW
@@ -1012,16 +1062,18 @@ impl PacketWindow {
     }
 
     /// How much each counter rose over the window: late, lost, sent
-    /// without audio.
+    /// without audio. Packets go out without audio whenever no application
+    /// plays, so that one counts only since one has been playing.
     pub fn rises(&self) -> (u64, u64, u64) {
-        match (self.samples.front(), self.samples.back()) {
-            (Some((_, a)), Some((_, b))) => (
-                b.rx_late.saturating_sub(a.rx_late),
-                b.rx_lost.saturating_sub(a.rx_lost),
-                b.tx_underruns.saturating_sub(a.tx_underruns),
-            ),
-            _ => (0, 0, 0),
-        }
+        let (Some(a), Some(b)) = (self.samples.front(), self.samples.back()) else {
+            return (0, 0, 0);
+        };
+        let quiet = self.samples.iter().rev().find(|s| !s.2).unwrap_or(a);
+        (
+            b.1.rx_late.saturating_sub(a.1.rx_late),
+            b.1.rx_lost.saturating_sub(a.1.rx_lost),
+            b.1.tx_underruns.saturating_sub(quiet.1.tx_underruns),
+        )
     }
 
     pub fn clear(&mut self) {
@@ -1353,13 +1405,43 @@ mod tests {
         assert_eq!(c.cost, interruption(Restart::Receive).unwrap().0);
         let both = change(&s, &Settings { name: "x".into(), sample_rate: 96_000, ..settings() });
         let c = confirmation(&both, &s, &[], &[]).unwrap();
-        assert_eq!(c.title, "Restart OpenVirtualSoundcard?");
+        assert_eq!(c.title, "Rename the device and restart?");
         assert!(c.cost.contains("10–20 s") && c.text.contains("“x”"), "{c:?}");
         assert_eq!(c.changes, ["Name: studio-mac → x", "Sample rate: 48 kHz → 96 kHz"]);
+        let rate = change(&s, &Settings { sample_rate: 96_000, ..settings() });
+        let c = confirmation(&rate, &s, &[], &[]).unwrap();
+        assert_eq!((c.title, c.button), ("Restart OpenVirtualSoundcard?", "Restart"));
         // The lock interrupts nothing.
         let lock = change(&s, &Settings { lock_remote_settings: true, ..settings() });
         assert_eq!(lock, SettingsChange { lock_remote_settings: Some(true), ..Default::default() });
         assert_eq!(confirmation(&lock, &s, &[], &[]), None);
+        assert!(lock_only(&lock) && !lock_only(&latency) && !lock_only(&SettingsChange::default()));
+    }
+
+    #[test]
+    fn a_rename_with_another_change_says_both() {
+        let s = settings();
+        let receivers = ["desk".to_owned()];
+        // With a new latency: the returns stop for the rename, so nothing
+        // may say they carry on.
+        let both = change(&s, &Settings { name: "vox-fx".into(), latency_ms: 2.0, ..settings() });
+        let c = confirmation(&both, &s, &receivers, &[]).unwrap();
+        assert_eq!(c.title, "Rename the device and change its latency?");
+        assert!(c.cost.contains("about a second") && c.cost.contains("subscriptions"), "{c:?}");
+        assert!(!c.text.contains("carry on") && c.text.contains("“vox-fx”"), "{c:?}");
+        let Applied::ToDo(text) = applied(&both, Restart::Receive, &receivers) else {
+            panic!("the rename leaves something to do");
+        };
+        assert!(text.contains("new latency") && text.contains("again, to “vox-fx”"), "{text}");
+        assert!(!text.contains("carried on"), "{text}");
+        // With a restart: the to-do waits for the daemon to come back.
+        let both =
+            change(&s, &Settings { name: "vox-fx".into(), sample_rate: 96_000, ..settings() });
+        let Applied::Restarting { todo: Some(todo) } = applied(&both, Restart::Daemon, &receivers)
+        else {
+            panic!("the rename's to-do follows the restart");
+        };
+        assert!(todo.starts_with("To do:") && todo.contains("(desk received"), "{todo}");
     }
 
     #[test]
@@ -1390,7 +1472,7 @@ mod tests {
     fn what_an_accepted_change_says() {
         let none = SettingsChange::default();
         assert_eq!(applied(&none, Restart::None, &[]), Applied::Saved("Saved.".into()));
-        assert_eq!(applied(&none, Restart::Daemon, &[]), Applied::Restarting);
+        assert_eq!(applied(&none, Restart::Daemon, &[]), Applied::Restarting { todo: None });
         let Applied::Saved(text) = applied(&none, Restart::Receive, &[]) else { panic!() };
         assert!(text.contains("carried on"), "{text}");
         let Applied::Saved(text) = applied(&none, Restart::Device, &[]) else { panic!() };
@@ -1406,6 +1488,7 @@ mod tests {
             "Not saved: The settings are locked against changes from the network."
         );
         assert_eq!(refusal("Bad name."), "Not saved: Bad name.");
+        assert_eq!(lock_refusal("busy"), "Show lock not changed: Busy.");
     }
 
     #[test]
@@ -1819,15 +1902,33 @@ mod tests {
         let counts =
             |late, lost| PacketCounts { rx_late: late, rx_lost: lost, ..Default::default() };
         let mut w = PacketWindow::default();
-        w.push(t0, counts(10, 1));
-        w.push(t0 + Duration::from_secs(10), counts(30, 1));
+        w.push(t0, counts(10, 1), true);
+        w.push(t0 + Duration::from_secs(10), counts(30, 1), true);
         assert_eq!(w.rises(), (20, 0, 0));
-        w.push(t0 + Duration::from_secs(45), counts(30, 4));
+        w.push(t0 + Duration::from_secs(45), counts(30, 4), true);
         // The first sample is older than the window now.
         assert_eq!(w.rises(), (0, 3, 0));
         // An engine restart sets the counters back: start over.
-        w.push(t0 + Duration::from_secs(46), counts(0, 0));
+        w.push(t0 + Duration::from_secs(46), counts(0, 0), true);
         assert_eq!(w.rises(), (0, 0, 0));
+    }
+
+    #[test]
+    fn packets_sent_without_audio_count_only_while_an_application_plays() {
+        let t0 = Instant::now();
+        let sent = |n| PacketCounts { tx_underruns: n, ..Default::default() };
+        let at = |s| t0 + Duration::from_secs(s);
+        let mut w = PacketWindow::default();
+        // Nothing plays: every packet goes out without audio, and that is
+        // no news.
+        w.push(at(0), sent(0), false);
+        w.push(at(10), sent(10_000), false);
+        assert_eq!(w.rises().2, 0);
+        // An application starts: only what happens after counts.
+        w.push(at(14), sent(14_000), true);
+        assert_eq!(w.rises().2, 4_000);
+        w.push(at(20), sent(14_000), true);
+        assert_eq!(w.rises().2, 4_000);
     }
 
     #[test]

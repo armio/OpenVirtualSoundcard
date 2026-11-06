@@ -403,8 +403,9 @@ without it.
     clock that has not locked, or lost its leader past the holdover; a gate
     closed for 2 s while an application plays; a stopped transmit engine);
   * red **Off**, **No answer** or **Lost**: the daemon is not running, does
-    not answer, or the connection to it was lost; amber **Restarting**
-    while it restarts after a change from the app.
+    not answer, or the connection to it was lost;
+  * amber **Restarting**: a change from the app restarts the daemon, until
+    audio is back (the clock locked) or 40 s have passed.
 
   **Clock** is green **Locked** (to the leader it names), amber
   **Locking** or **Holdover**, red **Unlocked**, or grey **Free running**
@@ -414,10 +415,10 @@ without it.
 * While audio is down, a red **Audio is down** panel stays under the header
   on both tabs, with what happened, what to do, and any command to run with
   a button to copy it (`sudo killall coreaudiod` for a failed driver). The
-  window's title starts with "Audio down", and if the window is in the
-  background the Dock icon bounces. A panel also says when the daemon
-  restarts after a change, and when no status has arrived for a few
-  seconds.
+  window's title starts with "Audio down", also while the window is
+  covered or minimised, and if the window is in the background the Dock
+  icon bounces once. A panel also says when the daemon restarts after a
+  change, and when no status has arrived for a few seconds.
 * **Status** lists the other warnings first, in amber: a warning about a
   counter (lost, late or early packets, datagrams from a stray sender, send
   errors, late sends, skipped packets, expired flows, late output or early
@@ -454,8 +455,7 @@ without it.
   * A new interface, rate, bit depth or channel count is written into
     `ovsc.toml`, keeping its comments, and restarts the whole daemon:
     audio stops for 10 to 20 seconds in both directions while the clock
-    locks again. The app counts the seconds and says when the daemon is
-    back.
+    locks again. The app counts the seconds and says when audio is back.
   * A new name applies at once, but subscriptions other devices made to
     OpenVirtualSoundcard's outputs name the old one: they stop resolving
     until patched again in Dante Controller. The question lists the devices
@@ -464,10 +464,11 @@ without it.
     soon as it is switched, and interrupts nothing.
 
   A change the daemon refuses stays in the form, with the daemon's reason.
-  Closing the window with changes not applied asks first.
-* `⌘1` and `⌘2` (or `⌘,`) switch to Status and Settings, `⌘W` closes the
-  window and `⌘M` minimises it. The app follows the system's light or dark
-  appearance, and remembers its window's size and place.
+  Closing the window with changes not applied asks first (quitting with
+  `⌘Q` does not).
+* `⌘1` and `⌘2` (or `⌘,`) switch to Status and Settings, and `⌘W` closes
+  the window. The app follows the system's light or dark appearance, and
+  remembers its window's size and place.
 
 Build it with `packaging/macos/build-app.sh`, which needs nothing beyond
 Rust and the command-line tools. It is signed ad hoc; built on the Mac that

@@ -170,10 +170,12 @@ pub fn install(ctx: &Context) {
     ctx.style_mut_of(Theme::Dark, |s| colours(s, &DARK));
     ctx.style_mut_of(Theme::Light, |s| colours(s, &LIGHT));
     // A testing hook, like OVSC_CONTROL_SOCKET: force an appearance.
+    // Otherwise follow the system, also after a forced run: egui remembers
+    // the preference across launches.
     match std::env::var("OVSC_APP_THEME").as_deref() {
         Ok("light") => ctx.set_theme(Theme::Light),
         Ok("dark") => ctx.set_theme(Theme::Dark),
-        _ => {}
+        _ => ctx.set_theme(egui::ThemePreference::System),
     }
 }
 
