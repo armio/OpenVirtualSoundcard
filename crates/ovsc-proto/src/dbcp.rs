@@ -56,7 +56,7 @@ pub struct FlowRequest {
     pub rx_addr: Ipv4Addr,
     pub rx_port: u16,
     /// A redundant receiver's address on the secondary network: the
-    /// transmitter sends the flow there too (PROTOCOL.md §6.2, §13).
+    /// transmitter sends the flow there too (PROTOCOL.md §6.2, §11).
     pub secondary: Option<SocketAddrV4>,
 }
 

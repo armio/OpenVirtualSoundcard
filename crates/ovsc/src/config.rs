@@ -64,6 +64,21 @@ impl Default for ClockConfig {
 /// PTP followers correct (real oscillators stay within ±100 ppm).
 pub const MAX_RATE_PPM: f64 = 500.0;
 
+/// The PTP follower's secondary network, for a device on both networks of a
+/// redundant Dante system: the clock follows the leader there while the
+/// primary network has none.
+pub fn ptp_secondary(device: &ovsc_core::DeviceConfig) -> Option<ovsc_clock::ptp::PtpSecondary> {
+    // One that cannot be found is the device's to report: it runs on the
+    // primary network alone then (`DeviceInfo::secondary_missing`). One on
+    // the primary's network is refused when the device starts.
+    match device.secondary_interface.as_str() {
+        "" => None,
+        spec => ovsc_core::net::Interface::find(spec).ok().map(|iface| {
+            ovsc_clock::ptp::PtpSecondary { interface: iface.ip, netmask: iface.netmask }
+        }),
+    }
+}
+
 /// The rate of a free-running clock `ppm` parts per million fast (or slow,
 /// if negative): media nanoseconds per local nanosecond.
 pub fn rate_from_ppm(ppm: f64) -> anyhow::Result<f64> {

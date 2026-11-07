@@ -498,6 +498,22 @@ async fn a_redundant_flow_runs_on_both_networks() {
     tx.shutdown().await;
 }
 
+/// A secondary interface that cannot be found at start (its cable out)
+/// leaves the device on the primary network alone, saying why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_secondary_interface_leaves_the_primary_running() {
+    let mut cfg = config("no-second", 24570, 14);
+    cfg.secondary_interface = "no-such-if9".into();
+    let dev = Device::start(cfg, system_clock()).await.unwrap();
+    assert!(dev.info().secondary.is_none());
+    assert!(dev.info().secondary_missing.as_deref().unwrap().contains("no-such-if9"));
+    // A secondary on the primary interface is a mistake, refused.
+    let mut cfg = config("same-twice", 24580, 15);
+    cfg.secondary_interface = "127.0.0.1".into();
+    assert!(Device::start(cfg, system_clock()).await.is_err());
+    dev.shutdown().await;
+}
+
 /// Runs `f` to completion from a synchronous check, on a thread of its own.
 #[cfg(target_os = "linux")]
 fn futures_lite_block<T: Send + 'static>(

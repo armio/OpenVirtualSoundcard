@@ -44,6 +44,9 @@ pub struct DeviceInfo {
     pub iface: Interface,
     /// The interface on the secondary network, for a redundant device.
     pub secondary: Option<Interface>,
+    /// Why the configured secondary interface is not in use, when it could
+    /// not be found at start: the device runs on the primary network alone.
+    pub secondary_missing: Option<String>,
     pub device_id: DeviceId,
     pub process_id: u16,
     /// Name used when the user hasn't chosen one.
@@ -111,6 +114,7 @@ impl DeviceInfo {
         Ok(Self {
             iface,
             secondary: None,
+            secondary_missing: None,
             device_id,
             process_id: config.process_id,
             factory_name,

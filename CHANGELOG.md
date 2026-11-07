@@ -55,6 +55,15 @@ The first public version, not released yet.
   transmit (send errors, lateness, skipped packets, resyncs, expired flows,
   real-time scheduling) and the clock (unlocks, steps, leader changes,
   holdover), logged as problems happen.
+- Dante redundancy: with `[device] secondary_interface` (or **Secondary
+  network** in the app), the device is on both networks of a redundant
+  Dante system. Flows with redundant devices run on both networks, and
+  either network can fail without a gap; a packet is lost only when neither
+  network brought it in time. The clock follows the PTP leader on the
+  secondary network while the primary has none. Dante Controller sees both
+  interfaces; the app's Networks section and its warnings show what each
+  network brings. A secondary network that is down never stops the
+  primary's audio.
 - Health in the app and the log: the app's Audio tile is green **Flowing**
   only while an application plays and nothing audible went wrong in the
   last 30 s, grey **Idle** when none plays, amber **Dropouts** when
@@ -104,6 +113,8 @@ The first public version, not released yet.
   fixed.
 - Transmit flows accept 2 to 32 frames per packet and 1 to 8 channels, as
   advertised. A flow requested again with another packet size is replaced.
+- A granted flow request is answered as real transmitters answer it: the
+  handle, then a result per network.
 - The macOS driver fades over 5 ms when its gate opens or closes, and sends
   silence for NaN or infinite output.
 - The state file is written durably with a backup, and a damaged one is kept

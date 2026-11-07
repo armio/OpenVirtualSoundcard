@@ -691,7 +691,7 @@ impl Conmon {
                     (flow_arrivals(&stats, MAX_RX_FLOWS), flow_late_packets(&stats, MAX_RX_FLOWS))
                 }
                 // Each flow on each network: the primary's flows, then the
-                // secondary's (PROTOCOL.md §7.6, 0x8003).
+                // secondary's (PROTOCOL.md §7.7, 0x8003).
                 Some(_) => (0..2).fold((Vec::new(), Vec::new()), |(mut a, mut l), net| {
                     a.extend(network_arrivals(&stats, MAX_RX_FLOWS, net));
                     l.extend(network_late_packets(&stats, MAX_RX_FLOWS, net));

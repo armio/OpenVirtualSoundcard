@@ -2017,7 +2017,7 @@ struct FlowParams {
     /// For a flow on both networks of a redundant system, the secondary
     /// network: its copy may come from any address there, as the
     /// transmitter's address on it is not announced where we look
-    /// (PROTOCOL.md §13).
+    /// (PROTOCOL.md §11).
     secondary: Option<Subnet>,
     /// Slots per packet, fixed when the flow was requested.
     slots: usize,

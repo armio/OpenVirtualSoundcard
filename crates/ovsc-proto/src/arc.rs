@@ -219,7 +219,7 @@ pub struct ChannelCounts {
     pub supports_tx_multicast: bool,
     /// Network interfaces: 2 for a device on both networks of a redundant
     /// system. Receive-flow entries of the heartbeat are per interface
-    /// (PROTOCOL.md §7.6).
+    /// (PROTOCOL.md §7.7).
     pub network_interfaces: u16,
 }
 
@@ -841,7 +841,7 @@ pub struct RxFlowInfo {
     pub secondary: Option<SocketAddrV4>,
     /// The networks the flow's packets arrive on: bit 0 the primary, bit 1
     /// the secondary (the status's "interfaces receiving"; see PROTOCOL.md
-    /// §13 for what is known of it).
+    /// §11 for what is known of it).
     pub networks: u16,
     pub latency_ns: u32,
     pub status: SubscriptionStatus,

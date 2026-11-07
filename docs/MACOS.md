@@ -163,6 +163,52 @@ address, the daemon keeps running and retries every few seconds (2 s, backing
 off to 5 s), logging `cannot start the engine: ...; retrying until it
 starts`. The device stays present and silent meanwhile.
 
+### Dante redundancy: two networks
+
+On a redundant Dante system (separate primary and secondary networks, each
+with its own switches, and devices with a port on each), give the Mac a
+second wired interface on the secondary network and name it in
+`[device] secondary_interface`, or choose it under **Secondary network** in
+the app's Settings (this restarts the daemon):
+
+```toml
+[device]
+interface = "en7"            # the primary network
+secondary_interface = "en8"  # the secondary network, often 172.31.x.x/16
+```
+
+The secondary interface must be another interface, on another network than
+the primary's. With it, OVSC:
+
+* announces itself on both networks (Dante Controller lists both
+  addresses), and asks redundant transmitters for their flows on both. A
+  device on one network still gets its flows on the primary;
+* receives each redundant flow on both networks and plays whichever copy
+  arrives: either network can fail, a cable or a switch, without a gap;
+* sends its own flows on both networks to receivers that ask for that;
+* follows the PTP leader on the primary network, and on the secondary while
+  the primary has none (after 2 s without its messages; back to the primary
+  after 10 s of steady messages there);
+* keeps its control services (Dante Controller's view, renames, settings)
+  on the primary network.
+
+The app's Status tab then has a **Networks** section: what each network
+brings, its packets, and which network the clock follows. Warnings say
+when a network brings nothing, and redundancy is lost.
+
+A secondary interface without an address when the daemon starts (its cable
+out) leaves the device on the primary network alone, with a warning, until
+the daemon restarts. The daemon never restarts on its own for the secondary
+interface: audio goes on on the primary meanwhile. If the secondary
+interface comes back with another address, or after its adapter was
+detached and attached again, the warning says to restart the daemon to use
+it again (`sudo launchctl kickstart -k system/org.openvirtualsoundcard.daemon`,
+between songs).
+
+Redundancy needs macOS or Linux. What real Dante devices send for a flow on
+two networks has not been captured yet: see `docs/PROTOCOL.md` §11 and the
+interoperation notes in `docs/LIVE.md`.
+
 ### The device name
 
 Dante Controller lists devices by name, and subscriptions find their
@@ -432,14 +478,17 @@ without it.
   thread without real-time priority and another device using this one's
   name also warn. Then come the receive channels, with what each one is
   subscribed to and whether audio arrives, and a line saying how many are
-  receiving; the transmit flows and the devices receiving them; the clock
+  receiving; the transmit flows and the devices receiving them; on a
+  redundant system, the two networks (what each brings, its packets, and
+  which one the clock follows); the clock
   (its leader, offset, network delay and drift); the packet counters, with
   how much each problem counter rose in the last 30 s; the device; and the
   driver. The changes controllers made or tried to make come last, newest
   first, for 10 minutes, then the older ones. **Diagnostics**, folded, holds
   the driver's raw status line for a bug report.
-* **Settings** changes the device name, the network interface, the sample
-  rate, the bit depth, the receive and transmit channel counts, the
+* **Settings** changes the device name, the network interface, the
+  [secondary network](#dante-redundancy-two-networks), the sample rate, the
+  bit depth, the receive and transmit channel counts, the
   latency and the [show lock](#locking-the-settings-for-a-show). An edited
   setting is marked with a dot, and the bar at the bottom lists what is not
   applied yet. **Apply** sends only what

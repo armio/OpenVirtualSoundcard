@@ -17,8 +17,9 @@ use tracing::{debug, info, warn};
 
 use ovsc_clock::{ClockState, MediaClock, local_now_ns};
 use ovsc_control::{
-    self as ctl, ClockInfo, DeviceStatus, DriverInfo, InterfaceInfo, PacketCounts, Request,
-    Response, Restart, RxChannelStatus, Settings, SettingsChange, Status, TxFlowStatus,
+    self as ctl, ClockInfo, DeviceStatus, DriverInfo, InterfaceInfo, NetworkPackets, PacketCounts,
+    Redundancy, Request, Response, Restart, RxChannelStatus, Settings, SettingsChange, Status,
+    TxFlowStatus,
 };
 use ovsc_core::config::min_latency_ms;
 use ovsc_core::{Device, RemoteChange, SavedState};
@@ -171,6 +172,9 @@ pub struct View<'a> {
     /// The daemon's health tracker, which keeps the recent readings. `None`
     /// judges the current reading alone: states, but no counter rises.
     pub health: Option<&'a Mutex<Health>>,
+    /// What is wrong with the secondary network's interface, on both
+    /// networks of a redundant system (see `netwatch::Watches`).
+    pub secondary_problem: Option<&'a str>,
 }
 
 /// The health tracker, also after a panic while it was held: it only
@@ -269,7 +273,7 @@ pub fn answer(call: Call, view: &View<'_>) -> After {
 
 fn status(view: &View<'_>) -> Status {
     let cfg = view.cfg;
-    let device = view.engine.map(|(d, _, _)| device_status(d));
+    let device = view.engine.map(|(d, clock, _)| device_status(d, clock, view.secondary_problem));
     let clock = match view.engine {
         Some((_, clock, _)) => clock_info(cfg, clock),
         None => ClockInfo {
@@ -305,6 +309,18 @@ fn status(view: &View<'_>) -> Status {
     let (urgent, other): (Vec<_>, Vec<_>) = health.warnings.into_iter().partition(|w| w.urgent);
     warnings.extend(urgent.into_iter().map(|w| w.text));
     let urgent_warnings = warnings.len();
+    if let Some(r) = device.as_ref().and_then(|d| d.redundancy.as_ref()) {
+        warnings.extend(redundancy_words(r));
+    }
+    if let Some((d, _, _)) = view.engine {
+        if let Some(why) = &d.info().secondary_missing {
+            warnings.push(format!(
+                "The secondary network is not in use: {why}. Audio runs on the primary network \
+                 alone, without redundancy, until the daemon restarts with the secondary \
+                 interface up."
+            ));
+        }
+    }
     if let Some(problem) = view.engine.and_then(|(d, _, _)| d.saved_state_problem()) {
         warnings.push(format!(
             "The saved names and subscriptions could not be read at start: {problem}. Check \
@@ -447,7 +463,74 @@ fn clock_info(cfg: &AppConfig, clock: &MediaClock) -> ClockInfo {
     }
 }
 
-fn device_status(d: &Device) -> DeviceStatus {
+/// What a device on both networks of a redundant system should know about
+/// them, as warnings: none while both networks bring everything.
+fn redundancy_words(r: &Redundancy) -> Vec<String> {
+    let mut words = Vec::new();
+    let flows = |n: u32| {
+        if n == 1 { "1 redundant flow".to_owned() } else { format!("{n} redundant flows") }
+    };
+    if let Some(problem) = &r.secondary_problem {
+        words.push(format!(
+            "The secondary network is down: {problem}. Audio runs on the primary network alone, \
+             without redundancy."
+        ));
+    } else if r.receiving_on_secondary < r.redundant_flows {
+        words.push(format!(
+            "Nothing arrives on the secondary network for {}: no redundancy for them. Check the \
+             secondary network's cable and switch.",
+            flows(r.redundant_flows - r.receiving_on_secondary)
+        ));
+    }
+    if r.receiving_on_primary < r.redundant_flows {
+        let missing = r.redundant_flows - r.receiving_on_primary;
+        words.push(format!(
+            "Nothing arrives on the primary network for {}: {} from the secondary network. \
+             Check the primary network's cable and switch.",
+            flows(missing),
+            if missing == 1 { "it plays" } else { "they play" }
+        ));
+    }
+    if r.clock_on_secondary {
+        words.push(
+            "The clock follows the leader on the secondary network: the primary network has \
+             none. Check the primary network."
+                .into(),
+        );
+    }
+    words
+}
+
+/// How the two networks of a redundant system do, for a device on both.
+fn redundancy(d: &Device, clock: &MediaClock, problem: Option<&str>) -> Option<Redundancy> {
+    let secondary = d.info().secondary.as_ref()?;
+    let stats = d.stats();
+    let packets = |n: &ovsc_core::NetworkStats| NetworkPackets {
+        tx: n.tx_packets,
+        tx_errors: n.tx_send_errors,
+        rx: n.rx_packets,
+        rx_lost: n.rx_lost_packets,
+    };
+    let flows: Vec<_> = d.rx_flows().into_iter().filter(|f| f.secondary.is_some()).collect();
+    let on = |bit: u16| flows.iter().filter(|f| f.networks & bit != 0).count() as u32;
+    let mask = u32::from(secondary.netmask);
+    let on_secondary = |ip: std::net::Ipv4Addr| {
+        mask != 0 && u32::from(ip) & mask == u32::from(secondary.ip) & mask
+    };
+    Some(Redundancy {
+        secondary_interface: secondary.name.clone(),
+        secondary_ip: secondary.ip.to_string(),
+        secondary_problem: problem.map(str::to_owned),
+        redundant_flows: flows.len() as u32,
+        receiving_on_primary: on(1),
+        receiving_on_secondary: on(2),
+        clock_on_secondary: clock.status().master.is_some_and(|m| on_secondary(m.addr)),
+        primary: packets(&stats.networks[0]),
+        secondary: packets(&stats.networks[1]),
+    })
+}
+
+fn device_status(d: &Device, clock: &MediaClock, secondary_problem: Option<&str>) -> DeviceStatus {
     let info = d.info();
     let (_, tx_names) = d.channel_names();
     let stats = d.stats();
@@ -478,6 +561,7 @@ fn device_status(d: &Device) -> DeviceStatus {
             .map(|f| TxFlowStatus {
                 receiver: f.receiver,
                 destination: f.destination.to_string(),
+                secondary: f.secondary.map(|a| a.to_string()),
                 channels: f.channels,
             })
             .collect(),
@@ -489,6 +573,7 @@ fn device_status(d: &Device) -> DeviceStatus {
             rx_lost: stats.rx_lost_packets,
         },
         remote_settings_locked: d.remote_settings_locked(),
+        redundancy: redundancy(d, clock, secondary_problem),
     }
 }
 
@@ -529,6 +614,7 @@ fn settings(view: &View<'_>) -> Settings {
     Settings {
         name,
         interface: d.interface.clone(),
+        secondary_interface: d.secondary_interface.clone(),
         sample_rate: d.sample_rate,
         bits_per_sample: d.bits_per_sample,
         rx_channels: d.rx_channels.names().len() as u16,
@@ -566,6 +652,7 @@ pub fn apply(view: &View<'_>, change: &SettingsChange) -> anyhow::Result<Restart
         None => None,
     };
     let host = change.interface.is_some()
+        || change.secondary_interface.is_some()
         || change.sample_rate.is_some()
         || change.bits_per_sample.is_some()
         || change.rx_channels.is_some()
@@ -696,6 +783,9 @@ fn edit_config(text: &str, change: &SettingsChange) -> anyhow::Result<Option<Str
     if let Some(i) = &change.interface {
         set("interface", i.as_str().into());
     }
+    if let Some(i) = &change.secondary_interface {
+        set("secondary_interface", i.as_str().into());
+    }
     if let Some(r) = change.sample_rate {
         set("sample_rate", i64::from(r).into());
     }
@@ -717,6 +807,10 @@ fn edit_config(text: &str, change: &SettingsChange) -> anyhow::Result<Option<Str
     // earlier version's) is raised then, not refused.
     cfg.raise_low_latencies();
     cfg.validate_for(true)?;
+    let d = &cfg.device;
+    if !d.secondary_interface.is_empty() && d.secondary_interface == d.interface {
+        bail!("the secondary network's interface must be another interface than the primary");
+    }
     Ok(Some(new))
 }
 
@@ -883,7 +977,15 @@ backend = "coreaudio"
     }
 
     fn view_with<'a>(cfg: &'a AppConfig, hal: HalStatus, health: &'a Mutex<Health>) -> View<'a> {
-        View { cfg, config_path: None, engine: None, hal, engine_error: None, health: Some(health) }
+        View {
+            cfg,
+            config_path: None,
+            engine: None,
+            hal,
+            engine_error: None,
+            health: Some(health),
+            secondary_problem: None,
+        }
     }
 
     /// A driver connected, with an application doing IO through an open gate.
@@ -1026,6 +1128,41 @@ backend = "coreaudio"
         assert_eq!(s.urgent_warnings, 1);
         assert!(s.warnings[0].starts_with("Core Audio has not loaded"), "{:?}", s.warnings);
         assert!(s.earlier.is_empty());
+    }
+
+    #[test]
+    fn redundancy_warns_of_a_network_that_brings_nothing() {
+        let both = Redundancy {
+            secondary_interface: "en8".into(),
+            secondary_ip: "172.31.1.20".into(),
+            redundant_flows: 2,
+            receiving_on_primary: 2,
+            receiving_on_secondary: 2,
+            ..Default::default()
+        };
+        assert!(redundancy_words(&both).is_empty());
+        let w = redundancy_words(&Redundancy { receiving_on_secondary: 1, ..both.clone() });
+        assert_eq!(w.len(), 1);
+        assert!(w[0].starts_with("Nothing arrives on the secondary network for 1 redundant flow:"));
+        let w = redundancy_words(&Redundancy {
+            receiving_on_primary: 0,
+            clock_on_secondary: true,
+            ..both.clone()
+        });
+        assert!(
+            w[0].contains("primary network for 2 redundant flows: they play from the secondary")
+        );
+        assert!(w[1].starts_with("The clock follows the leader on the secondary network"));
+        let one = Redundancy { redundant_flows: 1, receiving_on_primary: 0, ..both.clone() };
+        assert!(redundancy_words(&one)[0].contains("for 1 redundant flow: it plays from"));
+        // A secondary interface that is down says so, once.
+        let w = redundancy_words(&Redundancy {
+            secondary_problem: Some("the secondary network's interface en8 is gone".into()),
+            receiving_on_secondary: 0,
+            ..both
+        });
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("en8 is gone. Audio runs on the primary network alone"), "{w:?}");
     }
 
     #[test]

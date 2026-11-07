@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use ovsc_control::{
     BITS_PER_SAMPLE, ClockInfo, DeviceStatus, DriverInfo, InterfaceInfo, LATENCY_CHOICES_MS,
-    MAX_CHANNELS, PROTOCOL_VERSION, PacketCounts, Restart, RxChannelStatus, SAMPLE_RATES, Settings,
-    SettingsChange, Status, TxFlowStatus,
+    MAX_CHANNELS, NetworkPackets, PROTOCOL_VERSION, PacketCounts, Redundancy, Restart,
+    RxChannelStatus, SAMPLE_RATES, Settings, SettingsChange, Status, TxFlowStatus,
 };
 
 /// The command that starts the daemon, for when it does not run.
@@ -34,6 +34,8 @@ pub fn change(current: &Settings, edited: &Settings) -> SettingsChange {
     SettingsChange {
         name: (name != current.name).then(|| name.to_owned()),
         interface: (edited.interface != current.interface).then(|| edited.interface.clone()),
+        secondary_interface: (edited.secondary_interface != current.secondary_interface)
+            .then(|| edited.secondary_interface.clone()),
         sample_rate: (edited.sample_rate != current.sample_rate).then_some(edited.sample_rate),
         bits_per_sample: (edited.bits_per_sample != current.bits_per_sample)
             .then_some(edited.bits_per_sample),
@@ -55,6 +57,9 @@ pub fn with_change(settings: &Settings, change: &SettingsChange) -> Settings {
     }
     if let Some(interface) = &change.interface {
         s.interface = interface.clone();
+    }
+    if let Some(interface) = &change.secondary_interface {
+        s.secondary_interface = interface.clone();
     }
     if let Some(rate) = change.sample_rate {
         s.sample_rate = rate;
@@ -81,6 +86,7 @@ pub fn with_change(settings: &Settings, change: &SettingsChange) -> Settings {
 /// word; this decides whether to ask first.
 pub fn expected_restart(change: &SettingsChange) -> Restart {
     if change.interface.is_some()
+        || change.secondary_interface.is_some()
         || change.sample_rate.is_some()
         || change.bits_per_sample.is_some()
         || change.rx_channels.is_some()
@@ -236,6 +242,13 @@ pub fn change_lines(
             interface_setting_label(interfaces, interface),
         );
     }
+    if let Some(interface) = &change.secondary_interface {
+        line(
+            "Secondary network",
+            secondary_setting_label(interfaces, &current.secondary_interface),
+            secondary_setting_label(interfaces, interface),
+        );
+    }
     if let Some(rate) = change.sample_rate {
         line("Sample rate", rate_label(current.sample_rate), rate_label(rate));
     }
@@ -359,6 +372,11 @@ pub fn rebase(old: &Settings, edited: &Settings, new: &Settings) -> Settings {
     Settings {
         name: if edited.name.trim() == old.name { new.name.clone() } else { edited.name.clone() },
         interface: pick(&old.interface, &edited.interface, &new.interface),
+        secondary_interface: pick(
+            &old.secondary_interface,
+            &edited.secondary_interface,
+            &new.secondary_interface,
+        ),
         sample_rate: pick(&old.sample_rate, &edited.sample_rate, &new.sample_rate),
         bits_per_sample: pick(&old.bits_per_sample, &edited.bits_per_sample, &new.bits_per_sample),
         rx_channels: pick(&old.rx_channels, &edited.rx_channels, &new.rx_channels),
@@ -521,6 +539,116 @@ pub fn interface_setting_label(interfaces: &[InterfaceInfo], setting: &str) -> S
         .into_iter()
         .find(|(v, _)| v == setting)
         .map_or_else(|| setting.to_owned(), |(_, label)| label)
+}
+
+/// The secondary network menu's entry for one network, without redundancy.
+pub const NO_SECONDARY: &str = "None: one network";
+
+/// The secondary network menu, as [`interface_choices`] but with
+/// [`NO_SECONDARY`] first in place of the automatic choice.
+pub fn secondary_choices(interfaces: &[InterfaceInfo], keep: &[&str]) -> Vec<(String, String)> {
+    let mut choices = interface_choices(interfaces, keep);
+    choices[0] = (String::new(), NO_SECONDARY.to_owned());
+    choices
+}
+
+/// A secondary interface setting in words, as the menu shows it.
+pub fn secondary_setting_label(interfaces: &[InterfaceInfo], setting: &str) -> String {
+    secondary_choices(interfaces, &[setting])
+        .into_iter()
+        .find(|(v, _)| v == setting)
+        .map_or_else(|| setting.to_owned(), |(_, label)| label)
+}
+
+/// What is wrong with the secondary network in the form, if anything: the
+/// primary's interface again. The daemon refuses that, and an interface on
+/// the primary's network.
+pub fn secondary_problem(interfaces: &[InterfaceInfo], edited: &Settings) -> Option<&'static str> {
+    let secondary = edited.secondary_interface.as_str();
+    if secondary.is_empty() {
+        return None;
+    }
+    let primary = match edited.interface.as_str() {
+        "" => default_route(interfaces).map_or("", |i| i.name.as_str()),
+        name => name,
+    };
+    let same = |a: &str, b: &str| {
+        a == b
+            || interfaces.iter().any(|i| {
+                (i.name == a || i.ipv4.iter().any(|ip| ip == a))
+                    && (i.name == b || i.ipv4.iter().any(|ip| ip == b))
+            })
+    };
+    same(primary, secondary)
+        .then_some("The secondary network needs another interface than the primary's.")
+}
+
+/// One line on the two networks of a redundant system, and its light:
+/// green while both bring every redundant flow and the clock is on the
+/// primary.
+pub fn networks_summary(r: &Redundancy) -> (Light, String) {
+    let flows = r.redundant_flows;
+    if r.secondary_problem.is_some() {
+        return (Light::Amber, "secondary network down · no redundancy".into());
+    }
+    if r.receiving_on_primary < flows && r.receiving_on_secondary < flows {
+        return (Light::Amber, "both networks miss flows".into());
+    }
+    if r.receiving_on_primary < flows || r.clock_on_secondary {
+        return (Light::Amber, "running on the secondary network".into());
+    }
+    if r.receiving_on_secondary < flows {
+        return (Light::Amber, "secondary network brings nothing · no redundancy".into());
+    }
+    match flows {
+        0 => (Light::Green, "both networks · no redundant flows yet".into()),
+        1 => (Light::Green, "both networks · 1 redundant flow".into()),
+        n => (Light::Green, format!("both networks · {n} redundant flows")),
+    }
+}
+
+/// The rows of the Networks section: each network's interface, its share of
+/// the redundant flows, and its packets; then the clock's network.
+pub fn network_rows(device: &DeviceStatus, r: &Redundancy) -> Vec<(&'static str, String, Light)> {
+    let flows = r.redundant_flows;
+    let state = |receiving: u32, problem: Option<&str>| match (problem, flows, receiving) {
+        (Some(problem), _, _) => (problem.to_owned(), Light::Amber),
+        (None, 0, _) => ("up".to_owned(), Light::Green),
+        (None, 1, 1) => ("brings the redundant flow".to_owned(), Light::Green),
+        (None, 1, _) => ("brings nothing of the redundant flow".to_owned(), Light::Amber),
+        (None, n, r) if r == n => (format!("brings all {n} redundant flows"), Light::Green),
+        (None, n, 0) => (format!("brings none of the {n} redundant flows"), Light::Amber),
+        (None, n, r) => (format!("brings {r} of the {n} redundant flows"), Light::Amber),
+    };
+    let packets = |n: &NetworkPackets| {
+        let mut words = format!("{} received · {} sent", count_label(n.rx), count_label(n.tx));
+        if n.rx_lost > 0 {
+            words.push_str(&format!(" · {} lost here", count_label(n.rx_lost)));
+        }
+        if n.tx_errors > 0 {
+            words.push_str(&format!(" · {} not sent", count_label(n.tx_errors)));
+        }
+        words
+    };
+    let (primary, primary_light) = state(r.receiving_on_primary, None);
+    let (secondary, secondary_light) =
+        state(r.receiving_on_secondary, r.secondary_problem.as_deref());
+    let clock = if r.clock_on_secondary {
+        ("on the secondary network: the primary has no leader".to_owned(), Light::Amber)
+    } else {
+        ("on the primary network".to_owned(), Light::Green)
+    };
+    vec![
+        ("Primary", format!("{} ({}) · {primary}", device.interface, device.ip), primary_light),
+        ("", packets(&r.primary), Light::Grey),
+        (
+            "Secondary",
+            format!("{} ({}) · {secondary}", r.secondary_interface, r.secondary_ip),
+            secondary_light,
+        ),
+        ("", packets(&r.secondary), Light::Grey),
+        ("Clock", clock.0, clock.1),
+    ]
 }
 
 /// A warning for a setting that would put Dante audio on Wi-Fi: the named
@@ -988,6 +1116,17 @@ pub fn address_label(destination: &str) -> String {
     destination.rsplit_once(':').map_or(destination, |(ip, _)| ip).to_owned()
 }
 
+/// A flow's addresses: the destination's, and on both networks of a
+/// redundant system, the secondary one's too.
+pub fn flow_address_label(flow: &TxFlowStatus) -> String {
+    match &flow.secondary {
+        Some(secondary) => {
+            format!("{} + {}", address_label(&flow.destination), address_label(secondary))
+        }
+        None => address_label(&flow.destination),
+    }
+}
+
 /// One line on the returns, and its light: who receives from this device.
 pub fn tx_summary(device: &DeviceStatus) -> (Light, String) {
     let channels = device.tx_channels.len();
@@ -1012,7 +1151,12 @@ pub fn device_summary(device: &DeviceStatus) -> String {
         (true, false) => parts.push(device.ip.clone()),
         (true, true) => {}
     }
-    parts.join(" · ")
+    // On both networks of a redundant system: the secondary's interface too.
+    let mut line = parts.join(" · ");
+    if let Some(r) = &device.redundancy {
+        line.push_str(&format!(" + {} ({})", r.secondary_interface, r.secondary_ip));
+    }
+    line
 }
 
 /// How long ago, in a few characters: `12 s`, `4 min`, `2 h 5 min`.
@@ -1228,6 +1372,7 @@ mod tests {
         Settings {
             name: "studio-mac".into(),
             interface: "en7".into(),
+            secondary_interface: String::new(),
             sample_rate: 48_000,
             bits_per_sample: 24,
             rx_channels: 8,
@@ -1362,12 +1507,106 @@ mod tests {
                 .map(|r| ovsc_control::TxFlowStatus {
                     receiver: r.map(str::to_owned),
                     destination: "192.168.0.20:14400".into(),
+                    secondary: None,
                     channels: vec![1, 2],
                 })
                 .collect(),
             packets: Default::default(),
             remote_settings_locked: false,
+            redundancy: None,
         }
+    }
+
+    fn redundancy() -> Redundancy {
+        Redundancy {
+            secondary_interface: "en8".into(),
+            secondary_ip: "172.31.0.8".into(),
+            redundant_flows: 2,
+            receiving_on_primary: 2,
+            receiving_on_secondary: 2,
+            primary: NetworkPackets { rx: 12_000, tx: 6_000, ..Default::default() },
+            secondary: NetworkPackets { rx: 11_990, tx: 6_000, rx_lost: 10, ..Default::default() },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_networks_section_says_which_network_carries_the_audio() {
+        let r = redundancy();
+        assert_eq!(
+            networks_summary(&r),
+            (Light::Green, "both networks · 2 redundant flows".into())
+        );
+        let device = device_with_flows(&[]);
+        let rows = network_rows(&device, &r);
+        assert_eq!(rows[0].0, "Primary");
+        assert_eq!(rows[0].1, "en7 (192.168.0.8) · brings all 2 redundant flows");
+        assert_eq!(rows[3].1, "11,990 received · 6,000 sent · 10 lost here");
+        assert_eq!(rows[4], ("Clock", "on the primary network".into(), Light::Green));
+        // The primary network fails: the audio comes from the secondary.
+        let failed =
+            Redundancy { receiving_on_primary: 0, clock_on_secondary: true, ..redundancy() };
+        assert_eq!(networks_summary(&failed).1, "running on the secondary network");
+        assert_eq!(
+            network_rows(&device, &failed)[0].1,
+            "en7 (192.168.0.8) · brings none of the 2 redundant flows"
+        );
+        let one = Redundancy { redundant_flows: 1, receiving_on_primary: 1, ..redundancy() };
+        assert_eq!(
+            network_rows(&device, &one)[0].1,
+            "en7 (192.168.0.8) · brings the redundant flow"
+        );
+        assert_eq!(network_rows(&device, &failed)[0].2, Light::Amber);
+        assert_eq!(network_rows(&device, &failed)[4].2, Light::Amber);
+        // The secondary is down: no redundancy.
+        let down = Redundancy {
+            secondary_problem: Some("its link is down".into()),
+            receiving_on_secondary: 0,
+            ..redundancy()
+        };
+        assert_eq!(
+            networks_summary(&down),
+            (Light::Amber, "secondary network down · no redundancy".into())
+        );
+        assert_eq!(network_rows(&device, &down)[2].1, "en8 (172.31.0.8) · its link is down");
+        let quiet = Redundancy { receiving_on_secondary: 1, ..redundancy() };
+        assert!(networks_summary(&quiet).1.contains("no redundancy"));
+        // A flow on both networks lists both addresses.
+        let flow = TxFlowStatus {
+            receiver: Some("desk".into()),
+            destination: "192.168.0.20:14400".into(),
+            secondary: Some("172.31.0.20:14400".into()),
+            channels: vec![1],
+        };
+        assert_eq!(flow_address_label(&flow), "192.168.0.20 + 172.31.0.20");
+        let both = DeviceStatus { redundancy: Some(redundancy()), ..device_with_flows(&[]) };
+        assert!(device_summary(&both).ends_with("en7 (192.168.0.8) + en8 (172.31.0.8)"));
+    }
+
+    #[test]
+    fn the_secondary_network_is_a_setting_that_restarts() {
+        let s = settings();
+        let list = vec![
+            interface("en7", "USB LAN", &["192.168.0.8"]),
+            interface("en8", "Thunderbolt Ethernet", &["172.31.0.8"]),
+        ];
+        let edited = Settings { secondary_interface: "en8".into(), ..settings() };
+        let c = change(&s, &edited);
+        assert_eq!(c.secondary_interface.as_deref(), Some("en8"));
+        assert_eq!(expected_restart(&c), Restart::Daemon);
+        assert_eq!(
+            change_lines(&s, &c, &list),
+            ["Secondary network: None: one network → Thunderbolt Ethernet — en8 (172.31.0.8)"]
+        );
+        assert_eq!(with_change(&s, &c), edited);
+        assert_eq!(secondary_problem(&list, &edited), None);
+        // The primary's interface again, by name or address.
+        let same = Settings { secondary_interface: "192.168.0.8".into(), ..settings() };
+        assert!(secondary_problem(&list, &same).is_some());
+        assert_eq!(secondary_choices(&list, &[""])[0].1, NO_SECONDARY);
+        // Kept over a new status from the daemon.
+        let new = Settings { latency_ms: 2.0, ..settings() };
+        assert_eq!(rebase(&s, &edited, &new).secondary_interface, "en8");
     }
 
     #[test]
@@ -1889,6 +2128,7 @@ mod tests {
         let multicast = TxFlowStatus {
             receiver: None,
             destination: "239.69.12.4:4321".into(),
+            secondary: None,
             channels: vec![1],
         };
         assert_eq!(flow_receiver(&multicast), "Multicast");

@@ -220,13 +220,26 @@ impl Device {
             }
         }
         let iface = Interface::find(&config.interface)?;
-        let secondary = match config.secondary_interface.as_str() {
-            "" => None,
-            spec => Some(Interface::find(spec)?),
+        // A secondary network that is down (its cable out, so its interface
+        // has no address) must not keep the device off the primary one: the
+        // device then runs on the primary network alone, and says so.
+        let (secondary, missing) = match config.secondary_interface.as_str() {
+            "" => (None, None),
+            spec => match Interface::find(spec) {
+                Ok(s) => (Some(s), None),
+                Err(e) => {
+                    warn!(
+                        "secondary_interface {spec}: {e}; running on the primary network alone, \
+                         without redundancy, until the device restarts"
+                    );
+                    (None, Some(e.to_string()))
+                }
+            },
         };
         check_secondary(&iface, secondary.as_ref())?;
         let mut info = DeviceInfo::new(&config, iface)?;
         info.secondary = secondary;
+        info.secondary_missing = missing;
         let state = initial_state(&config, &info, saved, options.announced);
         let ip = info.iface.ip;
         let ports = info.ports;
@@ -550,6 +563,12 @@ impl Device {
             .checked_sub(1)
             .filter(|&i| i < self.shared.info.rx_channels.len())
             .ok_or_else(|| Error::NotFound(format!("rx channel {rx_channel}")))
+    }
+
+    /// The receive flows, as controllers see them (ARC 0x3200): for a flow
+    /// on both networks, its secondary address and which networks bring it.
+    pub fn rx_flows(&self) -> Vec<ovsc_proto::arc::RxFlowInfo> {
+        self.shared.state().rx_flows.clone()
     }
 
     pub fn rx_channels(&self) -> Vec<RxChannelStatus> {

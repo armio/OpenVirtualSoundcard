@@ -34,6 +34,98 @@ const HOUSEKEEPING_NS: u64 = 100_000_000;
 /// Delay_Req interval while the servo wants measurements quickly.
 const FAST_DELAY_REQ_INTERVAL_NS: u64 = 250_000_000;
 
+/// How long the network followed may go without a leader's messages before
+/// the follower takes them from the other network.
+const FAILOVER_QUIET_NS: u64 = 2_000_000_000;
+/// How recently the other network must have brought them for that.
+const FAILOVER_FRESH_NS: u64 = 1_000_000_000;
+/// How long the primary network must bring them again, without a gap of
+/// [`FAILOVER_FRESH_NS`], before the follower goes back to it.
+const FAILBACK_STEADY_NS: u64 = 10_000_000_000;
+
+/// Which network's PTP messages a follower on both networks of a redundant
+/// Dante system takes: the primary's, unless its leader has gone quiet
+/// while the secondary brings a leader's messages.
+///
+/// The leader sends on both networks (a redundant device has a PTP port on
+/// each, PROTOCOL.md §11). Taking both at once would hand the servo each
+/// Sync twice, over paths of different delays, so the follower takes one
+/// network's messages at a time and sends its Delay_Reqs there.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Failover {
+    /// The secondary network: its address bits and netmask.
+    secondary: (u32, u32),
+    /// The network followed: 0 the primary, 1 the secondary.
+    active: usize,
+    /// When each network last brought a message only leaders send
+    /// (Follow_Up, Delay_Resp), or for the primary, when following began.
+    heard: [Option<u64>; 2],
+    /// Since when the primary has brought them without a gap.
+    primary_since: Option<u64>,
+}
+
+impl Failover {
+    pub fn new(interface: Ipv4Addr, netmask: Ipv4Addr, now: u64) -> Self {
+        let mask = u32::from(netmask);
+        Self {
+            secondary: (u32::from(interface) & mask, mask),
+            active: 0,
+            // The primary gets the same time to be heard at start as when it
+            // goes quiet.
+            heard: [Some(now), None],
+            primary_since: None,
+        }
+    }
+
+    /// The network a packet from `src` came on.
+    pub fn network(&self, src: SocketAddr) -> usize {
+        match src {
+            SocketAddr::V4(a) if u32::from(*a.ip()) & self.secondary.1 == self.secondary.0 => 1,
+            _ => 0,
+        }
+    }
+
+    /// Notes a message only leaders send, on network `net` at `now`.
+    pub fn heard(&mut self, net: usize, now: u64) {
+        let net = net.min(1);
+        if net == 0 && !self.fresh(0, now) {
+            self.primary_since = Some(now);
+        }
+        self.heard[net] = Some(now);
+    }
+
+    /// Whether the follower takes packets from network `net`.
+    pub fn takes(&self, net: usize) -> bool {
+        net == self.active
+    }
+
+    fn fresh(&self, net: usize, now: u64) -> bool {
+        self.heard[net].is_some_and(|t| now.saturating_sub(t) < FAILOVER_FRESH_NS)
+    }
+
+    fn quiet(&self, net: usize, now: u64) -> bool {
+        self.heard[net].is_none_or(|t| now.saturating_sub(t) >= FAILOVER_QUIET_NS)
+    }
+
+    /// Moves to the other network when the one followed has gone quiet and
+    /// the other brings a leader's messages, and back to the primary once
+    /// it has brought them steadily again. Returns the network followed
+    /// from now on, when it changed.
+    pub fn poll(&mut self, now: u64) -> Option<usize> {
+        let steady =
+            self.primary_since.is_some_and(|s| now.saturating_sub(s) >= FAILBACK_STEADY_NS);
+        let next = match self.active {
+            0 if self.quiet(0, now) && self.fresh(1, now) => 1,
+            1 if self.fresh(0, now) && (steady || self.quiet(1, now)) => 0,
+            a => a,
+        };
+        (next != self.active).then(|| {
+            self.active = next;
+            next
+        })
+    }
+}
+
 /// Settings of the protocol engine.
 #[derive(Clone, Debug)]
 pub(crate) struct CoreConfig {
@@ -546,6 +638,7 @@ pub(crate) async fn run(
     general: UdpSocket,
     endpoints: Endpoints,
     output: Arc<ClockOutput>,
+    mut failover: Option<Failover>,
 ) {
     let mut event_buf = vec![0u8; RECV_BUF_LEN];
     let mut general_buf = vec![0u8; RECV_BUF_LEN];
@@ -560,14 +653,45 @@ pub(crate) async fn run(
         tokio::select! {
             biased;
             r = recv_timestamped(&event, &mut event_buf) => match r {
-                Ok((n, src, t)) => core.handle_packet(&event_buf[..n], src, t, &mut out),
+                // Syncs, and other followers' Delay_Reqs: from the network
+                // followed only.
+                Ok((n, src, t)) => {
+                    if failover.is_none_or(|f| f.takes(f.network(src))) {
+                        core.handle_packet(&event_buf[..n], src, t, &mut out);
+                    }
+                }
                 Err(e) => backoff = recv_error(e),
             },
             r = recv_timestamped(&general, &mut general_buf) => match r {
-                Ok((n, src, t)) => core.handle_packet(&general_buf[..n], src, t, &mut out),
+                Ok((n, src, t)) => {
+                    let net = failover.map(|f| f.network(src));
+                    if let (Some(f), Some(net)) = (&mut failover, net) {
+                        f.heard(net, local_now_ns());
+                    }
+                    if failover.zip(net).is_none_or(|(f, net)| f.takes(net)) {
+                        core.handle_packet(&general_buf[..n], src, t, &mut out);
+                    }
+                }
                 Err(e) => backoff = recv_error(e),
             },
             () = sleep => {}
+        }
+        if let Some(net) = failover.as_mut().and_then(|f| f.poll(local_now_ns())) {
+            let interface = match net {
+                0 => endpoints.interface,
+                _ => endpoints.secondary.unwrap_or(endpoints.interface),
+            };
+            match net {
+                0 => info!("PTP: following the leader on the primary network again"),
+                _ => warn!(
+                    "PTP: no leader heard on the primary network; following the leader on the \
+                     secondary network"
+                ),
+            }
+            // Delay_Reqs go to the leader followed.
+            if let Err(e) = socket2::SockRef::from(&event).set_multicast_if_v4(&interface) {
+                warn!("cannot send PTP Delay_Reqs on {interface}: {e}");
+            }
         }
         core.poll(local_now_ns(), &mut out);
         for o in out.drain(..) {
@@ -956,6 +1080,55 @@ mod tests {
         assert!((st.last_step_ns - 50_000_000).abs() < 100_000, "{}", st.last_step_ns);
         let st = last_status(&out);
         assert_eq!((st.state, st.steps), (ClockState::Locked, 1));
+    }
+
+    #[test]
+    fn the_follower_takes_the_secondary_network_while_the_primary_is_quiet() {
+        let s = |ms: u64| ms * MS;
+        let mut f = Failover::new(Ipv4Addr::new(172, 31, 9, 9), Ipv4Addr::new(255, 255, 0, 0), 0);
+        let primary: SocketAddr = "192.168.1.10:320".parse().unwrap();
+        let secondary: SocketAddr = "172.31.4.10:320".parse().unwrap();
+        assert_eq!((f.network(primary), f.network(secondary)), (0, 1));
+        // Both networks bring the leader: the primary is followed, also
+        // when the secondary is heard first.
+        for t in (0..3000).step_by(250) {
+            f.heard(1, s(t));
+            f.heard(0, s(t + 10));
+            assert_eq!(f.poll(s(t + 20)), None);
+        }
+        assert!(f.takes(0) && !f.takes(1));
+        // The primary goes quiet: 2 s later, the secondary is followed.
+        let mut t = 3000;
+        while f.poll(s(t)).is_none() {
+            f.heard(1, s(t));
+            t += 250;
+        }
+        // The first poll 2 s or more after the primary's last message (2760 ms).
+        assert_eq!(t, 5000);
+        assert!(f.takes(1) && !f.takes(0));
+        // The primary is back: followed again once steady for 10 s.
+        let back = t;
+        loop {
+            t += 250;
+            f.heard(0, s(t));
+            f.heard(1, s(t));
+            if f.poll(s(t)) == Some(0) {
+                break;
+            }
+        }
+        assert_eq!(t - back, 10_250);
+        // The secondary goes quiet while followed: back to the primary at once.
+        let mut g = f;
+        g.active = 1;
+        g.primary_since = None;
+        g.heard(0, s(t + 2500));
+        assert_eq!(g.poll(s(t + 2600)), Some(0));
+        // Neither network brings a leader: nothing to move to.
+        let mut h = Failover::new(Ipv4Addr::new(172, 31, 9, 9), Ipv4Addr::new(255, 255, 0, 0), 0);
+        assert_eq!(h.poll(s(60_000)), None);
+        // At start, the secondary is followed if the primary has no leader.
+        h.heard(1, s(60_100));
+        assert_eq!(h.poll(s(60_200)), Some(1));
     }
 
     #[test]

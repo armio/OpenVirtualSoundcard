@@ -157,6 +157,23 @@ fn format_rows(ui: &mut Ui, form: &mut Form, interfaces: &[InterfaceInfo]) {
     });
     widgets::separator(ui);
 
+    let choices = logic::secondary_choices(
+        interfaces,
+        &[&current.secondary_interface, &edited.secondary_interface],
+    );
+    let changed = edited.secondary_interface != current.secondary_interface;
+    let help = match logic::secondary_problem(interfaces, edited) {
+        Some(problem) => RichText::new(problem).small().color(p.red_ink),
+        None => theme::caption(
+            "Dante redundancy: a second Ethernet adapter on the secondary network. Flows with \
+             redundant devices then run on both networks.",
+        ),
+    };
+    widgets::setting_row(ui, "Secondary network", Some(help), changed, |ui| {
+        menu(ui, "secondary", width, &mut edited.secondary_interface, &choices)
+    });
+    widgets::separator(ui);
+
     let rates: Vec<(u32, String)> = logic::rate_choices(current.sample_rate)
         .into_iter()
         .map(|r| (r, logic::rate_label(r)))

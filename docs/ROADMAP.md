@@ -24,7 +24,7 @@ is to test against real equipment and fix what breaks.
   - still to do: routing from OpenVirtualSoundcard to hardware, renames and latency from Dante Controller, a second hardware device, Windows
   - capture each exchange with Wireshark and add the captures as test vectors
 - 🧪 PTPv1 follower against a real Dante leader: locks to an AVIO-DAI2 with kernel receive timestamps on macOS; measure lock time, offset and stability, and tune the servo
-- ⏳ Answer the open questions in `PROTOCOL.md` §11.2
+- ⏳ Answer the open questions in `PROTOCOL.md` §12.2
 - ⏳ Measure the minimum stable latency per OS
 - ⏳ Sound-card bridge on real hardware and virtual cables (BlackHole, VB-Cable, snd-aloop); compensate device latency; auto-reconnect
 - ⏳ Optional hardware timestamping (Linux `SO_TIMESTAMPING`) for lower latency

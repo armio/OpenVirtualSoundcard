@@ -344,6 +344,7 @@ mod tests {
         Settings {
             name: "studio-mac".into(),
             interface: "en7".into(),
+            secondary_interface: String::new(),
             sample_rate: 48_000,
             bits_per_sample: 24,
             rx_channels: 8,

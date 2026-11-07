@@ -43,6 +43,9 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         widgets::section(ui, "Transmit channels", Some((light, &summary)), |ui| {
             tx_table(ui, device)
         });
+        if let Some(r) = &device.redundancy {
+            networks_section(ui, device, r);
+        }
     }
     widgets::pair(
         ui,
@@ -210,11 +213,32 @@ fn tx_table(ui: &mut Ui, device: &DeviceStatus) {
         match col {
             0 => ui.add(Label::new(logic::flow_receiver(flow)).truncate()),
             1 => ui.add(
-                Label::new(RichText::new(logic::address_label(&flow.destination)).color(p.text2))
+                Label::new(RichText::new(logic::flow_address_label(flow)).color(p.text2))
                     .truncate(),
             ),
             _ => ui.add(Label::new(logic::channels_label(&flow.channels)).truncate()),
         };
+    });
+}
+
+/// The two networks of a redundant Dante system: which carry the audio and
+/// the clock.
+fn networks_section(ui: &mut Ui, device: &DeviceStatus, r: &ovsc_control::Redundancy) {
+    let p = theme::palette(ui);
+    let (light, summary) = logic::networks_summary(r);
+    widgets::section(ui, "Networks", Some((light, &summary)), |ui| {
+        let rows: Vec<(&str, RichText)> = logic::network_rows(device, r)
+            .into_iter()
+            .map(|(name, value, light)| {
+                let text = match light {
+                    Light::Amber | Light::Red => RichText::new(value).color(p.ink(light)),
+                    Light::Grey => RichText::new(value).monospace().color(p.text2),
+                    Light::Green => RichText::new(value),
+                };
+                (name, text)
+            })
+            .collect();
+        widgets::rows(ui, "networks", &rows);
     });
 }
 

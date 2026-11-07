@@ -29,6 +29,9 @@ pub(crate) const GENERAL_TOS: u32 = 46 << 2;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Endpoints {
     pub interface: Ipv4Addr,
+    /// The interface on the secondary network of a redundant system, where
+    /// the group is joined too.
+    pub secondary: Option<Ipv4Addr>,
     pub group: Ipv4Addr,
     pub event_port: u16,
     pub general_port: u16,
@@ -95,6 +98,17 @@ impl Endpoints {
                 format!("cannot join {} on interface {}: {e}", self.group, self.interface),
             )
         })?;
+        // The leader of a redundant system is heard on both networks; the
+        // follower takes one network's messages at a time (Failover).
+        if let Some(secondary) = self.secondary {
+            if let Err(e) = socket.join_multicast_v4(&self.group, &secondary) {
+                tracing::warn!(
+                    "cannot join {} on the secondary interface {secondary}: {e}; the clock \
+                     follows the primary network only",
+                    self.group
+                );
+            }
+        }
         // A socket bound to 0.0.0.0 on Linux also receives the group's
         // datagrams from every other interface on which any process joined
         // it (IP_MULTICAST_ALL defaults to 1), so a host with a second PTP
@@ -352,6 +366,7 @@ mod tests {
     fn sockets_are_marked_and_on_linux_filtered_by_interface() {
         let endpoints = Endpoints {
             interface: Ipv4Addr::LOCALHOST,
+            secondary: None,
             group: Ipv4Addr::new(224, 0, 1, 129),
             event_port: 0,
             general_port: 0,

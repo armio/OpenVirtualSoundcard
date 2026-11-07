@@ -210,6 +210,13 @@ computer during a show.
 * Run no other Dante software on the show Mac. OVSC moves its ports out of
   the way of Audinate's ConMon service, but Dante Virtual Soundcard and OVSC
   must not both carry the show.
+* On a redundant Dante system, give the Mac a second wired interface on the
+  secondary network and set it as **Secondary network** (`[device]
+  secondary_interface`, see `docs/MACOS.md`). Flows with the console then
+  run on both networks: a pulled cable or a failed switch on either costs
+  no audio. Check the app's **Networks** section before the show: both
+  networks should bring every redundant flow, and the clock should follow
+  the primary.
 
 ## The Mac
 
@@ -302,6 +309,8 @@ any of them.
 | A leader whose time differs by more than 250 µs (or a jump of more than 2 ms) | Silence, 1.6 s typically, up to about 5.5 s, then one slip | The clock steps once and relocks. Core Audio's timeline stays continuous; the host is not disturbed. |
 | The leader's time jumps by 0.25 to 2 ms, same leader | Possibly dropouts on the returns, for up to about 15 s | The clock slews back at 0.1 ms per second instead of stepping, so audio keeps flowing, but the console may find returns late until the error is below its latency slack. Rare: it needs the leader's own time to jump (for example a leader re-syncing to an external reference). |
 | Sync packets delayed by congestion | Nothing | The clock may unlock; it keeps its frequency and slews back gently. Repeated unlocks mean the network needs PTP priority. |
+| Redundant system: the primary or the secondary network fails (a cable, a switch) | Nothing | Each redundant flow plays from the other network's copy. If the primary has no PTP leader for 2 s, the clock follows the leader on the secondary (it holds over meanwhile) and returns to the primary after 10 s of steady messages there. The app warns; flows with devices on one network only stop with the primary. |
+| Redundant system: the secondary interface's adapter is re-attached, or comes back with another address | Nothing | The engine is not restarted: audio goes on on the primary network. The warning says to restart the daemon, between songs, to use the secondary network again. |
 | Cable pulled and put back (same address) | Silence while unplugged, then audio returns | Receive flows that deliver nothing for 3 s are requested again; audio usually returns well under 2 s after the link does. The console requests its flows from OVSC again on its own timing. |
 | The Mac's address changes | A few seconds of silence; the returns may take longer | About 2 s after the change the network engine restarts on the new address; inputs return when the clock locks. The returns come back once the console requests OVSC's flows again, on its own timing (often several seconds, more while it finds the new address): test this with your console. With `interface = ""` it could pick Wi-Fi: name the interface. |
 | The console reboots | Silence until the console is back, and a few seconds more | OVSC stops the dead flows and requests them again. An unanswered request (after a 2 s wait) is retried within 1 s; a console that refuses while it boots is retried after 1 s, backing off to 5 s; one whose records are gone is looked up again every 2 to 4 s. Inputs can return several seconds after the console is ready. |
@@ -445,6 +454,13 @@ These rest on code reading, Linux tests and simulation, not on hardware:
   host, and whether the host restarts its audio engine on it. The flows
   themselves are tested on Linux, the driver's configuration with a
   simulated host.
+* Dante redundancy: tested with two OVSC devices on loopback addresses on
+  Linux, and in unit tests (the merge of the two networks' packets, the
+  clock's failover, the interface watcher). The layouts of a flow on two
+  networks (the DBCP request, the 0x2200 and 0x3200 records) are inferred
+  from single-network captures: no capture of a redundant flow exists yet.
+  Check with your console that it subscribes on both networks, and pull
+  each network's cable during a soundcheck.
 * The macOS end-to-end test (`ci/macos/e2e-local.sh`, every scenario against
   the real Core Audio device and a test PTP master on the same Mac) passed on
   an M1 Mac with macOS 26.6. That covers the driver, the daemon and Core
