@@ -142,6 +142,9 @@ pub struct TxFlow {
     /// The latest promise of this flow to its receiver.
     generation: u32,
     socket: StdUdpSocket,
+    /// For a redundant receiver, the socket to its address on the
+    /// secondary network: every packet goes out on both networks.
+    secondary: Option<StdUdpSocket>,
     /// Local transmit channel per slot in the packet.
     channels: Vec<Option<usize>>,
     fpp: u64,
@@ -171,6 +174,7 @@ impl TxFlow {
             id,
             generation,
             socket,
+            secondary: None,
             channels,
             fpp: fpp as u64,
             format,
@@ -179,6 +183,33 @@ impl TxFlow {
             steady: false,
             last_heard_ns: local_now_ns(),
             expired: false,
+        }
+    }
+
+    /// The flow, sent on the secondary network too, through `socket`.
+    fn with_secondary(self, socket: StdUdpSocket) -> Self {
+        Self { secondary: Some(socket), ..self }
+    }
+
+    /// Takes what the receiver sent on either network (keepalives) and the
+    /// errors of earlier sends, reported on whichever call comes next.
+    fn hear(&mut self, scratch: &mut [u8], local: u64, counters: &Counters) {
+        let redundant = self.secondary.is_some();
+        let sockets = std::iter::once(&self.socket).chain(&self.secondary);
+        for (net, socket) in sockets.enumerate() {
+            loop {
+                match socket.recv(scratch) {
+                    // Anything the receiver sends us counts as a keepalive.
+                    Ok(_) => self.last_heard_ns = local,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    // An earlier packet bounced (ICMP: port or host
+                    // unreachable). Audible only without another network.
+                    Err(e) => {
+                        count_send_error(counters, net, !redundant, &e);
+                        break;
+                    }
+                }
+            }
         }
     }
 }
@@ -363,19 +394,7 @@ fn engine(
         let mut next_due: Option<u64> = None;
 
         for flow in flows.iter_mut().filter(|f| !f.expired) {
-            // Anything the receiver sends us counts as a keepalive.
-            loop {
-                match flow.socket.recv(&mut scratch) {
-                    Ok(_) => flow.last_heard_ns = local,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    // An earlier packet bounced (ICMP: port or host
-                    // unreachable), reported on whichever call comes next.
-                    Err(e) => {
-                        count_send_error(counters, &e);
-                        break;
-                    }
-                }
-            }
+            flow.hear(&mut scratch, local, counters);
             if flow.unicast && local.saturating_sub(flow.last_heard_ns) > KEEPALIVE_TIMEOUT_NS {
                 flow.expired = true;
                 expiries.report(flow.id, flow.generation);
@@ -456,8 +475,24 @@ fn send_packet(
         counters.tx_skipped_packets.fetch_add(1, Ordering::Relaxed);
         return;
     };
-    match flow.socket.send(packet) {
-        Ok(_) => {
+    // On every network the flow runs on; the audio is sent when any took
+    // it, and a failure is audible only when none did.
+    let mut first_error = None;
+    let mut sent_on = 0;
+    for (net, socket) in std::iter::once(&flow.socket).chain(&flow.secondary).enumerate() {
+        match socket.send(packet) {
+            Ok(_) => {
+                counters.networks[net].tx_packets.fetch_add(1, Ordering::Relaxed);
+                sent_on += 1;
+            }
+            Err(e) => {
+                count_send_error(counters, net, false, &e);
+                first_error.get_or_insert(e);
+            }
+        }
+    }
+    match first_error.filter(|_| sent_on == 0) {
+        None => {
             counters.tx_packets.fetch_add(1, Ordering::Relaxed);
             let sent = snap.media_ns_at(local_now_ns());
             let late_ns = sent.saturating_sub(samples_to_ns(ts + guard, rate));
@@ -469,13 +504,21 @@ fn send_packet(
             }
             flow.steady = true;
         }
-        Err(e) => count_send_error(counters, &e),
+        Some(e) => {
+            counters.tx_send_errors.fetch_add(1, Ordering::Relaxed);
+            counters.tx_last_send_error.store(e.raw_os_error().unwrap_or(0), Ordering::Relaxed);
+        }
     }
 }
 
-fn count_send_error(counters: &Counters, e: &std::io::Error) {
-    counters.tx_send_errors.fetch_add(1, Ordering::Relaxed);
-    counters.tx_last_send_error.store(e.raw_os_error().unwrap_or(0), Ordering::Relaxed);
+/// Counts a send that failed on network `net` (0 primary, 1 secondary), and
+/// as a failure to send the audio when `audible`.
+fn count_send_error(counters: &Counters, net: usize, audible: bool, e: &std::io::Error) {
+    counters.networks[net].tx_send_errors.fetch_add(1, Ordering::Relaxed);
+    if audible {
+        counters.tx_send_errors.fetch_add(1, Ordering::Relaxed);
+        counters.tx_last_send_error.store(e.raw_os_error().unwrap_or(0), Ordering::Relaxed);
+    }
 }
 
 /// The transmit thread's problem counters at one moment, to report what
@@ -545,6 +588,9 @@ struct ServerFlow {
     /// channel update or a re-request (see [`Expiries`]).
     generation: u32,
     dst: SocketAddrV4,
+    /// The receiver's address on the secondary network, as it asked for
+    /// it, when we have a secondary network too.
+    secondary: Option<SocketAddrV4>,
     fpp: u16,
     format: SampleFormat,
     info: TxFlowInfo,
@@ -822,6 +868,20 @@ impl FlowControl {
             req.rx_addr,
             req.rx_port
         );
+        // A redundant receiver gets the flow on both networks when we are
+        // on both; else on the primary, as from any device without a
+        // secondary interface.
+        let secondary = match (req.secondary, &info.secondary) {
+            (Some(dst), Some(_)) => Some(dst),
+            (Some(dst), None) => {
+                debug!(
+                    "{} also asks for the flow at {dst}: we have no secondary network",
+                    req.rx_device
+                );
+                None
+            }
+            (None, _) => None,
+        };
         if self.engine_failed {
             warn!("refusing flow: the transmit thread has stopped");
             return respond(h, result::FAILURE, &[]);
@@ -846,7 +906,7 @@ impl FlowControl {
         let dst = SocketAddrV4::new(req.rx_addr, req.rx_port);
         let existing = self.flows.iter().find(|(_, f)| f.dst == dst).map(|(&id, f)| (id, f));
         if let Some((id, f)) = existing {
-            if f.fpp == req.fpp && f.format == format {
+            if f.fpp == req.fpp && f.format == format && f.secondary == secondary {
                 // A receiver asking again for a flow it has gets it back
                 // with the new channels, under the same handle (PROTOCOL.md
                 // 6.7, Same destination).
@@ -855,19 +915,21 @@ impl FlowControl {
                     f.info.remote = Some((req.rx_device, req.flow_name));
                 }
                 self.set_channels(id, req.channels, channels);
-                return dbcp::encode_flow_created(h, handle);
+                return dbcp::encode_flow_created(h, handle, 1 + secondary.is_some() as usize);
             }
             // Other packets than the flow sends: a receiver that changed its
             // latency, say. Answering with the old flow would send packets
             // it did not ask for, so it gets a new flow, with a new handle
             // that a late stop for the old one cannot match.
             info!(
-                "tx flow {id} to {dst} re-requested at {} fpp/{} bit, was {} fpp/{} bit: \
+                "tx flow {id} to {dst} re-requested at {} fpp/{} bit{}, was {} fpp/{} bit{}: \
                  replacing it",
                 req.fpp,
                 format.bits(),
+                also(secondary),
                 f.fpp,
-                f.format.bits()
+                f.format.bits(),
+                also(f.secondary),
             );
             self.remove(id);
         }
@@ -885,7 +947,17 @@ impl FlowControl {
         let cookie: u32 = rand::random();
         let generation = self.next_generation();
         let unicast = !req.rx_addr.is_multicast();
-        let flow = TxFlow::new(id, generation, socket, channels, req.fpp, format, unicast);
+        let mut flow = TxFlow::new(id, generation, socket, channels, req.fpp, format, unicast);
+        // The audio still reaches the receiver on the primary network if
+        // the secondary cannot take it (its cable is out, say).
+        let local = info.secondary.as_ref().map(|i| i.ip);
+        match secondary.zip(local).map(|(dst, local)| (dst, open_flow_socket(local, dst))) {
+            Some((_, Ok(socket))) => flow = flow.with_secondary(socket),
+            Some((dst, Err(e))) => {
+                warn!("cannot send flow {id} on the secondary network, to {dst}: {e}")
+            }
+            None => {}
+        }
         if !self.send(TxCommand::Add(flow)) {
             return respond(h, result::FAILURE, &[]);
         }
@@ -895,6 +967,7 @@ impl FlowControl {
                 cookie,
                 generation,
                 dst,
+                secondary,
                 fpp: req.fpp,
                 format,
                 info: TxFlowInfo {
@@ -903,14 +976,20 @@ impl FlowControl {
                     remote: Some((req.rx_device, req.flow_name)),
                     dst_addr: req.rx_addr,
                     dst_port: req.rx_port,
+                    secondary,
                     channels: req.channels,
                     fpp: req.fpp,
                 },
             },
         );
         self.publish();
-        dbcp::encode_flow_created(h, handle_of(id, cookie))
+        dbcp::encode_flow_created(h, handle_of(id, cookie), 1 + secondary.is_some() as usize)
     }
+}
+
+/// " and at {dst}" for a flow also sent on the secondary network.
+fn also(secondary: Option<SocketAddrV4>) -> String {
+    secondary.map(|dst| format!(" and at {dst}")).unwrap_or_default()
 }
 
 fn packet_size(fpp: u16, channels: usize, format: SampleFormat) -> usize {

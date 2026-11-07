@@ -253,6 +253,8 @@ struct RxFlow {
     /// Since when the flow has had no routes.
     empty_since: Option<Instant>,
     port: u16,
+    /// Where the flow comes on the secondary network, for a flow on both.
+    secondary: Option<SocketAddrV4>,
     /// The latency the flow plays at, in ns: ours or more (see
     /// [`flow_latency`]).
     latency_ns: u32,
@@ -515,6 +517,8 @@ struct Grow {
 struct Create {
     id: u16,
     socket: std::net::UdpSocket,
+    /// The socket on the secondary network, for a flow asked for on both.
+    secondary: Option<std::net::UdpSocket>,
     request: FlowRequest,
     placed: Vec<Placed>,
     format: SampleFormat,
@@ -1169,6 +1173,28 @@ impl RxManager {
             }
         };
         let port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+        // On both networks of a redundant system, a transmitter on both
+        // (TXT `nred`) is asked for the flow on both: either network can
+        // then fail without a gap. Without a socket there, the flow still
+        // comes on the primary.
+        let secondary = match &info.secondary {
+            Some(iface) if txt.nred > 0 => match bind_rx_port(iface.ip) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    warn!(
+                        "cannot receive on the secondary network, on {} ({}): {e}; flow {id} \
+                         from {} comes on the primary network only",
+                        iface.name, iface.ip, chunk[0].resolved.device
+                    );
+                    None
+                }
+            },
+            _ => None,
+        };
+        let secondary_addr = secondary.as_ref().and_then(|s| match s.local_addr() {
+            Ok(SocketAddr::V4(a)) => Some(a),
+            _ => None,
+        });
         let request = FlowRequest {
             rx_device: shared.name(),
             flow_name: format!("{id}_{}", info.process_id),
@@ -1178,9 +1204,9 @@ impl RxManager {
             channels,
             rx_addr: info.iface.ip,
             rx_port: port,
-            secondary: None,
+            secondary: secondary_addr,
         };
-        Some(Create { id, socket, request, placed: chunk, format, latency, own })
+        Some(Create { id, socket, secondary, request, placed: chunk, format, latency, own })
     }
 
     fn fail_chunk(&mut self, chunk: &[Placed], status: SubscriptionStatus, retry: Retry) -> bool {
@@ -1412,7 +1438,7 @@ impl RxManager {
     ) -> std::result::Result<(), (Vec<Placed>, std::io::Error)> {
         let shared = self.shared.clone();
         let info = &shared.info;
-        let Create { id, socket, request, placed, format, latency, own } = c;
+        let Create { id, socket, secondary, request, placed, format, latency, own } = c;
         let slots = request.channels.len();
         let mut routes = Routes::new(slots);
         let mut spelled = HashMap::new();
@@ -1433,6 +1459,10 @@ impl RxManager {
         let addrs = placed.iter().flat_map(|p| p.resolved.addrs.iter().copied());
         let params = FlowParams {
             tx: TxAddrs::new(*control.ip(), addrs),
+            secondary: match (&secondary, &info.secondary) {
+                (Some(_), Some(iface)) => Some(Subnet::of(iface.ip, iface.netmask)),
+                _ => None,
+            },
             slots,
             fpp: request.fpp as usize,
             format,
@@ -1454,11 +1484,17 @@ impl RxManager {
                 stats: stats.clone(),
             },
         );
-        let worker =
-            match Worker::spawn(id, socket, shared.clock.clone(), receiver, self.threads.clone()) {
-                Ok(w) => w,
-                Err(e) => return Err((placed, e)),
-            };
+        let worker = match Worker::spawn(
+            id,
+            socket,
+            secondary,
+            shared.clock.clone(),
+            receiver,
+            self.threads.clone(),
+        ) {
+            Ok(w) => w,
+            Err(e) => return Err((placed, e)),
+        };
         let latency_ns = (latency as u128 * 1_000_000_000 / info.sample_rate.max(1) as u128)
             .min(u32::MAX as u128) as u32;
         let ms = |samples: u64| samples as f64 * 1000.0 / info.sample_rate.max(1) as f64;
@@ -1478,6 +1514,7 @@ impl RxManager {
             grow_refused: false,
             empty_since: None,
             port: request.rx_port,
+            secondary: request.secondary,
             latency_ns,
             own,
             txt: placed[0].resolved.txt.clone(),
@@ -1488,10 +1525,11 @@ impl RxManager {
             worker,
         };
         info!(
-            "rx flow {} from {} ({} channels) established",
+            "rx flow {} from {} ({} channels{}) established",
             flow.id,
             flow.tx_device,
-            flow.slot_names.iter().filter(|n| !n.is_empty()).count()
+            flow.slot_names.iter().filter(|n| !n.is_empty()).count(),
+            if flow.secondary.is_some() { ", on both networks" } else { "" }
         );
         if params.offset > 0 {
             warn!(
@@ -1641,6 +1679,16 @@ impl RxManager {
                 id: flow.id,
                 addr: self.shared.info.iface.ip,
                 port: flow.port,
+                secondary: flow.secondary,
+                // A flow on one network says whether it receives, as Dante
+                // receivers' unicast flows do; one on both, which networks
+                // bring it.
+                networks: match flow.secondary {
+                    None => receiving as u16,
+                    Some(_) => (0..2)
+                        .filter(|&n| flow.stats.networks[n].is_receiving(now))
+                        .fold(0, |bits, n| bits | 1 << n),
+                },
                 latency_ns: flow.latency_ns,
                 status: if receiving {
                     SubscriptionStatus::ReceivingUnicast
@@ -1810,6 +1858,9 @@ pub fn own_channel_txt(info: &crate::info::DeviceInfo, id: u16) -> ChannelTxt {
         dbcp1: ovsc_proto::frame::protocol::DBCP,
         is_default_name: true,
         multicast: None,
+        // On both networks of a redundant system, receivers may ask for our
+        // flows on both.
+        nred: info.secondary.is_some() as u8,
     }
 }
 
@@ -1820,9 +1871,10 @@ pub fn own_channel_txt(info: &crate::info::DeviceInfo, id: u16) -> ChannelTxt {
 /// scheduling delays the main cause of dropouts, hence a dedicated
 /// high-priority thread per flow rather than an async task.
 ///
-/// The thread blocks in `recv` with a timeout (the keepalive interval) on
-/// every turn and must keep doing so: XNU demotes a real-time thread that
-/// runs for about a second without blocking.
+/// The thread blocks in `recv` (or, for a flow on both networks of a
+/// redundant system, in `poll` on both sockets) with a timeout of the
+/// keepalive interval on every turn, and must keep doing so: XNU demotes a
+/// real-time thread that runs for about a second without blocking.
 struct Worker {
     stop: Arc<AtomicBool>,
     params: FlowParams,
@@ -1839,14 +1891,21 @@ struct Probes {
 }
 
 impl Worker {
+    /// Starts the thread receiving on `socket`, and on `secondary`, the
+    /// flow's socket on the secondary network, for a flow on both.
     fn spawn(
         id: u16,
         socket: std::net::UdpSocket,
+        secondary: Option<std::net::UdpSocket>,
         clock: MediaClock,
         receiver: Receiver,
         alive: mpsc::Sender<()>,
     ) -> std::io::Result<Self> {
         socket.set_read_timeout(Some(KEEPALIVE_INTERVAL))?;
+        if let Some(s) = &secondary {
+            socket.set_nonblocking(true)?;
+            s.set_nonblocking(true)?;
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let params = receiver.params;
@@ -1858,7 +1917,15 @@ impl Worker {
             if !crate::rt::raise_priority("receive", crate::rt::RtClass::Receive) {
                 receiver.probes.counters.rx_not_realtime.store(true, Ordering::Relaxed);
             }
-            receive(socket, clock, receiver, flag)
+            match secondary {
+                #[cfg(unix)]
+                Some(secondary) => receive_both([socket, secondary], clock, receiver, flag),
+                // The device refuses a secondary interface where it cannot
+                // wait on two sockets (crate::device::check_secondary).
+                #[cfg(not(unix))]
+                Some(_) => receive(socket, clock, receiver, flag),
+                None => receive(socket, clock, receiver, flag),
+            }
         })?;
         Ok(Self { stop, params })
     }
@@ -1924,11 +1991,34 @@ impl std::fmt::Display for TxAddrs {
     }
 }
 
+/// An IPv4 network: an address and its netmask.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Subnet {
+    net: u32,
+    mask: u32,
+}
+
+impl Subnet {
+    fn of(ip: Ipv4Addr, mask: Ipv4Addr) -> Self {
+        let mask = u32::from(mask);
+        Self { net: u32::from(ip) & mask, mask }
+    }
+
+    fn contains(&self, ip: Ipv4Addr) -> bool {
+        u32::from(ip) & self.mask == self.net
+    }
+}
+
 /// What a receive thread knows about its flow.
 #[derive(Clone, Copy, Debug)]
 struct FlowParams {
     /// The transmitter's addresses: datagrams from any other are dropped.
     tx: TxAddrs,
+    /// For a flow on both networks of a redundant system, the secondary
+    /// network: its copy may come from any address there, as the
+    /// transmitter's address on it is not announced where we look
+    /// (PROTOCOL.md §13).
+    secondary: Option<Subnet>,
     /// Slots per packet, fixed when the flow was requested.
     slots: usize,
     fpp: usize,
@@ -1986,11 +2076,217 @@ fn receive(
         if now >= next_keepalive {
             // Only to the transmitter's source we follow (PROTOCOL.md §8.5):
             // a keepalive to any other would keep a stray flow alive.
-            if let Some(source) = rx.source {
+            if let Some(source) = rx.paths[0].source {
                 let _ = socket.send_to(&audio::KEEPALIVE, source);
             }
             next_keepalive = now + interval;
         }
+    }
+}
+
+/// Receives a flow on both networks of a redundant system: the primary's
+/// socket first, then the secondary's, both non-blocking. Keepalives go to
+/// the transmitter on each network it sends from.
+#[cfg(unix)]
+fn receive_both(
+    sockets: [std::net::UdpSocket; 2],
+    clock: MediaClock,
+    mut rx: Receiver,
+    stop: Arc<AtomicBool>,
+) {
+    use std::os::fd::AsRawFd;
+
+    /// Datagrams taken from one socket per wake, so that neither network's
+    /// packets wait long on the other's.
+    const BURST: usize = 8;
+
+    let mut buf = vec![0u8; RECV_BUFFER];
+    drop(rx.routing.load());
+    let mut fds = [0, 1].map(|net| libc::pollfd {
+        fd: sockets[net].as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    });
+    let timeout = KEEPALIVE_INTERVAL.as_millis() as libc::c_int;
+    let mut next_keepalive = local_now_ns();
+    let interval = KEEPALIVE_INTERVAL.as_nanos() as u64;
+    while !stop.load(Ordering::Relaxed) {
+        // SAFETY: `fds` holds two initialised pollfd structs for sockets
+        // that `sockets` keeps open for as long as this loop runs.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
+        if ready > 0 {
+            for (net, socket) in sockets.iter().enumerate() {
+                if fds[net].revents == 0 {
+                    continue;
+                }
+                for _ in 0..BURST {
+                    // Would block, or an earlier keepalive bounced (ICMP).
+                    let Ok((len, from)) = socket.recv_from(&mut buf) else { break };
+                    rx.datagram_on(net, &buf[..len], from, local_now_ns(), &clock);
+                }
+            }
+        }
+        let now = local_now_ns();
+        if now >= next_keepalive {
+            for (net, socket) in sockets.iter().enumerate() {
+                if let Some(source) = rx.paths[net].source {
+                    let _ = socket.send_to(&audio::KEEPALIVE, source);
+                }
+            }
+            next_keepalive = now + interval;
+        }
+    }
+}
+
+/// One network's copy of a flow, as its receive thread follows it.
+#[derive(Clone, Copy, Debug, Default)]
+struct Path {
+    /// Where the transmitter sends this copy from, once known.
+    source: Option<SocketAddr>,
+    /// Local time of the last packet accepted from `source`.
+    source_ns: u64,
+    /// Where this copy's next packet should start.
+    expected: Option<u64>,
+}
+
+/// Where a packet's timestamp falls in its sequence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Seq {
+    /// Where the previous packet ended.
+    Next,
+    /// After a gap of that many packets of the size received.
+    Lost(u64),
+    /// Before the end of the previous packet, within a second: a duplicate
+    /// or a reordered packet. The sequence goes on where it was.
+    Behind,
+    /// Too far from the previous packet to be packet loss: a transmitter
+    /// restart, a clock step.
+    Jump,
+}
+
+impl Path {
+    /// Places the packet `[ts, ts + frames)` in this copy's sequence.
+    fn sequence(&mut self, ts: u64, frames: u64, window: u64) -> Seq {
+        let (next, seq) = match self.expected {
+            Some(exp) if ts > exp && ts - exp <= window => {
+                (ts + frames, Seq::Lost((ts - exp).div_ceil(frames.max(1))))
+            }
+            Some(exp) if ts < exp && exp - ts <= window => (exp, Seq::Behind),
+            Some(exp) if ts != exp => (ts + frames, Seq::Jump),
+            _ => (ts + frames, Seq::Next),
+        };
+        self.expected = Some(next);
+        seq
+    }
+}
+
+/// The audio of a flow received on both networks: which packets bring
+/// audio first, and which audio neither network brought before it played.
+#[derive(Clone, Copy, Debug, Default)]
+struct Merge {
+    /// The end of the newest audio received.
+    expected: Option<u64>,
+    /// Audio missing behind it, `[start, end)` in timestamps, oldest
+    /// first: the other network may still bring it.
+    gaps: [(u64, u64); Merge::GAPS],
+    len: usize,
+}
+
+/// What [`Merge::take`] made of a packet.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Merged {
+    /// The packet brings audio no network brought before.
+    first: bool,
+    /// Packets of audio that are missing for good: due to play, and
+    /// brought by neither network.
+    lost: u64,
+    /// The timeline jumped (see [`Seq::Jump`]).
+    jump: bool,
+}
+
+impl Merge {
+    /// Holes kept track of at once. More, and the oldest counts as lost.
+    const GAPS: usize = 16;
+
+    /// Takes the packet `[ts, ts + frames)`, from either network. Audio is
+    /// missing for good once the newest audio is `latency` samples past it.
+    fn take(&mut self, ts: u64, frames: u64, window: u64, latency: u64) -> Merged {
+        let end = ts + frames;
+        let mut out = Merged { first: true, ..Merged::default() };
+        match self.expected {
+            None => self.expected = Some(end),
+            Some(exp) if ts >= exp && ts - exp <= window => {
+                if ts > exp {
+                    out.lost += self.open(exp, ts, frames);
+                }
+                self.expected = Some(end);
+            }
+            Some(exp) if ts < exp && exp - ts <= window => out.first = self.fill(ts, end),
+            Some(_) => {
+                // The holes belong to the timeline left behind.
+                self.len = 0;
+                self.expected = Some(end);
+                out.jump = true;
+            }
+        }
+        let horizon = self.expected.unwrap_or(end).saturating_sub(latency);
+        out.lost += self.expire(horizon, frames);
+        out
+    }
+
+    /// Notes the hole `[start, end)`. Returns the packets of the oldest
+    /// hole, given up on when there is no room.
+    fn open(&mut self, start: u64, end: u64, frames: u64) -> u64 {
+        let mut lost = 0;
+        if self.len == Self::GAPS {
+            let (s, e) = self.gaps[0];
+            lost = (e - s).div_ceil(frames.max(1));
+            self.gaps.copy_within(1.., 0);
+            self.len -= 1;
+        }
+        self.gaps[self.len] = (start, end);
+        self.len += 1;
+        lost
+    }
+
+    /// Takes `[ts, end)` out of the holes. Returns whether it filled any.
+    fn fill(&mut self, ts: u64, end: u64) -> bool {
+        let mut kept = [(0, 0); Self::GAPS];
+        let mut n = 0;
+        let mut filled = false;
+        let mut keep = |gap: (u64, u64)| {
+            // A hole split in two with no room left loses its later part:
+            // that audio still plays if it comes, only uncounted if not.
+            if n < Self::GAPS {
+                kept[n] = gap;
+                n += 1;
+            }
+        };
+        for &(s, e) in &self.gaps[..self.len] {
+            if e <= ts || s >= end {
+                keep((s, e));
+                continue;
+            }
+            filled = true;
+            if s < ts {
+                keep((s, ts));
+            }
+            if end < e {
+                keep((end, e));
+            }
+        }
+        self.gaps = kept;
+        self.len = n;
+        filled
+    }
+
+    /// Gives up on the holes that end by `horizon`. Returns their packets.
+    fn expire(&mut self, horizon: u64, frames: u64) -> u64 {
+        let done = self.gaps[..self.len].iter().take_while(|&&(_, e)| e <= horizon).count();
+        let lost = self.gaps[..done].iter().map(|&(s, e)| (e - s).div_ceil(frames.max(1))).sum();
+        self.gaps.copy_within(done.., 0);
+        self.len -= done;
+        lost
     }
 }
 
@@ -2005,12 +2301,11 @@ struct Receiver {
     samples: Vec<Sample>,
     /// [`FRESH_HOLD`] in samples.
     fresh_hold: u64,
-    /// Where the transmitter sends the flow from, once known.
-    source: Option<SocketAddr>,
-    /// Local time of the last packet accepted from `source`.
-    source_ns: u64,
-    /// Where the next packet should start.
-    expected: Option<u64>,
+    /// Each network's copy of the flow: the primary's, then the
+    /// secondary's.
+    paths: [Path; 2],
+    /// For a flow on both networks, the audio across them.
+    merge: Option<Merge>,
 }
 
 impl Receiver {
@@ -2029,15 +2324,34 @@ impl Receiver {
             // transmitter may send another fpp than the one asked for.
             samples: vec![0; max_frames(&params)],
             fresh_hold: ns_to_samples(FRESH_HOLD.as_nanos() as u64, params.sample_rate),
-            source: None,
-            source_ns: 0,
-            expected: None,
+            paths: [Path::default(); 2],
+            merge: params.secondary.map(|_| Merge::default()),
         }
     }
 
-    /// Handles one datagram received at local time `now_ns`.
+    /// Handles one datagram received on the primary network at local time
+    /// `now_ns`.
     fn datagram(&mut self, data: &[u8], from: SocketAddr, now_ns: u64, clock: &MediaClock) {
-        if !self.accept(data.len(), from, now_ns) {
+        self.datagram_on(0, data, from, now_ns, clock);
+    }
+
+    /// Handles one datagram received on network `net` (0 the primary, 1
+    /// the secondary) at local time `now_ns`.
+    ///
+    /// Every accepted packet is written into the rings: a copy of audio
+    /// the other network brought already writes the same samples again.
+    /// What the counters say about the audio (packets, late, early, lost)
+    /// counts each packet's first copy only, whichever network brought it.
+    fn datagram_on(
+        &mut self,
+        net: usize,
+        data: &[u8],
+        from: SocketAddr,
+        now_ns: u64,
+        clock: &MediaClock,
+    ) {
+        let net = net.min(1);
+        if !self.accept(net, data.len(), from, now_ns) {
             let Probes { counters, stats, .. } = &self.probes;
             counters.rx_rejected_packets.fetch_add(1, Ordering::Relaxed);
             stats.rejected_packets.fetch_add(1, Ordering::Relaxed);
@@ -2054,26 +2368,42 @@ impl Receiver {
         let Ok(packet) = AudioPacket::parse(data, p.slots, p.format) else { return };
         let ts = packet.timestamp(p.sample_rate);
         let frames = packet.frames() as u64;
-        self.sequence(ts, frames);
+        let first = self.sequence(net, ts, frames);
         let Probes { last_packet_ns, counters, stats } = &self.probes;
-        counters.rx_packets.fetch_add(1, Ordering::Relaxed);
-        stats.packets.fetch_add(1, Ordering::Relaxed);
+        let network = &stats.networks[net];
+        counters.networks[net].rx_packets.fetch_add(1, Ordering::Relaxed);
+        network.packets.fetch_add(1, Ordering::Relaxed);
+        network.last_packet_ns.store(now_ns, Ordering::Relaxed);
+        if first {
+            counters.rx_packets.fetch_add(1, Ordering::Relaxed);
+            stats.packets.fetch_add(1, Ordering::Relaxed);
+        }
         if let Some(now) = clock.now_samples(p.sample_rate) {
             // Its first sample plays `latency` samples after its timestamp,
             // so the packet must be here by then.
             let arrival = now.saturating_sub(ts);
-            stats.max_arrival.fetch_max(arrival.min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
-            if arrival > p.latency {
-                counters.rx_late_packets.fetch_add(1, Ordering::Relaxed);
-                stats.late_packets.fetch_add(1, Ordering::Relaxed);
+            let arrival32 = arrival.min(u64::from(u32::MAX)) as u32;
+            network.max_arrival.fetch_max(arrival32, Ordering::Relaxed);
+            let late = arrival > p.latency;
+            if late {
+                network.late_packets.fetch_add(1, Ordering::Relaxed);
             }
             // Stamped in our future: the transmitter's clock is ahead of
             // ours, which delays its audio by as much.
             let lead = ts.saturating_sub(now);
-            if lead > frames {
-                counters.rx_early_packets.fetch_add(1, Ordering::Relaxed);
-                stats.early_packets.fetch_add(1, Ordering::Relaxed);
-                stats.max_early.fetch_max(lead.min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
+            if first {
+                stats.max_arrival.fetch_max(arrival32, Ordering::Relaxed);
+                if late {
+                    counters.rx_late_packets.fetch_add(1, Ordering::Relaxed);
+                    stats.late_packets.fetch_add(1, Ordering::Relaxed);
+                }
+                if lead > frames {
+                    counters.rx_early_packets.fetch_add(1, Ordering::Relaxed);
+                    stats.early_packets.fetch_add(1, Ordering::Relaxed);
+                    stats
+                        .max_early
+                        .fetch_max(lead.min(u64::from(u32::MAX)) as u32, Ordering::Relaxed);
+                }
             }
         }
         let routes = self.routing.load();
@@ -2096,60 +2426,71 @@ impl Receiver {
         last_packet_ns.store(now_ns, Ordering::Relaxed);
     }
 
-    /// Whether a datagram is one of the flow's packets: from one of the
-    /// transmitter's addresses (a computer on Wi-Fi and Ethernet may send
-    /// from either, whichever the flow was requested from), from the source
-    /// its packets have been coming from, and whole frames of the flow's
-    /// slots. Anything else (a flow that a previous receiver on this port
-    /// left behind, a second flow created by a retried request) would be
-    /// mixed into this flow's channels, or decoded with the wrong layout.
+    /// Whether a datagram on network `net` is one of the flow's packets:
+    /// from one of the transmitter's addresses (a computer on Wi-Fi and
+    /// Ethernet may send from either, whichever the flow was requested
+    /// from), or on the secondary network from an address there; from the
+    /// source the network's packets have been coming from; and whole frames
+    /// of the flow's slots. Anything else (a flow that a previous receiver
+    /// on this port left behind, a second flow created by a retried
+    /// request) would be mixed into this flow's channels, or decoded with
+    /// the wrong layout.
     ///
     /// The frame count is not checked against the fpp we asked for, only
     /// against [`RX_FPP_LIMIT`]: receivers derive it from the length
     /// (PROTOCOL.md §8.2), so a transmitter that picks another fpp still
     /// plays rather than going silent for good.
-    fn accept(&mut self, len: usize, from: SocketAddr, now_ns: u64) -> bool {
+    fn accept(&mut self, net: usize, len: usize, from: SocketAddr, now_ns: u64) -> bool {
         let payload = len.saturating_sub(audio::HEADER_LEN);
         let stride = self.params.stride();
         let frames = payload / stride;
         let whole = payload % stride == 0 && (1..=self.samples.len()).contains(&frames);
         let IpAddr::V4(ip) = from.ip() else { return false };
-        if !self.params.tx.contains(ip) || !whole {
+        let ours = self.params.tx.contains(ip)
+            || (net == 1 && self.params.secondary.is_some_and(|s| s.contains(ip)));
+        if !ours || !whole {
             return false;
         }
-        match self.source {
+        let path = &mut self.paths[net];
+        match path.source {
             Some(source) if source == from => {}
             // Another port, or another of the transmitter's addresses: only
             // once the one we follow has gone quiet.
-            Some(_) if now_ns.saturating_sub(self.source_ns) < SOURCE_HOLD_NS => return false,
-            _ => self.source = Some(from),
+            Some(_) if now_ns.saturating_sub(path.source_ns) < SOURCE_HOLD_NS => return false,
+            _ => path.source = Some(from),
         }
-        self.source_ns = now_ns;
+        path.source_ns = now_ns;
         true
     }
 
-    /// Counts packets missing from the timestamp sequence, in packets of
-    /// the size received.
-    fn sequence(&mut self, ts: u64, frames: u64) {
+    /// Counts packets missing from network `net`'s copy of the flow, in
+    /// packets of the size received, and those missing from the audio.
+    /// Returns whether the packet brings audio first.
+    fn sequence(&mut self, net: usize, ts: u64, frames: u64) -> bool {
         let Probes { counters, stats, .. } = &self.probes;
         let window = u64::from(self.params.sample_rate);
-        let next = match self.expected {
-            Some(exp) if ts > exp && ts - exp <= window => {
-                let lost = (ts - exp).div_ceil(frames.max(1));
-                counters.rx_lost_packets.fetch_add(lost, Ordering::Relaxed);
-                stats.lost_packets.fetch_add(lost, Ordering::Relaxed);
-                ts + frames
-            }
-            // A late duplicate or reordered packet: the sequence goes on
-            // where it was.
-            Some(exp) if ts < exp && exp - ts <= window => exp,
-            Some(exp) if ts != exp => {
-                stats.discontinuities.fetch_add(1, Ordering::Relaxed);
-                ts + frames
-            }
-            _ => ts + frames,
+        let seq = self.paths[net].sequence(ts, frames, window);
+        if let Seq::Lost(lost) = seq {
+            counters.networks[net].rx_lost_packets.fetch_add(lost, Ordering::Relaxed);
+            stats.networks[net].lost_packets.fetch_add(lost, Ordering::Relaxed);
+        }
+        let merged = match &mut self.merge {
+            // One network: its sequence is the audio's.
+            None => Merged {
+                first: true,
+                lost: if let Seq::Lost(n) = seq { n } else { 0 },
+                jump: seq == Seq::Jump,
+            },
+            Some(m) => m.take(ts, frames, window, self.params.latency),
         };
-        self.expected = Some(next);
+        if merged.lost > 0 {
+            counters.rx_lost_packets.fetch_add(merged.lost, Ordering::Relaxed);
+            stats.lost_packets.fetch_add(merged.lost, Ordering::Relaxed);
+        }
+        if merged.jump {
+            stats.discontinuities.fetch_add(1, Ordering::Relaxed);
+        }
+        merged.first
     }
 }
 
@@ -2171,6 +2512,7 @@ mod tests {
             dbcp1: 0x1102,
             is_default_name: true,
             multicast: None,
+            nred: 0,
         };
         // 4 ms at 48 kHz → 48, capped by the transmitter's 32.
         assert_eq!(choose_fpp(192, &txt, 2, SampleFormat::S24), 32);
@@ -2196,6 +2538,7 @@ mod tests {
             dbcp1: 0x1102,
             is_default_name: true,
             multicast: None,
+            nred: 0,
         }
     }
 
@@ -2277,6 +2620,7 @@ mod tests {
     fn test_rx_from(tx: TxAddrs, slots: usize, fpp: usize, offset: u64) -> TestRx {
         let params = FlowParams {
             tx,
+            secondary: None,
             slots,
             fpp,
             format: SampleFormat::S24,
@@ -2310,6 +2654,36 @@ mod tests {
             let data = packet(ts, p.slots, p.fpp, value);
             self.rx.datagram(&data, from, at_ns, &self.clock);
         }
+
+        /// Like [`TestRx::send`], on network `net`.
+        fn send_on(&mut self, net: usize, from: SocketAddr, at_ns: u64, ts: u64, value: i32) {
+            let p = self.rx.params;
+            let data = packet(ts, p.slots, p.fpp, value);
+            self.rx.datagram_on(net, &data, from, at_ns, &self.clock);
+        }
+    }
+
+    /// The secondary network of the redundant tests, and the transmitter's
+    /// address on it.
+    const SECONDARY: Ipv4Addr = Ipv4Addr::new(172, 31, 0, 0);
+    const TX2: Ipv4Addr = Ipv4Addr::new(172, 31, 4, 7);
+
+    /// A receiver for a flow on both networks, otherwise as [`test_rx`].
+    fn test_rx_redundant(slots: usize, fpp: usize) -> TestRx {
+        let mut t = test_rx(slots, fpp, 0);
+        let mask = Ipv4Addr::new(255, 255, 0, 0);
+        t.rx.params.secondary = Some(Subnet::of(SECONDARY, mask));
+        t.rx = Receiver::new(
+            t.rx.params,
+            t.routing.clone(),
+            t.rings.clone(),
+            Probes {
+                last_packet_ns: Arc::new(AtomicU64::new(0)),
+                counters: t.counters.clone(),
+                stats: t.stats.clone(),
+            },
+        );
+        t
     }
 
     fn packet(ts: u64, slots: usize, fpp: usize, value: i32) -> Vec<u8> {
@@ -2354,7 +2728,7 @@ mod tests {
         assert_eq!(last >> 32, u32::from(TX) as u64);
         assert_eq!((last >> 16) & 0xffff, 5000);
         assert_eq!(last & 0xffff, wrong.len() as u64);
-        assert_eq!(t.rx.source, Some(a));
+        assert_eq!(t.rx.paths[0].source, Some(a));
         // Only the accepted packet was written.
         assert_eq!(t.rings[1].read_one(ts), Some(101 << 8));
         assert_eq!(t.rings[0].read_one(ts + 12), None);
@@ -2363,7 +2737,7 @@ mod tests {
         // Once the followed port has been quiet a while, another may take
         // over: a transmitter that moved its flow to a new socket.
         t.send(b, 1_000 + SOURCE_HOLD_NS + 1, ts + 36, 400);
-        assert_eq!(t.rx.source, Some(b));
+        assert_eq!(t.rx.paths[0].source, Some(b));
         assert_eq!(t.rings[0].read_one(ts + 36), Some(400 << 8));
         t.send(a, 1_000 + SOURCE_HOLD_NS + 2, ts + 48, 500);
         assert_eq!(t.rings[0].read_one(ts + 48), None);
@@ -2384,7 +2758,7 @@ mod tests {
         t.send(a, 1_000, ts, 100);
         assert_eq!(get(&t.stats.rejected_packets), 0);
         assert_eq!(get(&t.stats.packets), 1);
-        assert_eq!(t.rx.source, Some(a));
+        assert_eq!(t.rx.paths[0].source, Some(a));
         assert_eq!(t.rings[0].read_one(ts), Some(100 << 8));
         assert_eq!(t.rings[1].read_one(ts + 11), Some(101 << 8));
 
@@ -2403,7 +2777,7 @@ mod tests {
         // Once Wi-Fi has been quiet a while, the wired address takes over:
         // the computer moved the flow to its other interface.
         t.send(b, 4_000 + SOURCE_HOLD_NS + 1, ts + 24, 500);
-        assert_eq!(t.rx.source, Some(b));
+        assert_eq!(t.rx.paths[0].source, Some(b));
         assert_eq!(t.rings[0].read_one(ts + 24), Some(500 << 8));
         assert_eq!(get(&t.stats.packets), 3);
         assert_eq!(get(&t.stats.rejected_packets), 2);
@@ -2489,6 +2863,94 @@ mod tests {
         assert_eq!(get(&t.stats.lost_packets), 2);
         assert_eq!(get(&t.stats.discontinuities), 1);
         assert_eq!(get(&t.stats.packets), 6);
+    }
+
+    #[test]
+    fn audio_brought_by_either_network_is_not_lost() {
+        let mut t = test_rx_redundant(1, 12);
+        let (a, b) = (from(TX, 5000), from(TX2, 5000));
+        let ts = t.now();
+        // Both networks bring every packet: each counts once.
+        for k in 0..4 {
+            t.send_on(0, a, 1 + k, ts + 12 * k, 1);
+            t.send_on(1, b, 2 + k, ts + 12 * k, 1);
+        }
+        assert_eq!(get(&t.stats.packets), 4);
+        assert_eq!(get(&t.counters.networks[0].rx_packets), 4);
+        assert_eq!(get(&t.counters.networks[1].rx_packets), 4);
+        // The primary loses two packets the secondary brings, before or
+        // after the primary's next one: lost on the primary, not to the
+        // audio.
+        t.send_on(1, b, 10, ts + 48, 1);
+        t.send_on(0, a, 11, ts + 72, 1);
+        t.send_on(1, b, 12, ts + 60, 1);
+        t.send_on(1, b, 13, ts + 72, 1);
+        assert_eq!(get(&t.counters.networks[0].rx_lost_packets), 2);
+        assert_eq!(get(&t.counters.networks[1].rx_lost_packets), 0);
+        assert_eq!(get(&t.counters.rx_lost_packets), 0);
+        assert_eq!(get(&t.stats.packets), 7);
+        // Both lose ts + 84: lost to the audio once it is due, the latency
+        // (480 samples) after the newest audio.
+        t.send_on(0, a, 20, ts + 96, 1);
+        t.send_on(1, b, 21, ts + 96, 1);
+        assert_eq!(get(&t.counters.rx_lost_packets), 0, "the hole may still fill");
+        for k in 0..40 {
+            t.send_on(0, a, 30 + k, ts + 108 + 12 * k, 1);
+        }
+        assert_eq!(get(&t.counters.rx_lost_packets), 1);
+        assert_eq!(get(&t.stats.lost_packets), 1);
+        // Each network lost ts + 84; the secondary's silence since is not
+        // counted until a packet shows how long it was.
+        assert_eq!(get(&t.counters.networks[0].rx_lost_packets), 3);
+        assert_eq!(get(&t.counters.networks[1].rx_lost_packets), 1);
+        assert_eq!(get(&t.stats.discontinuities), 0);
+        // The audio was written from whichever network brought it.
+        assert_eq!(t.rings[0].read_one(ts + 60), Some(1 << 8));
+        assert!(t.stats.networks[0].is_receiving(70));
+    }
+
+    #[test]
+    fn the_secondary_copy_comes_from_the_secondary_network() {
+        let mut t = test_rx_redundant(1, 12);
+        let ts = t.now();
+        // From the transmitter's primary address or the secondary network.
+        t.send_on(1, from(TX2, 6000), 1, ts, 1);
+        assert_eq!(t.rx.paths[1].source, Some(from(TX2, 6000)));
+        // Not from elsewhere, nor from the secondary network on the primary.
+        t.send_on(1, from(Ipv4Addr::new(10, 9, 9, 9), 6000), 2, ts + 12, 1);
+        t.send_on(0, from(TX2, 6000), 3, ts + 12, 1);
+        assert_eq!(get(&t.counters.rx_rejected_packets), 2);
+        // Each network follows its own source.
+        t.send_on(0, from(TX, 5000), 4, ts + 12, 1);
+        assert_eq!(t.rx.paths[0].source, Some(from(TX, 5000)));
+        assert_eq!(get(&t.stats.packets), 2);
+    }
+
+    #[test]
+    fn holes_fill_in_part_and_give_up_when_too_many() {
+        let mut m = Merge::default();
+        let (w, lat) = (48_000, 480);
+        assert!(m.take(0, 10, w, lat).first);
+        // [10, 40) missing, then filled from the middle out.
+        assert_eq!(m.take(40, 10, w, lat), Merged { first: true, lost: 0, jump: false });
+        assert!(m.take(20, 10, w, lat).first);
+        assert_eq!(&m.gaps[..m.len], &[(10, 20), (30, 40)]);
+        assert!(!m.take(20, 10, w, lat).first, "a copy of audio already here");
+        assert!(m.take(10, 10, w, lat).first);
+        assert!(m.take(30, 10, w, lat).first);
+        assert_eq!(m.len, 0);
+        // More holes than there is room for: the oldest is given up.
+        let mut ts = 50;
+        let mut lost = 0;
+        for _ in 0..=Merge::GAPS {
+            lost += m.take(ts + 10, 10, w, lat).lost;
+            ts += 20;
+        }
+        assert_eq!((lost, m.len), (1, Merge::GAPS));
+        // A jump forgets them all.
+        let jumped = m.take(ts + 10 * w, 10, w, lat);
+        assert!(jumped.jump && jumped.first);
+        assert_eq!((jumped.lost, m.len), (0, 0));
     }
 
     #[test]
@@ -2661,7 +3123,7 @@ mod tests {
         let addr = socket.local_addr().unwrap();
         let t = test_rx(1, 12, 0);
         let (alive, _) = mpsc::channel(1);
-        let worker = Worker::spawn(99, socket, t.clock.clone(), t.rx, alive).unwrap();
+        let worker = Worker::spawn(99, socket, None, t.clock.clone(), t.rx, alive).unwrap();
         let tx = std::net::UdpSocket::bind((TX, 0)).unwrap();
         let stray = std::net::UdpSocket::bind((TX, 0)).unwrap();
         for s in [&tx, &stray] {

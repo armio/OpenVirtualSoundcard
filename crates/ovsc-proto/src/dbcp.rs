@@ -155,12 +155,39 @@ impl FlowRequest {
 }
 
 /// Successful response to [`opcode::REQUEST_FLOW`].
-pub fn encode_flow_created(request: &Header, handle: FlowHandle) -> Vec<u8> {
-    respond(request, result::SUCCESS, &handle)
+/// The answer to a granted flow request, as a real transmitter gives it
+/// (PROTOCOL.md §6.3): the handle, the number of networks the flow is sent
+/// on, a result per network (1: sent there), an extension pointer (none)
+/// and a pad.
+pub fn encode_flow_created(request: &Header, handle: FlowHandle, networks: usize) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.bytes(&handle);
+    w.u16(networks as u16);
+    for _ in 0..networks {
+        w.u16(result::SUCCESS);
+    }
+    w.u16(0);
+    w.u16(0);
+    respond(request, result::SUCCESS, w.as_slice())
 }
 
+/// The handle of a granted flow request. Earlier versions of
+/// OpenVirtualSoundcard answer with the handle alone.
 pub fn decode_flow_created(frame: &Frame<'_>) -> Result<FlowHandle> {
     Reader::new(frame.payload()).array()
+}
+
+/// The per-network results of a granted flow request: one per network the
+/// flow is sent on, 1 when it is sent there. Empty for an answer with the
+/// handle alone.
+pub fn decode_flow_networks(frame: &Frame<'_>) -> Result<Vec<u16>> {
+    let payload = frame.payload();
+    if payload.len() <= 6 {
+        return Ok(Vec::new());
+    }
+    let mut r = Reader::at(payload, 6);
+    let n = (r.u16()? as usize).min(MAX_RECEIVER_ADDRESSES);
+    (0..n).map(|_| r.u16()).collect()
 }
 
 /// Request to stop a flow.
@@ -260,7 +287,30 @@ mod tests {
         let u = Frame::parse(&u_pkt).unwrap();
         assert_eq!(decode_update_flow(&u).unwrap(), (handle, vec![4, 5, 0]));
 
-        let created = encode_flow_created(&f.header, handle);
-        assert_eq!(decode_flow_created(&Frame::parse(&created).unwrap()).unwrap(), handle);
+        let created = encode_flow_created(&f.header, handle, 1);
+        let c = Frame::parse(&created).unwrap();
+        assert_eq!(decode_flow_created(&c).unwrap(), handle);
+        assert_eq!(decode_flow_networks(&c).unwrap(), [1]);
+        let created = encode_flow_created(&f.header, handle, 2);
+        assert_eq!(decode_flow_networks(&Frame::parse(&created).unwrap()).unwrap(), [1, 1]);
+    }
+
+    #[test]
+    fn a_granted_flow_is_answered_as_a_real_transmitter_does() {
+        // A transmitter's answer to the A32's request (netaudio test vector,
+        // public domain): handle 0001 7fef911d, one network, result 1.
+        let real =
+            hex::decode("110200180000010000010001 7fef911d 0001 0001 0000 0000".replace(' ', ""))
+                .unwrap();
+        let f = Frame::parse(&real).unwrap();
+        let handle = decode_flow_created(&f).unwrap();
+        assert_eq!(handle, [0x00, 0x01, 0x7f, 0xef, 0x91, 0x1d]);
+        assert_eq!(decode_flow_networks(&f).unwrap(), [1]);
+        assert_eq!(encode_flow_created(&f.header, handle, 1), real);
+        // An answer with the handle alone, as OpenVirtualSoundcard gave.
+        let old = respond(&f.header, result::SUCCESS, &handle);
+        let f = Frame::parse(&old).unwrap();
+        assert_eq!(decode_flow_created(&f).unwrap(), handle);
+        assert!(decode_flow_networks(&f).unwrap().is_empty());
     }
 }

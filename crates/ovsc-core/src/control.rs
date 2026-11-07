@@ -176,6 +176,7 @@ pub fn handle_arc(shared: &Shared, frame: &Frame<'_>, from: SocketAddr) -> Optio
             max_rx_flows: MAX_RX_FLOWS as u16,
             supports_tx_rename: true,
             supports_tx_multicast: false,
+            network_interfaces: 1 + info.secondary.is_some() as u16,
         }
         .encode_response(h),
         opcode::DEVICE_NAME => arc::encode_device_name_response(h, &shared.name()),
@@ -450,10 +451,11 @@ struct Conmon {
     seq: u16,
     /// The clock state last reported, to report changes.
     sync: Option<conmon::Sync>,
-    /// The interface's counters at the last heartbeat, and when.
-    traffic: Option<(InterfaceCounters, std::time::Instant)>,
-    /// The interface's error counters when the device started.
-    errors_base: Option<InterfaceCounters>,
+    /// Each interface's counters at the last heartbeat, and when: the
+    /// primary's, then the secondary's.
+    traffic: [Option<(InterfaceCounters, std::time::Instant)>; 2],
+    /// Each interface's error counters when the device started.
+    errors_base: [Option<InterfaceCounters>; 2],
 }
 
 impl Conmon {
@@ -543,13 +545,15 @@ impl Conmon {
                 self.status(notification::MANUFACTURER_VERSIONS_STATUS, &c).await
             }
             notification::INTERFACE_QUERY => {
-                let c = conmon::interface_status(
-                    iface.link_speed_mbps,
-                    iface.mac,
-                    iface.ip,
-                    iface.netmask,
-                    iface.gateway,
-                );
+                let addrs = |i: &crate::net::Interface| conmon::InterfaceAddrs {
+                    mac: i.mac,
+                    ip: i.ip,
+                    netmask: i.netmask,
+                    gateway: i.gateway,
+                };
+                let all: Vec<_> =
+                    std::iter::once(iface).chain(&info.secondary).map(addrs).collect();
+                let c = conmon::interface_status(iface.link_speed_mbps, &all);
                 self.status(notification::INTERFACE_STATUS, &c).await
             }
             notification::CLOCKING_QUERY => self.clocking().await,
@@ -611,13 +615,15 @@ impl Conmon {
         }
     }
 
-    /// The interface's traffic since the last call, per second, and its
-    /// errors since the device started.
-    fn traffic(&mut self) -> Option<InterfaceTraffic> {
-        let now = interface_counters(&self.shared.info.iface.name)?;
+    /// Interface `net`'s traffic (0 the primary, 1 the secondary) since the
+    /// last call, per second, and its errors since the device started.
+    fn traffic(&mut self, net: usize) -> Option<InterfaceTraffic> {
+        let info = &self.shared.info;
+        let iface = if net == 0 { Some(&info.iface) } else { info.secondary.as_ref() }?;
+        let now = interface_counters(&iface.name)?;
         let at = std::time::Instant::now();
-        let base = *self.errors_base.get_or_insert(now);
-        let previous = self.traffic.replace((now, at));
+        let base = *self.errors_base[net].get_or_insert(now);
+        let previous = self.traffic[net].replace((now, at));
         let (before, then) = previous?;
         let secs = at.duration_since(then).as_secs_f64().max(0.001);
         let rate =
@@ -660,8 +666,16 @@ impl Conmon {
         if let Some(snap) = &snap {
             hb = hb.clock(seq, snap.freq_offset_ppb().round() as i32);
         }
-        if let Some(traffic) = self.traffic() {
-            hb = hb.interface_traffic(seq, &[traffic]);
+        if let Some(primary) = self.traffic(0) {
+            // A device on two networks reports both, the secondary as zeros
+            // while its counters are unavailable, as an LX-DANTE with its
+            // secondary link down does.
+            hb = match self.shared.info.secondary {
+                Some(_) => {
+                    hb.interface_traffic(seq, &[primary, self.traffic(1).unwrap_or_default()])
+                }
+                None => hb.interface_traffic(seq, &[primary]),
+            };
         }
         let now = self.shared.clock.now_samples(rate);
         let window = (rate / 4) as usize;
@@ -672,9 +686,19 @@ impl Conmon {
         );
         if snap.is_some() && !self.shared.rx_rings.is_empty() {
             let stats = self.shared.state().rx_flow_stats.clone();
-            hb = hb
-                .rx_latency(seq, rate, &flow_arrivals(&stats, MAX_RX_FLOWS))
-                .late_packets(seq, &flow_late_packets(&stats, MAX_RX_FLOWS));
+            let (arrivals, late) = match self.shared.info.secondary {
+                None => {
+                    (flow_arrivals(&stats, MAX_RX_FLOWS), flow_late_packets(&stats, MAX_RX_FLOWS))
+                }
+                // Each flow on each network: the primary's flows, then the
+                // secondary's (PROTOCOL.md §7.6, 0x8003).
+                Some(_) => (0..2).fold((Vec::new(), Vec::new()), |(mut a, mut l), net| {
+                    a.extend(network_arrivals(&stats, MAX_RX_FLOWS, net));
+                    l.extend(network_late_packets(&stats, MAX_RX_FLOWS, net));
+                    (a, l)
+                }),
+            };
+            hb = hb.rx_latency(seq, rate, &arrivals).late_packets(seq, &late);
         }
         let dest = SocketAddr::from((conmon::HEARTBEAT_GROUP, conmon::HEARTBEAT_PORT));
         self.send(conmon::START_HEARTBEAT, conmon::HEARTBEAT_OPCODE, &hb.into_content(), dest)
@@ -721,6 +745,18 @@ fn flow_late_packets(stats: &[(u16, Arc<FlowStats>)], capacity: usize) -> Vec<u3
     })
 }
 
+/// [`flow_arrivals`] on network `net` alone.
+fn network_arrivals(stats: &[(u16, Arc<FlowStats>)], capacity: usize, net: usize) -> Vec<u32> {
+    per_flow(stats, capacity, |s| s.networks[net].max_arrival.swap(0, Ordering::Relaxed))
+}
+
+/// [`flow_late_packets`] on network `net` alone.
+fn network_late_packets(stats: &[(u16, Arc<FlowStats>)], capacity: usize, net: usize) -> Vec<u32> {
+    per_flow(stats, capacity, |s| {
+        s.networks[net].late_packets.load(Ordering::Relaxed).min(u64::from(u32::MAX)) as u32
+    })
+}
+
 fn per_flow(
     stats: &[(u16, Arc<FlowStats>)],
     capacity: usize,
@@ -746,8 +782,8 @@ pub async fn run_conmon(
         info_dest: SocketAddr::from((conmon::INFO_GROUP, conmon::INFO_PORT)),
         seq: 1,
         sync: None,
-        traffic: None,
-        errors_base: None,
+        traffic: [None; 2],
+        errors_base: [None; 2],
     };
     c.answer(notification::VERSIONS_QUERY, &[], None).await;
     c.answer(notification::MANUFACTURER_VERSIONS_QUERY, &[], None).await;
@@ -886,8 +922,8 @@ mod tests {
             info_dest: listener.local_addr().unwrap(),
             seq: 1,
             sync: None,
-            traffic: None,
-            errors_base: None,
+            traffic: [None; 2],
+            errors_base: [None; 2],
         };
         (c, listener)
     }

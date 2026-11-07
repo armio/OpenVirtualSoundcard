@@ -23,7 +23,9 @@ use crate::mdns::{self, Advertisement, Mdns, NameConflict};
 use crate::net::{Interface, bind_udp, into_tokio};
 use crate::persist::{self, SavedState};
 use crate::rx::{RxManager, own_channel_txt};
-use crate::state::{FormatRequest, RemoteChanges, RxLatency, Shared, State, Subscription};
+use crate::state::{
+    FormatRequest, NetworkStats, RemoteChanges, RxLatency, Shared, State, Subscription,
+};
 use crate::tx::{self, FlowControl, TxCommand};
 use crate::{Error, Result};
 
@@ -67,6 +69,9 @@ pub struct TxFlowStatus {
     pub id: u16,
     pub receiver: Option<String>,
     pub destination: std::net::SocketAddrV4,
+    /// The receiver's address on the secondary network, for a flow sent on
+    /// both networks of a redundant system.
+    pub secondary: Option<std::net::SocketAddrV4>,
     pub channels: Vec<u16>,
 }
 
@@ -161,6 +166,10 @@ pub struct DeviceStats {
     /// Datagrams receive flows dropped: from another sender than the
     /// flow's transmitter, or not whole frames of the flow's slots.
     pub rx_rejected_packets: u64,
+    /// Each network's packets, the primary's then the secondary's: see
+    /// [`crate::state::Counters`]. All zero for the secondary of a device
+    /// without one.
+    pub networks: [NetworkStats; 2],
 }
 
 impl Device {
@@ -565,6 +574,7 @@ impl Device {
                 id: f.id,
                 receiver: f.remote.as_ref().map(|(dev, _)| dev.clone()),
                 destination: std::net::SocketAddrV4::new(f.dst_addr, f.dst_port),
+                secondary: f.secondary,
                 channels: f.channels.clone(),
             })
             .collect()
@@ -699,13 +709,22 @@ impl DeviceObserver {
 /// Loopback addresses are allowed together, for tests.
 fn check_secondary(primary: &Interface, secondary: Option<&Interface>) -> Result<()> {
     let Some(s) = secondary else { return Ok(()) };
-    if s.name == primary.name || s.ip == primary.ip {
+    // A flow on both networks is received by one thread waiting on both
+    // sockets with poll(2).
+    if cfg!(not(unix)) {
+        return Err(Error::Config(
+            "secondary_interface: Dante redundancy needs macOS or Linux".into(),
+        ));
+    }
+    // Two loopback addresses stand in for two interfaces in tests.
+    let loopback = s.ip.is_loopback() && primary.ip.is_loopback();
+    if s.ip == primary.ip || (s.name == primary.name && !loopback) {
         return Err(Error::Config(format!(
             "secondary_interface {} ({}) is the primary interface",
             s.name, s.ip
         )));
     }
-    if s.ip.is_loopback() && primary.ip.is_loopback() {
+    if loopback {
         return Ok(());
     }
     let on_network_of = |a: &Interface, ip: Ipv4Addr| {
@@ -747,6 +766,7 @@ fn stats(shared: &Shared) -> DeviceStats {
         rx_lost_packets: c.rx_lost_packets.load(Ordering::Relaxed),
         rx_early_packets: c.rx_early_packets.load(Ordering::Relaxed),
         rx_rejected_packets: c.rx_rejected_packets.load(Ordering::Relaxed),
+        networks: [c.networks[0].read(), c.networks[1].read()],
     }
 }
 
@@ -998,6 +1018,33 @@ impl AudioIo {
 mod tests {
     use super::*;
     use crate::config::{Channels, Ports};
+
+    #[cfg(unix)]
+    #[test]
+    fn the_secondary_interface_is_another_one_on_another_network() {
+        let iface = |name: &str, ip: [u8; 4], mask: [u8; 4]| Interface {
+            name: name.into(),
+            ip: ip.into(),
+            netmask: mask.into(),
+            gateway: Ipv4Addr::UNSPECIFIED,
+            mac: [0; 6],
+            link_speed_mbps: 1000,
+        };
+        let primary = iface("en0", [192, 168, 1, 20], [255, 255, 255, 0]);
+        let ok = |s: &Interface| check_secondary(&primary, Some(s)).is_ok();
+        assert!(check_secondary(&primary, None).is_ok());
+        // The usual secondary network of a Dante system.
+        assert!(ok(&iface("en7", [172, 31, 1, 20], [255, 255, 0, 0])));
+        // The primary again, by name or address, or the primary's network.
+        assert!(!ok(&iface("en0", [172, 31, 1, 20], [255, 255, 0, 0])));
+        assert!(!ok(&iface("en7", [192, 168, 1, 20], [255, 255, 255, 0])));
+        assert!(!ok(&iface("en7", [192, 168, 1, 21], [255, 255, 255, 0])));
+        // A wider netmask that covers the primary.
+        assert!(!ok(&iface("en7", [192, 168, 2, 20], [255, 255, 0, 0])));
+        // Two loopback addresses, as the tests use.
+        let lo = iface("lo", [127, 0, 0, 1], [255, 0, 0, 0]);
+        assert!(check_secondary(&lo, Some(&iface("lo", [127, 0, 0, 2], [255, 0, 0, 0]))).is_ok());
+    }
 
     /// A device's rings that held audio from before it started (rings in a
     /// region shared with a driver outlive the device) are swept when it

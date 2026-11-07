@@ -139,6 +139,10 @@ pub struct ChannelTxt {
     /// `(bundle id, 1-based channel in bundle)` if the channel is available
     /// in a multicast flow.
     pub multicast: Option<(u16, u16)>,
+    /// How many networks the transmitter has beyond the primary (`nred`):
+    /// 1 for a device on both networks of a redundant system, which a
+    /// receiver on both may ask for the flow on both. Absent: 0.
+    pub nred: u8,
 }
 
 impl ChannelTxt {
@@ -161,6 +165,9 @@ impl ChannelTxt {
         }
         if let Some((bundle, chan)) = self.multicast {
             items.push(format!("b.{bundle}={chan}"));
+        }
+        if self.nred > 0 {
+            items.push(format!("nred={}", self.nred));
         }
         to_entries(items)
     }
@@ -197,6 +204,7 @@ impl ChannelTxt {
             dbcp1: parse_int(&map, "dbcp1").unwrap_or(0x1102) as u16,
             is_default_name: map.contains_key("default"),
             multicast,
+            nred: parse_int(&map, "nred").unwrap_or(0).min(1) as u8,
         })
     }
 }
@@ -219,11 +227,18 @@ mod tests {
             dbcp1: 0x1102,
             is_default_name: true,
             multicast: Some((2, 5)),
+            nred: 0,
         };
         let entries = txt.to_entries();
         assert!(entries.contains(&b"pcm=3 e".to_vec()));
         assert!(entries.contains(&b"fpp=32,2".to_vec()));
+        assert!(!entries.iter().any(|e| e.starts_with(b"nred")));
         assert_eq!(ChannelTxt::from_entries(&entries).unwrap(), txt);
+        // On both networks of a redundant system, as an LX-DANTE says.
+        let redundant = ChannelTxt { nred: 1, ..txt };
+        let entries = redundant.to_entries();
+        assert!(entries.contains(&b"nred=1".to_vec()));
+        assert_eq!(ChannelTxt::from_entries(&entries).unwrap(), redundant);
     }
 
     #[test]
