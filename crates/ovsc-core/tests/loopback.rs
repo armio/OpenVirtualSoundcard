@@ -508,6 +508,7 @@ async fn a_re_requested_flow_sends_the_packets_asked_for() {
         channels: channels.to_vec(),
         rx_addr: Ipv4Addr::LOCALHOST,
         rx_port: rx.local_addr().unwrap().port(),
+        secondary: None,
     };
     let ask =
         |req: FlowRequest| async move { client::request_flow(Ipv4Addr::LOCALHOST, fc, &req).await };
@@ -699,6 +700,7 @@ async fn a_new_receive_latency_leaves_the_transmit_flows_alone() {
         channels: vec![1, 2],
         rx_addr: Ipv4Addr::LOCALHOST,
         rx_port: socket.local_addr().unwrap().port(),
+        secondary: None,
     };
     let flow_control = SocketAddr::from((Ipv4Addr::LOCALHOST, OVSC + 2));
     let handle = client::request_flow(Ipv4Addr::LOCALHOST, flow_control, &request).await.unwrap();

@@ -42,6 +42,8 @@ pub const PCM_TYPE: u8 = 0x0e;
 #[derive(Clone, Debug)]
 pub struct DeviceInfo {
     pub iface: Interface,
+    /// The interface on the secondary network, for a redundant device.
+    pub secondary: Option<Interface>,
     pub device_id: DeviceId,
     pub process_id: u16,
     /// Name used when the user hasn't chosen one.
@@ -108,6 +110,7 @@ impl DeviceInfo {
         ];
         Ok(Self {
             iface,
+            secondary: None,
             device_id,
             process_id: config.process_id,
             factory_name,

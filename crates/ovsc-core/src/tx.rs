@@ -1009,6 +1009,7 @@ mod tests {
             channels: channels.to_vec(),
             rx_addr: Ipv4Addr::LOCALHOST,
             rx_port: port,
+            secondary: None,
         }
     }
 

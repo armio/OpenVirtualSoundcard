@@ -1178,6 +1178,7 @@ impl RxManager {
             channels,
             rx_addr: info.iface.ip,
             rx_port: port,
+            secondary: None,
         };
         Some(Create { id, socket, request, placed: chunk, format, latency, own })
     }

@@ -9,7 +9,7 @@
 //! `_netaudio-chan._udp` services and the protocol id from their `dbcp1` TXT
 //! key (`0x1102`).
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddrV4};
 
 use crate::frame::{Frame, Header, PacketBuilder, encode, protocol, respond, result};
 use crate::wire::{Reader, Writer, u16_at};
@@ -55,19 +55,35 @@ pub struct FlowRequest {
     /// Where the transmitter must send the audio.
     pub rx_addr: Ipv4Addr,
     pub rx_port: u16,
+    /// A redundant receiver's address on the secondary network: the
+    /// transmitter sends the flow there too (PROTOCOL.md §6.2, §13).
+    pub secondary: Option<SocketAddrV4>,
 }
 
+/// How many receiver addresses a request may carry: one per network.
+pub const MAX_RECEIVER_ADDRESSES: usize = 2;
+
 impl FlowRequest {
+    /// The receiver's addresses, the primary network's first.
+    pub fn receivers(&self) -> Vec<SocketAddrV4> {
+        let mut all = vec![SocketAddrV4::new(self.rx_addr, self.rx_port)];
+        all.extend(self.secondary);
+        all
+    }
+
     pub fn encode(&self, seq: u16) -> Vec<u8> {
         let n = self.channels.len();
-        let strings_at = 48 + 2 * n;
+        let receivers = self.receivers();
+        let k = receivers.len();
+        let strings_at = 46 + 2 * k + 2 * n;
         let mut b = PacketBuilder::new();
         let host_ptr = b.w.u16(0) as usize;
         b.w.u32(self.sample_rate);
         b.w.u32(self.bits_per_sample);
-        b.w.u16(1);
+        // How many socket descriptors follow: one per network.
+        b.w.u16(k as u16);
         b.w.u16(n as u16);
-        let socket_ptr = b.w.u16(0) as usize;
+        let socket_ptrs = b.w.zeros(2 * k) as usize;
         for &ch in &self.channels {
             b.w.u16(ch);
         }
@@ -80,12 +96,14 @@ impl FlowRequest {
         debug_assert_eq!(b.w.len(), strings_at);
         let host_at = b.w.cstr(&self.rx_device);
         let name_at = b.w.cstr(&self.flow_name);
-        b.w.align(8);
-        let socket_at = b.w.u16(0x0802);
-        b.w.u16(self.rx_port);
-        b.w.bytes(&self.rx_addr.octets());
+        for (i, receiver) in receivers.iter().enumerate() {
+            b.w.align(8);
+            let socket_at = b.w.u16(0x0802);
+            b.w.u16(receiver.port());
+            b.w.bytes(&receiver.ip().octets());
+            b.w.patch_u16(socket_ptrs + 2 * i, socket_at);
+        }
         b.w.patch_u16(host_ptr, host_at);
-        b.w.patch_u16(socket_ptr, socket_at);
         b.w.patch_u16(trailer_ptr, trailer_at);
         b.w.patch_u16(name_ptr, name_at);
         b.finish(protocol::DBCP, seq, opcode::REQUEST_FLOW, result::REQUEST)
@@ -96,9 +114,13 @@ impl FlowRequest {
         let host_at = r.u16()?;
         let sample_rate = r.u32()?;
         let bits_per_sample = r.u32()?;
-        let _one = r.u16()?;
+        // One socket descriptor per network of the receiver.
+        let k = r.u16()? as usize;
+        if !(1..=MAX_RECEIVER_ADDRESSES).contains(&k) {
+            return Err(Error::Invalid("flow request receiver address count"));
+        }
         let n = r.u16()? as usize;
-        let socket_at = r.u16()? as usize;
+        let sockets = (0..k).map(|_| r.u16()).collect::<Result<Vec<_>>>()?;
         let channels = (0..n).map(|_| r.u16()).collect::<Result<Vec<_>>>()?;
         let _trailer_at = r.u16()?;
         let _a00 = r.u16()?;
@@ -107,11 +129,17 @@ impl FlowRequest {
         let name_at = r.u16()?;
 
         let p = frame.packet;
-        if u16_at(p, socket_at)? != 0x0802 {
-            return Err(Error::Invalid("flow request socket descriptor"));
-        }
-        let rx_port = u16_at(p, socket_at + 2)?;
-        let rx_addr = Ipv4Addr::from(Reader::at(p, socket_at + 4).array::<4>()?);
+        let read = |at: u16| -> Result<SocketAddrV4> {
+            let at = at as usize;
+            if u16_at(p, at)? != 0x0802 {
+                return Err(Error::Invalid("flow request socket descriptor"));
+            }
+            let port = u16_at(p, at + 2)?;
+            Ok(SocketAddrV4::new(Ipv4Addr::from(Reader::at(p, at + 4).array::<4>()?), port))
+        };
+        let primary = read(sockets[0])?;
+        let secondary = sockets.get(1).map(|&at| read(at)).transpose()?;
+        let (rx_addr, rx_port) = (*primary.ip(), primary.port());
         Ok(Self {
             rx_device: frame.string_at(host_at)?,
             flow_name: frame.string_at(name_at)?,
@@ -121,6 +149,7 @@ impl FlowRequest {
             channels,
             rx_addr,
             rx_port,
+            secondary,
         })
     }
 }
@@ -176,6 +205,7 @@ mod tests {
             channels: vec![1, 2, 0, 8],
             rx_addr: Ipv4Addr::new(192, 168, 1, 50),
             rx_port: 41234,
+            secondary: None,
         }
     }
 
@@ -195,6 +225,28 @@ mod tests {
         // Socket descriptor is 8-byte aligned.
         assert_eq!(u16_at(&pkt, 24).unwrap() % 8, 0);
         assert_eq!(FlowRequest::decode(&f).unwrap(), req);
+    }
+
+    #[test]
+    fn a_redundant_request_carries_an_address_per_network() {
+        let req = FlowRequest {
+            secondary: Some(SocketAddrV4::new(Ipv4Addr::new(172, 31, 1, 50), 14402)),
+            ..sample()
+        };
+        let pkt = req.encode(3);
+        let f = Frame::parse(&pkt).unwrap();
+        // Two descriptors, counted where a single-network receiver puts 1.
+        assert_eq!(u16_at(&pkt, 20).unwrap(), 2);
+        let (first, second) = (u16_at(&pkt, 24).unwrap(), u16_at(&pkt, 26).unwrap());
+        assert_eq!((first % 8, second % 8), (0, 0));
+        assert_eq!(&pkt[second as usize..second as usize + 4], &[0x08, 0x02, 0x38, 0x42]);
+        // The channel list follows the two pointers.
+        assert_eq!(u16_at(&pkt, 28).unwrap(), 1);
+        assert_eq!(FlowRequest::decode(&f).unwrap(), req);
+        assert_eq!(req.receivers().len(), 2);
+        // A single-network request is the captured layout: count 1.
+        let single = sample().encode(4);
+        assert_eq!(u16_at(&single, 20).unwrap(), 1);
     }
 
     #[test]

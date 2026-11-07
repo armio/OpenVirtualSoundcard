@@ -18,6 +18,10 @@ name = ""
 # Network interface name (en0) or IPv4 address. Empty: the interface of the
 # default route, which may be Wi-Fi; name the Dante interface if so.
 interface = ""
+# Dante redundancy: the interface on the secondary network (en7), with a
+# second Ethernet adapter. Flows with redundant devices then run on both
+# networks, and either can fail without a gap. Unset: one network.
+# secondary_interface = "en7"
 sample_rate = 48000          # 44100, 48000, 88200, 96000, 176400 or 192000
 bits_per_sample = 24         # 16, 24 or 32
 # 1 to 128 of each: receive channels are the device's inputs, transmit

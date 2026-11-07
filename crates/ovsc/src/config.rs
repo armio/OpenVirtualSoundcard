@@ -376,6 +376,11 @@ pub const EXAMPLE: &str = r#"# OpenVirtualSoundcard configuration.
 name = ""
 # Network interface name or IPv4 address. Empty: interface of the default route.
 interface = ""
+# Dante redundancy: the interface on the secondary network, by name or IPv4
+# address; another interface, on another network. Flows with redundant
+# devices then run on both networks, and either can fail without a gap.
+# Empty: one network.
+secondary_interface = ""
 sample_rate = 48000          # 44100, 48000, 88200, 96000, 176400 or 192000
 bits_per_sample = 24         # 16, 24 or 32
 tx_channels = 8              # a count, or a list of names: ["Left", "Right"]

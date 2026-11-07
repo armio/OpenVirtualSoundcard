@@ -211,7 +211,13 @@ impl Device {
             }
         }
         let iface = Interface::find(&config.interface)?;
-        let info = DeviceInfo::new(&config, iface)?;
+        let secondary = match config.secondary_interface.as_str() {
+            "" => None,
+            spec => Some(Interface::find(spec)?),
+        };
+        check_secondary(&iface, secondary.as_ref())?;
+        let mut info = DeviceInfo::new(&config, iface)?;
+        info.secondary = secondary;
         let state = initial_state(&config, &info, saved, options.announced);
         let ip = info.iface.ip;
         let ports = info.ports;
@@ -685,6 +691,35 @@ impl DeviceObserver {
     pub fn stats(&self) -> Option<DeviceStats> {
         self.shared.upgrade().map(|s| stats(&s))
     }
+}
+
+/// A secondary interface must be another interface, on another network:
+/// Dante's two networks are separate, and an address on the primary's
+/// network would send the secondary's traffic through either interface.
+/// Loopback addresses are allowed together, for tests.
+fn check_secondary(primary: &Interface, secondary: Option<&Interface>) -> Result<()> {
+    let Some(s) = secondary else { return Ok(()) };
+    if s.name == primary.name || s.ip == primary.ip {
+        return Err(Error::Config(format!(
+            "secondary_interface {} ({}) is the primary interface",
+            s.name, s.ip
+        )));
+    }
+    if s.ip.is_loopback() && primary.ip.is_loopback() {
+        return Ok(());
+    }
+    let on_network_of = |a: &Interface, ip: Ipv4Addr| {
+        let mask = u32::from(a.netmask);
+        mask != 0 && u32::from(a.ip) & mask == u32::from(ip) & mask
+    };
+    if on_network_of(primary, s.ip) || on_network_of(s, primary.ip) {
+        return Err(Error::Config(format!(
+            "secondary_interface {} ({}) is on the network of the primary interface {} ({}): \
+             the secondary network of a redundant Dante system is a separate one",
+            s.name, s.ip, primary.name, primary.ip
+        )));
+    }
+    Ok(())
 }
 
 fn channel_names(shared: &Shared) -> (Vec<String>, Vec<String>) {
