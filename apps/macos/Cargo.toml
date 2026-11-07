@@ -20,8 +20,10 @@ path = "src/main.rs"
 [dependencies]
 ovsc-control = { path = "../../crates/ovsc-control" }
 
+# "persistence" remembers the window's size and place and the zoom (Cmd-plus
+# and Cmd-minus) across launches; it adds ron and serde.
 [target.'cfg(target_os = "macos")'.dependencies]
-eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "accesskit"] }
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "accesskit", "persistence"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "x11"] }
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "x11", "persistence"] }
