@@ -464,12 +464,13 @@ async fn a_redundant_flow_runs_on_both_networks() {
         let flows = futures_lite_block(rx_flows(24560));
         let red = flows.iter().find(|f| f.secondary.is_some()).ok_or("no redundant flow")?;
         let one = flows.iter().find(|f| f.secondary.is_none()).ok_or("no single flow")?;
-        if red.networks != 0b11 {
-            return Err(format!("networks {:#b}", red.networks));
-        }
         assert_eq!(*red.secondary.unwrap().ip(), Ipv4Addr::new(127, 0, 0, 8));
-        assert_eq!(one.networks, 1);
-        Ok(())
+        // Each is published as receiving once the manager's pass after its
+        // packets arrive has run.
+        match (red.networks, one.networks) {
+            (0b11, 1) => Ok(()),
+            other => Err(format!("networks {other:?}")),
+        }
     })
     .await;
     // Every packet came twice, and none counts as lost or twice.
