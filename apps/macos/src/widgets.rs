@@ -1,19 +1,22 @@
 //! The app's building blocks: status marks, cards, notices, warnings with
-//! their commands, status tiles, the segmented control and settings rows.
-//! Colours and sizes come from [`crate::theme`].
+//! their commands, status tiles, chips, the segmented control and settings
+//! rows, made of the glass in [`crate::glass`]. Colours and sizes come from
+//! [`crate::theme`].
 
 use std::f32::consts::TAU;
 use std::time::{Duration, Instant};
 
 use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{
-    self, Align, Color32, CornerRadius, FontFamily, FontId, Frame, Id, Layout, Margin, Painter,
-    Pos2, Rect, Response, RichText, Sense, Shape, Stroke, TextStyle, Ui, Vec2, WidgetInfo,
-    WidgetType, pos2, vec2,
+    self, Align, Color32, FontFamily, FontId, Id, Layout, Margin, Painter, Pos2, Rect, Response,
+    RichText, Sense, Shape, Stroke, TextStyle, Ui, Vec2, WidgetInfo, WidgetType, pos2, vec2,
 };
 
+use crate::glass::{self, Glass};
 use crate::logic::{self, Lamp, Light};
-use crate::theme::{self, CARD_PAD, CARD_RADIUS, Palette};
+use crate::theme::{
+    self, CARD_PAD, CARD_RADIUS, CONTROL_HEIGHT, FIELD_RADIUS, Palette, TILE_RADIUS,
+};
 
 /// Paints a light's mark: its shape says the state without the colour. A
 /// filled circle with a check is fine, a triangle with a bar is worth a
@@ -79,32 +82,20 @@ pub fn mark(ui: &mut Ui, light: Light, size: f32) -> Response {
     response
 }
 
-/// A titled card, with an optional one-line summary at the right of the
-/// title: `Receive channels … 7 of 7 receiving`.
+/// A titled card, with an optional one-line summary in a chip at the
+/// right of the title: `Receive channels … (7 of 7 receiving)`.
 pub fn section<R>(
     ui: &mut Ui,
     title: &str,
     summary: Option<(Light, &str)>,
     add: impl FnOnce(&mut Ui) -> R,
 ) -> R {
-    let p = theme::palette(ui);
     ui.add_space(theme::SECTION_GAP - ui.spacing().item_spacing.y);
     ui.horizontal(|ui| {
-        ui.label(theme::headline(title));
+        ui.label(theme::title(title));
         if let Some((light, text)) = summary {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let words = if light == Light::Grey { p.text2 } else { p.ink(light) };
-                let marked = matches!(light, Light::Amber | Light::Red);
-                // Leave the mark its room, or a long summary pushes it
-                // over the title.
-                let room = if marked { 11.0 + ui.spacing().item_spacing.x } else { 0.0 };
-                ui.scope(|ui| {
-                    ui.set_max_width((ui.available_width() - room).max(0.0));
-                    ui.add(egui::Label::new(RichText::new(text).color(words)).truncate());
-                });
-                if marked {
-                    mark(ui, light, 11.0);
-                }
+                chip(ui, light, text);
             });
         }
     });
@@ -112,19 +103,60 @@ pub fn section<R>(
     card(ui, add)
 }
 
-/// A plain card at the full width.
+/// A card of glass at the full width.
 pub fn card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
     let p = theme::palette(ui);
-    Frame::new()
-        .fill(p.card)
-        .stroke(Stroke::new(1.0, p.card_stroke))
-        .corner_radius(CARD_RADIUS)
-        .inner_margin(Margin::same(CARD_PAD))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            add(ui)
-        })
-        .inner
+    let radius = f32::from(CARD_RADIUS);
+    glass::frame(ui, radius, Margin::same(CARD_PAD), Glass::panel(p), |ui| {
+        ui.set_width(ui.available_width());
+        add(ui)
+    })
+    .inner
+}
+
+/// A chip: a capsule of glass with a few words in a light's colour, and
+/// its mark when the light is amber or red. It truncates to the room it
+/// has, so it can sit at the end of a row. It is card glass, which keeps
+/// coloured words readable over any part of the wallpaper.
+pub fn chip(ui: &mut Ui, light: Light, text: &str) -> Response {
+    let p = theme::palette(ui);
+    let color = if light == Light::Grey { p.text2 } else { p.ink(light) };
+    let mark = matches!(light, Light::Amber | Light::Red).then_some(light);
+    let glass = Glass { rim: 0.8, sheen: 0.8, lift: glass::Lift::Flat, ..Glass::panel(p) };
+    pill(ui, mark, text, color, glass)
+}
+
+/// A capsule of `glass` with `text` in `color`, after a light's mark if
+/// any.
+pub fn pill(
+    ui: &mut Ui,
+    mark: Option<Light>,
+    text: &str,
+    color: Color32,
+    glass: Glass,
+) -> Response {
+    let p = theme::palette(ui);
+    let (pad, gap, mark_size, height) = (10.0, 5.0, 11.0, 22.0);
+    let mark_w = if mark.is_some() { mark_size + gap } else { 0.0 };
+    let font = TextStyle::Body.resolve(ui.style());
+    let room = (ui.available_width() - 2.0 * pad - mark_w).max(24.0);
+    let mut job = LayoutJob::simple_singleline(text.to_owned(), font, color);
+    job.wrap.max_width = room;
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('…');
+    let galley = ui.painter().layout_job(job);
+    let size = vec2(2.0 * pad + mark_w + galley.size().x, height);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
+    glass::paint(ui.painter(), rect, height / 2.0, &glass, p);
+    let mut x = rect.left() + pad;
+    if let Some(light) = mark {
+        paint_mark(ui.painter(), pos2(x + mark_size / 2.0, rect.center().y), mark_size, light, p);
+        x += mark_w;
+    }
+    ui.painter().galley(pos2(x, rect.center().y - galley.size().y / 2.0), galley, color);
+    response.widget_info(|| WidgetInfo::labeled(WidgetType::Label, true, text));
+    response
 }
 
 /// How much a notice matters.
@@ -160,38 +192,33 @@ pub fn notice<R>(
 ) -> R {
     let p = theme::palette(ui);
     let light = severity.light();
-    let (fill, stroke) = match severity {
-        Severity::Urgent => (theme::mix(p.card, p.red, p.tint + 0.06), Stroke::new(1.5, p.red)),
-        Severity::Warning | Severity::Progress => (p.tint(Light::Amber), Stroke::new(1.0, p.amber)),
-        Severity::Info => (p.card, Stroke::new(1.0, p.card_stroke)),
+    let glass = match severity {
+        Severity::Urgent => Glass::tinted(p, p.alarm()),
+        Severity::Warning | Severity::Progress => Glass::tinted(p, p.tint(Light::Amber)),
+        Severity::Info => Glass::panel(p),
     };
-    let inner = Frame::new()
-        .fill(fill)
-        .stroke(stroke)
-        .corner_radius(CARD_RADIUS)
-        .inner_margin(Margin { left: 16, right: CARD_PAD, top: 10, bottom: 10 })
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                if severity == Severity::Progress {
-                    ui.spinner();
-                } else {
-                    mark(ui, light, 16.0);
-                }
-                ui.label(theme::semibold(heading, 14.0));
-            });
-            ui.add_space(2.0);
-            add(ui)
+    let margin = Margin { left: 22, right: CARD_PAD, top: 12, bottom: 12 };
+    let inner = glass::frame(ui, f32::from(CARD_RADIUS), margin, glass, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            if severity == Severity::Progress {
+                ui.spinner();
+            } else {
+                mark(ui, light, 16.0);
+            }
+            ui.label(theme::semibold(heading, 14.0));
         });
-    // The bar on the left edge, inside the rounded corners.
+        ui.add_space(2.0);
+        add(ui)
+    });
+    // A bar down the left side, inside the rounded corners.
     if severity != Severity::Info {
         let r = inner.response.rect;
         let bar = Rect::from_min_max(
-            pos2(r.left() + 1.0, r.top() + 1.0),
-            pos2(r.left() + 5.0, r.bottom() - 1.0),
+            pos2(r.left() + 9.0, r.top() + 14.0),
+            pos2(r.left() + 12.0, r.bottom() - 14.0),
         );
-        let radius = CornerRadius { nw: CARD_RADIUS - 1, sw: CARD_RADIUS - 1, ne: 0, se: 0 };
-        ui.painter().rect_filled(bar, radius, p.fill(light));
+        ui.painter().rect_filled(bar, 2, p.fill(light));
     }
     ui.add_space(4.0);
     inner.inner
@@ -243,36 +270,32 @@ impl Copied {
 /// A command in a framed box with a Copy button that confirms the copy.
 pub fn command_row(ui: &mut Ui, command: &str, copied: &mut Copied) {
     let p = theme::palette(ui);
-    Frame::new()
-        .fill(p.code)
-        .stroke(Stroke::new(1.0, p.card_stroke))
-        .corner_radius(theme::CONTROL_RADIUS)
-        .inner_margin(Margin::symmetric(10, 6))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            egui::Sides::new().shrink_left().show(
-                ui,
-                |ui| {
-                    ui.add(
-                        egui::Label::new(RichText::new(command).monospace().color(p.text))
-                            .wrap()
-                            .selectable(true),
-                    );
-                },
-                |ui| {
-                    let done = copied.shows(ui, command);
-                    let label = if done { "Copied" } else { "Copy" };
-                    let button = ui
-                        .add(egui::Button::new(label).min_size(vec2(72.0, 24.0)))
-                        .on_hover_text("Copy the command, then paste it in Terminal.");
-                    if button.clicked() {
-                        ui.ctx().copy_text(command.to_owned());
-                        copied.0 = Some((command.to_owned(), Instant::now()));
-                        ui.ctx().request_repaint_after(COPIED_FOR);
-                    }
-                },
-            );
-        });
+    let glass = Glass { tint: p.code, ..Glass::field(p) };
+    glass::frame(ui, f32::from(FIELD_RADIUS), Margin::symmetric(12, 6), glass, |ui| {
+        ui.set_width(ui.available_width());
+        egui::Sides::new().shrink_left().show(
+            ui,
+            |ui| {
+                ui.add(
+                    egui::Label::new(RichText::new(command).monospace().color(p.text))
+                        .wrap()
+                        .selectable(true),
+                );
+            },
+            |ui| {
+                let done = copied.shows(ui, command);
+                let label = if done { "Copied" } else { "Copy" };
+                let button = ui
+                    .add(egui::Button::new(label).min_size(vec2(72.0, 26.0)))
+                    .on_hover_text("Copy the command, then paste it in Terminal.");
+                if button.clicked() {
+                    ui.ctx().copy_text(command.to_owned());
+                    copied.0 = Some((command.to_owned(), Instant::now()));
+                    ui.ctx().request_repaint_after(COPIED_FOR);
+                }
+            },
+        );
+    });
 }
 
 /// One warning from the daemon: its first sentence in semibold, the rest
@@ -296,15 +319,16 @@ pub fn warning(ui: &mut Ui, text: &str, copied: &mut Copied) {
 /// room; amber ones are tinted; the others stay quiet.
 pub fn tile(ui: &mut Ui, title: &str, lamp: &Lamp, size: Vec2, large: bool) -> Response {
     let p = theme::palette(ui);
-    let (fill, stroke, text, text2) = match lamp.light {
-        Light::Red => (p.urgent, Stroke::NONE, Color32::WHITE, Color32::from_gray(235)),
-        Light::Amber => (p.tint(Light::Amber), Stroke::new(1.0, p.amber), p.text, p.text),
-        _ => (p.card, Stroke::new(1.0, p.card_stroke), p.text, p.text2),
+    let (glass, text, text2) = match lamp.light {
+        Light::Red => (Glass::solid(p.urgent), Color32::WHITE, Color32::from_gray(235)),
+        Light::Amber => (Glass::tinted(p, p.tint(Light::Amber)), p.text, p.text),
+        _ => (Glass::panel(p), p.text, p.text2),
     };
     let (rect, response) = ui.allocate_exact_size(size, Sense::focusable_noninteractive());
+    // The glass and its shadow, then the words, kept inside the tile.
+    glass::paint(ui.painter(), rect, f32::from(TILE_RADIUS), &glass, p);
     let painter = ui.painter_at(rect);
-    painter.rect(rect, CARD_RADIUS, fill, stroke, egui::StrokeKind::Inside);
-    let pad = 12.0;
+    let pad = 14.0;
     let mark_size = if large { 22.0 } else { 18.0 };
     let mark_center =
         pos2(rect.left() + pad + mark_size / 2.0, rect.top() + pad + mark_size / 2.0 + 1.0);
@@ -332,8 +356,8 @@ pub fn tile(ui: &mut Ui, title: &str, lamp: &Lamp, size: Vec2, large: bool) -> R
         ui.painter().layout_job(job)
     };
     let title_g = galley(title, FontId::proportional(11.0), text2);
-    let word_font =
-        FontId::new(if large { 20.0 } else { 16.0 }, FontFamily::Name(theme::SEMIBOLD.into()));
+    let word_style = if large { theme::STATUS_LARGE } else { theme::STATUS };
+    let word_font = TextStyle::Name(word_style.into()).resolve(ui.style());
     let word_g = galley(&lamp.word, word_font, text);
     let note_g = galley(&lamp.note, FontId::proportional(12.0), text2);
     let mut y = rect.top() + pad - 1.0;
@@ -347,7 +371,7 @@ pub fn tile(ui: &mut Ui, title: &str, lamp: &Lamp, size: Vec2, large: bool) -> R
     if response.has_focus() {
         painter.rect_stroke(
             rect.shrink(1.0),
-            CARD_RADIUS,
+            TILE_RADIUS,
             Stroke::new(2.0, p.focus),
             egui::StrokeKind::Inside,
         );
@@ -360,9 +384,9 @@ pub fn tile(ui: &mut Ui, title: &str, lamp: &Lamp, size: Vec2, large: bool) -> R
 /// A segment's badge: its light, and what it means, for VoiceOver.
 pub type Badge<'a> = Option<(Light, &'a str)>;
 
-/// A segmented control in the macOS style: one segment per choice, the
-/// selected one raised. A segment can carry a badge (warnings on a tab the
-/// user is not on).
+/// A segmented control in Raven's glass: a capsule track, the selected
+/// segment a capsule of accent glass with white words. A segment can carry
+/// a badge (warnings on a tab the user is not on).
 pub fn segmented<T: PartialEq + Copy>(
     ui: &mut Ui,
     id: Id,
@@ -371,45 +395,37 @@ pub fn segmented<T: PartialEq + Copy>(
 ) -> bool {
     let p = theme::palette(ui);
     let segment_w = 96.0;
-    let size = vec2(segment_w * choices.len() as f32 + 4.0, 26.0);
+    let size = vec2(segment_w * choices.len() as f32 + 8.0, CONTROL_HEIGHT + 4.0);
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-    ui.painter().rect(
-        rect,
-        7,
-        p.control,
-        Stroke::new(1.0, p.card_stroke),
-        egui::StrokeKind::Inside,
-    );
+    let track = Glass { lift: glass::Lift::Raised, ..Glass::control(p) };
+    glass::paint(ui.painter(), rect, rect.height() / 2.0, &track, p);
     let mut changed = false;
     for (i, &(value, label, badge)) in choices.iter().enumerate() {
         let seg = Rect::from_min_size(
-            pos2(rect.left() + 2.0 + segment_w * i as f32, rect.top() + 2.0),
-            vec2(segment_w, rect.height() - 4.0),
+            pos2(rect.left() + 4.0 + segment_w * i as f32, rect.top() + 4.0),
+            vec2(segment_w, rect.height() - 8.0),
         );
         let response = ui.interact(seg, id.with(i), Sense::click());
         let on = *selected == value;
+        let radius = seg.height() / 2.0;
         if on {
-            ui.painter().rect(
-                seg,
-                5,
-                p.segment,
-                Stroke::new(1.0, p.card_stroke),
-                egui::StrokeKind::Inside,
-            );
+            glass::paint(ui.painter(), seg, radius, &Glass::solid(p.accent), p);
         } else if response.hovered() {
-            ui.painter().rect_filled(seg.shrink(1.0), 5, p.control_hover);
+            ui.painter().rect_filled(seg, radius, p.control_hover);
         }
-        let font = if on {
-            FontId::new(13.0, FontFamily::Name(theme::SEMIBOLD.into()))
-        } else {
-            FontId::proportional(13.0)
-        };
-        ui.painter().text(seg.center(), egui::Align2::CENTER_CENTER, label, font, p.text);
+        let color = if on { Color32::WHITE } else { p.text };
+        let font = FontId::proportional(13.0);
+        ui.painter().text(seg.center(), egui::Align2::CENTER_CENTER, label, font, color);
         if let Some((light, _)) = badge {
-            paint_mark(ui.painter(), pos2(seg.right() - 12.0, seg.center().y), 9.0, light, p);
+            paint_mark(ui.painter(), pos2(seg.right() - 14.0, seg.center().y), 9.0, light, p);
         }
         if response.has_focus() {
-            ui.painter().rect_stroke(seg, 5, Stroke::new(2.0, p.focus), egui::StrokeKind::Inside);
+            ui.painter().rect_stroke(
+                seg.expand(2.0),
+                radius + 2.0,
+                Stroke::new(2.0, p.focus),
+                egui::StrokeKind::Inside,
+            );
         }
         // VoiceOver hears the badge too: "Status, warnings".
         let spoken = match badge {
@@ -478,7 +494,7 @@ pub fn table(
         if let Some(row) = row
             && row % 2 == 1
         {
-            ui.painter().rect_filled(rect, 4, p.stripe);
+            ui.painter().rect_filled(rect, 8, p.stripe);
         }
         let mut x = rect.left() + pad;
         for (col, width) in widths.iter().enumerate() {
@@ -499,7 +515,7 @@ pub fn table(
             x += width + gap;
         }
     };
-    draw_row(ui, None, 18.0);
+    draw_row(ui, None, 20.0);
     for row in 0..rows {
         draw_row(ui, Some(row), row_height);
     }
@@ -562,10 +578,11 @@ pub fn setting_row(
     }
 }
 
-/// A switch in the macOS style: on is the accent colour.
+/// A switch in Raven's glass: a capsule track, green when on, and a white
+/// capsule for a knob.
 pub fn toggle(ui: &mut Ui, on: &mut bool) -> Response {
     let p = theme::palette(ui);
-    let size = vec2(38.0, 22.0);
+    let size = vec2(48.0, 26.0);
     let (rect, mut response) = ui.allocate_exact_size(size, Sense::click());
     if response.clicked() {
         *on = !*on;
@@ -575,22 +592,34 @@ pub fn toggle(ui: &mut Ui, on: &mut bool) -> Response {
     let value = *on;
     response.widget_info(|| WidgetInfo::selected(WidgetType::Checkbox, enabled, value, ""));
     let t = ui.ctx().animate_bool_responsive(response.id, *on);
-    let mut fill = theme::mix(p.control, p.accent, t);
     let mut knob = Color32::WHITE;
+    let fade = if enabled { 1.0 } else { 0.5 };
     if !enabled {
-        fill = fill.gamma_multiply(0.5);
         knob = knob.gamma_multiply(0.7);
     }
     let radius = rect.height() / 2.0;
     let painter = ui.painter();
-    painter.rect(rect, radius, fill, Stroke::new(1.0, p.control_stroke), egui::StrokeKind::Inside);
-    let x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), t);
-    painter.circle(
-        pos2(x, rect.center().y),
-        radius - 3.0,
-        knob,
-        Stroke::new(0.5, p.control_stroke),
+    // Off: clear glass with an edge you can see; on: green.
+    painter.rect(
+        rect,
+        radius,
+        p.control.gamma_multiply(fade),
+        Stroke::new(1.0, p.control_stroke.gamma_multiply((1.0 - t) * fade)),
+        egui::StrokeKind::Inside,
     );
+    painter.rect_filled(rect, radius, p.switch.gamma_multiply(t * fade));
+    let knob_size = vec2(28.0, rect.height() - 6.0);
+    let x = egui::lerp(
+        (rect.left() + 3.0 + knob_size.x / 2.0)..=(rect.right() - 3.0 - knob_size.x / 2.0),
+        t,
+    );
+    let knob_rect = Rect::from_center_size(pos2(x, rect.center().y), knob_size);
+    painter.rect_filled(
+        knob_rect.translate(vec2(0.0, 1.0)),
+        knob_size.y / 2.0,
+        p.shadow.gamma_multiply(0.6),
+    );
+    painter.rect_filled(knob_rect, knob_size.y / 2.0, knob);
     if response.has_focus() {
         painter.rect_stroke(
             rect.expand(2.0),
@@ -607,28 +636,34 @@ pub fn separator(ui: &mut Ui) {
     let p = theme::palette(ui);
     ui.add_space(4.0);
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
-    ui.painter().hline(rect.x_range(), rect.center().y, Stroke::new(1.0, p.card_stroke));
+    ui.painter().hline(rect.x_range(), rect.center().y, Stroke::new(1.0, p.separator));
     ui.add_space(4.0);
 }
 
-/// The default button: accent fill and white text.
+/// The rim of a capsule of coloured glass.
+fn bright_rim() -> Stroke {
+    Stroke::new(1.0, Color32::from_white_alpha(70))
+}
+
+/// The default button: a capsule of accent glass, white words.
 pub fn primary_button(ui: &Ui, text: &str, enabled: bool) -> egui::Button<'static> {
     let p = theme::palette(ui);
     if enabled {
         egui::Button::new(RichText::new(text.to_owned()).color(Color32::WHITE))
             .fill(p.accent)
-            .stroke(Stroke::NONE)
-            .min_size(vec2(84.0, 26.0))
+            .stroke(bright_rim())
+            .min_size(vec2(88.0, CONTROL_HEIGHT))
     } else {
-        egui::Button::new(text.to_owned()).min_size(vec2(84.0, 26.0))
+        egui::Button::new(text.to_owned()).min_size(vec2(88.0, CONTROL_HEIGHT))
     }
 }
 
-/// A button for an action that interrupts audio: solid red, white text.
+/// A button for an action that interrupts audio: a capsule of red glass,
+/// white words.
 pub fn destructive_button(ui: &Ui, text: &str) -> egui::Button<'static> {
     let p = theme::palette(ui);
     egui::Button::new(RichText::new(text.to_owned()).color(Color32::WHITE))
         .fill(p.urgent)
-        .stroke(Stroke::NONE)
-        .min_size(vec2(84.0, 26.0))
+        .stroke(bright_rim())
+        .min_size(vec2(88.0, CONTROL_HEIGHT))
 }

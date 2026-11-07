@@ -128,14 +128,15 @@ fn name_row(ui: &mut Ui, form: &mut Form, problem: Option<&str>) -> bool {
                 .char_limit(logic::MAX_NAME_LEN),
         );
         enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-        if problem.is_some() {
-            let red = p.red;
-            ui.painter().rect_stroke(
-                r.rect,
-                theme::CONTROL_RADIUS,
-                egui::Stroke::new(1.5, red),
-                egui::StrokeKind::Outside,
-            );
+        // The field's edge: red with a problem, else one you can see
+        // against the glass (3:1); focused, egui draws its own.
+        let edge = match problem {
+            Some(_) => Some(egui::Stroke::new(1.5, p.red)),
+            None if !r.has_focus() => Some(egui::Stroke::new(1.0, p.control_stroke)),
+            None => None,
+        };
+        if let Some(edge) = edge {
+            ui.painter().rect_stroke(r.rect, theme::CONTROL_RADIUS, edge, egui::StrokeKind::Inside);
         }
         r
     });
@@ -281,7 +282,7 @@ pub fn action_bar(app: &mut App, ui: &mut Ui) {
             if ui.add_enabled(can_apply, button).clicked() {
                 apply = true;
             }
-            let button = egui::Button::new("Revert").min_size(vec2(84.0, 26.0));
+            let button = egui::Button::new("Revert").min_size(vec2(88.0, theme::CONTROL_HEIGHT));
             if ui.add_enabled(can_revert, button).on_hover_text("Discard the edits.").clicked() {
                 revert = true;
             }
@@ -411,7 +412,7 @@ pub fn confirm_modal(app: &mut App, ctx: &egui::Context) {
     let focus_cancel = std::mem::take(&mut app.confirm_opened);
     let mut answer = None;
     let modal = egui::Modal::new(Id::new("confirm-change"))
-        .frame(Frame::popup(&ctx.global_style()).corner_radius(12).inner_margin(20))
+        .frame(Frame::popup(&ctx.global_style()).corner_radius(theme::CARD_RADIUS).inner_margin(22))
         .show(ctx, |ui| {
             let p = theme::palette(ui);
             ui.set_width(420.0);
@@ -422,8 +423,8 @@ pub fn confirm_modal(app: &mut App, ctx: &egui::Context) {
             ui.add_space(8.0);
             Frame::new()
                 .fill(p.code)
-                .corner_radius(theme::CONTROL_RADIUS)
-                .inner_margin(egui::Margin::symmetric(10, 8))
+                .corner_radius(theme::FIELD_RADIUS)
+                .inner_margin(egui::Margin::symmetric(12, 8))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     for line in &c.changes {
@@ -439,14 +440,16 @@ pub fn confirm_modal(app: &mut App, ctx: &egui::Context) {
                 ui.add_space(
                     (ui.available_width() - 2.0 * w - ui.spacing().item_spacing.x).max(0.0),
                 );
-                let cancel = ui.add(egui::Button::new("Cancel").min_size(vec2(w, 26.0)));
+                let cancel =
+                    ui.add(egui::Button::new("Cancel").min_size(vec2(w, theme::CONTROL_HEIGHT)));
                 if focus_cancel {
                     cancel.request_focus();
                 }
                 if cancel.clicked() {
                     answer = Some(false);
                 }
-                let action = widgets::destructive_button(ui, c.button).min_size(vec2(w, 26.0));
+                let action = widgets::destructive_button(ui, c.button)
+                    .min_size(vec2(w, theme::CONTROL_HEIGHT));
                 if ui.add(action).clicked() {
                     answer = Some(true);
                 }

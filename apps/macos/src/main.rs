@@ -4,6 +4,7 @@
 //! testing; `OVSC_APP_THEME=light|dark` forces an appearance).
 
 mod app;
+mod glass;
 mod logic;
 mod settings;
 mod status;

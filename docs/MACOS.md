@@ -469,6 +469,11 @@ without it.
 * `⌘1` and `⌘2` (or `⌘,`) switch to Status and Settings, and `⌘W` closes
   the window. The app follows the system's light or dark appearance, and
   remembers its window's size and place.
+* The app is drawn in the glass look of the
+  [Raven](https://github.com/oscar-soirey/Raven) GUI library (Apache-2.0):
+  translucent panels with a lit rim over a soft coloured wallpaper, and
+  capsule-shaped controls. Its colours are checked for contrast over the
+  whole wallpaper.
 
 Build it with `packaging/macos/build-app.sh`, which needs nothing beyond
 Rust and the command-line tools. It is signed ad hoc; built on the Mac that

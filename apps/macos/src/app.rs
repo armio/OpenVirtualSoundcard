@@ -5,11 +5,12 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Frame, Id, Key, KeyboardShortcut, Label, Margin, Modifiers, RichText, Ui,
-    ViewportCommand, vec2,
+    self, Color32, Frame, Id, Key, KeyboardShortcut, Label, Margin, Modifiers, Rect, RichText,
+    TextureHandle, TextureOptions, Ui, ViewportCommand, pos2, vec2,
 };
 use ovsc_control::{Restart, Settings, SettingsChange, Status};
 
+use crate::glass::{self, Glass};
 use crate::logic::{self, Lamp, Light, PacketWindow, Problem};
 use crate::theme;
 use crate::widgets::{self, Copied, Severity};
@@ -114,6 +115,9 @@ pub struct App {
     /// attention for the current outage.
     title: String,
     alerted: bool,
+    /// The wallpaper behind the glass, made for the dark or the light
+    /// appearance.
+    wallpaper: Option<(bool, TextureHandle)>,
 }
 
 impl App {
@@ -141,7 +145,18 @@ impl App {
             discarding: false,
             title: String::new(),
             alerted: false,
+            wallpaper: None,
         }
+    }
+
+    /// The wallpaper of the appearance in use, made once per appearance.
+    fn wallpaper(&mut self, ctx: &egui::Context, dark: bool) -> &TextureHandle {
+        if self.wallpaper.as_ref().is_none_or(|(made_for, _)| *made_for != dark) {
+            let image = theme::wallpaper(theme::palette_of(dark));
+            let texture = ctx.load_texture("wallpaper", image, TextureOptions::LINEAR);
+            self.wallpaper = Some((dark, texture));
+        }
+        &self.wallpaper.as_ref().expect("made above").1
     }
 
     fn handle(&mut self, event: Event) {
@@ -431,7 +446,7 @@ impl App {
         let third = ((width - 2.0 * gap) / 3.0).max(0.0);
         let audio = (width * 0.40).max(180.0).min(width - 2.0 * (120.0 + gap)).max(third);
         let other = ((width - audio - 2.0 * gap) / 2.0).max(0.0);
-        let height = 76.0;
+        let height = 84.0;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
             widgets::tile(ui, "Audio", &lamps[0], vec2(audio, height), true);
@@ -586,7 +601,11 @@ impl App {
         }
         let mut answer = None;
         let modal = egui::Modal::new(Id::new("discard"))
-            .frame(Frame::popup(&ctx.global_style()).corner_radius(12).inner_margin(20))
+            .frame(
+                Frame::popup(&ctx.global_style())
+                    .corner_radius(theme::CARD_RADIUS)
+                    .inner_margin(22),
+            )
             .show(ctx, |ui| {
                 ui.set_width(360.0);
                 ui.label(theme::semibold("Discard the changes you have not applied?", 15.0));
@@ -600,8 +619,10 @@ impl App {
                 ui.add_space(14.0);
                 ui.horizontal(|ui| {
                     ui.add_space((ui.available_width() - 2.0 * 112.0 - 8.0).max(0.0));
-                    let keep =
-                        ui.add(egui::Button::new("Keep editing").min_size(vec2(112.0, 26.0)));
+                    let keep = ui.add(
+                        egui::Button::new("Keep editing")
+                            .min_size(vec2(112.0, theme::CONTROL_HEIGHT)),
+                    );
                     if keep.clicked() {
                         answer = Some(false);
                     }
@@ -609,7 +630,10 @@ impl App {
                         keep.request_focus();
                     }
                     if ui
-                        .add(widgets::destructive_button(ui, "Discard").min_size(vec2(112.0, 26.0)))
+                        .add(
+                            widgets::destructive_button(ui, "Discard")
+                                .min_size(vec2(112.0, theme::CONTROL_HEIGHT)),
+                        )
                         .clicked()
                     {
                         answer = Some(true);
@@ -702,22 +726,20 @@ fn settings_moved(old: &Status, new: &Status) -> bool {
     }
 }
 
-/// The show lock, beside the device name while it is on.
+/// The show lock, beside the device name while it is on: a chip of glass
+/// tinted with the accent.
 fn lock_badge(ui: &mut Ui) {
     let p = theme::palette(ui);
-    Frame::new()
-        .fill(theme::mix(p.window, p.focus, 0.18))
-        .stroke(egui::Stroke::new(1.0, p.focus))
-        .corner_radius(255)
-        .inner_margin(Margin::symmetric(8, 2))
-        .show(ui, |ui| {
-            ui.label(theme::semibold("Show lock on", 11.0).color(p.text));
-        })
-        .response
-        .on_hover_text(logic::LOCK_HELP);
+    let glass = Glass { overlay: theme::fade(p.focus, 0.30), ..Glass::control(p) };
+    widgets::pill(ui, None, "Show lock on", p.text, glass).on_hover_text(logic::LOCK_HELP);
 }
 
 impl eframe::App for App {
+    /// The wallpaper's base, under it before the first frame.
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        theme::palette_of(visuals.dark_mode).window.to_normalized_gamma_f32()
+    }
+
     /// Runs before every frame, and while the window is hidden too (covered
     /// or minimised), whenever the worker has news.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -740,38 +762,50 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_secs(1));
         }
         let p = theme::palette(ui);
+        // The wallpaper first: everything else is glass over it.
+        let wallpaper = self.wallpaper(&ctx, p.dark).id();
+        let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+        ui.painter().image(wallpaper, ui.max_rect(), uv, Color32::WHITE);
         let gutter = theme::GUTTER as i8;
         egui::Panel::top("header")
-            .frame(Frame::new().fill(p.window).inner_margin(Margin {
+            .frame(Frame::new().inner_margin(Margin {
                 left: gutter,
                 right: gutter,
-                top: 12,
-                bottom: 12,
+                top: 14,
+                bottom: 10,
             }))
+            .show_separator_line(false)
             .show(ui, |ui| self.header(ui));
         if self.has_alerts(&ctx) {
             egui::Panel::top("alerts")
-                .frame(Frame::new().fill(p.window).inner_margin(Margin {
+                .frame(Frame::new().inner_margin(Margin {
                     left: gutter,
                     right: gutter,
-                    top: 10,
+                    top: 8,
                     bottom: 2,
                 }))
                 .show_separator_line(false)
                 .show(ui, |ui| self.alerts(ui));
         }
         if self.tab == Tab::Settings && self.form.is_some() {
+            // A bar of glass floating over the bottom of the page.
             egui::Panel::bottom("actions")
-                .frame(Frame::new().fill(p.window).inner_margin(Margin {
+                .frame(Frame::new().inner_margin(Margin {
                     left: gutter,
                     right: gutter,
-                    top: 10,
-                    bottom: 12,
+                    top: 8,
+                    bottom: 14,
                 }))
-                .show(ui, |ui| settings::action_bar(self, ui));
+                .show_separator_line(false)
+                .show(ui, |ui| {
+                    let margin = Margin::symmetric(16, 10);
+                    glass::frame(ui, 22.0, margin, Glass::bar(p), |ui| {
+                        settings::action_bar(self, ui);
+                    });
+                });
         }
         egui::CentralPanel::default()
-            .frame(Frame::new().fill(p.window).inner_margin(Margin {
+            .frame(Frame::new().inner_margin(Margin {
                 left: gutter,
                 right: gutter,
                 top: 0,

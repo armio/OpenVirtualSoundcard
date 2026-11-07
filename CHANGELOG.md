@@ -22,11 +22,11 @@ The first public version, not released yet.
   LaunchDaemon share memory over XPC. Installed with `install.sh` or a
   package, removed with `uninstall.sh`.
 - macOS: the OpenVirtualSoundcard app, for status and settings over the
-  daemon's control socket. It follows the system's light or dark
-  appearance, keeps an outage in view on both tabs (and in the window's
-  title and the Dock), asks before a change that interrupts audio or other
-  devices' subscriptions and says what it costs, and works with VoiceOver
-  and the keyboard.
+  daemon's control socket. It is drawn in the glass look of the Raven GUI
+  library, follows the system's light or dark appearance, keeps an outage
+  in view on both tabs (and in the window's title and the Dock), asks
+  before a change that interrupts audio or other devices' subscriptions and
+  says what it costs, and works with VoiceOver and the keyboard.
 - Settings from Dante Controller: device and channel names, subscriptions,
   latency, sample rate and encoding.
 - Monitoring in Dante Controller: clock state, signal meters, receive
