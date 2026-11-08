@@ -1,5 +1,5 @@
 //! The look: Raven's glass, in egui. Surfaces are translucent glass over a
-//! wallpaper of melted colours, controls are capsules, and text is regular
+//! sober grey wallpaper, controls are capsules, and text is regular
 //! weight at larger sizes. Every colour pair used for text or controls is
 //! checked for contrast in the tests below, over the wallpaper's darkest and
 //! lightest points.
@@ -49,7 +49,7 @@ pub const STATUS_LARGE: &str = "status-large";
 #[derive(Clone, Copy, Debug)]
 pub struct Palette {
     pub dark: bool,
-    /// The wallpaper: a base colour, and the colours melted into it.
+    /// The wallpaper: a base colour, and the shades melted into it.
     pub window: Color32,
     pub blobs: &'static [Color32],
     /// Glass: the tint of panels, its rim (at the top and at the bottom),
@@ -62,6 +62,9 @@ pub struct Palette {
     /// Menus and dialogs: nearly solid glass, so nothing behind shows
     /// through their text.
     pub popup: Color32,
+    /// The bar docked at the bottom of the Settings tab: opaque, so that
+    /// the page scrolls under it unseen.
+    pub footer: Color32,
     /// Primary, secondary and tertiary text.
     pub text: Color32,
     pub text2: Color32,
@@ -107,17 +110,20 @@ const fn rgba(hex: u32, alpha: u8) -> Color32 {
     Color32::from_rgba_unmultiplied_const((hex >> 16) as u8, (hex >> 8) as u8, hex as u8, alpha)
 }
 
-/// GlassDark: Raven's dark glass, over a dusk of blue, violet and teal.
+/// GlassDark: Raven's dark glass, over graphite. The wallpaper only shades
+/// from lighter to darker grey, so that colour in the window means
+/// something: the status, a warning, the accent.
 pub const DARK: Palette = Palette {
     dark: true,
-    window: rgb(0x24242A),
-    blobs: &[rgb(0x23396A), rgb(0x3A2B64), rgb(0x12423F), rgb(0x2A2E52)],
+    window: rgb(0x1D1D20),
+    blobs: &[rgb(0x2C2D31), rgb(0x27272A), rgb(0x1F2023), rgb(0x2A2A2D)],
     card: rgba(0x3A3A3F, 128),
     rim: rgba(0xFFFFFF, 90),
     rim_low: rgba(0xFFFFFF, 26),
     sheen: rgba(0xFFFFFF, 18),
     shadow: rgba(0x000000, 110),
     popup: rgba(0x2E2E33, 247),
+    footer: rgb(0x252528),
     text: rgb(0xF5F5F7),
     text2: rgb(0xCACAD2),
     text3: rgb(0x8A8A92),
@@ -143,18 +149,18 @@ pub const DARK: Palette = Palette {
     tint: 0.18,
 };
 
-/// GlassLight: Raven's light glass, over pastel blue, pink, mint, peach
-/// and lilac.
+/// GlassLight: Raven's light glass, over soft greys, as sober as the dark.
 pub const LIGHT: Palette = Palette {
     dark: false,
-    window: rgb(0xF1F2F7),
-    blobs: &[rgb(0xA9C9FF), rgb(0xF7BEDD), rgb(0xABE9DA), rgb(0xFFD6B3), rgb(0xDCD0F7)],
+    window: rgb(0xECECEF),
+    blobs: &[rgb(0xF7F7F8), rgb(0xE3E3E6), rgb(0xF0F0F2), rgb(0xE6E6E9), rgb(0xF4F4F5)],
     card: rgba(0xFFFFFF, 160),
     rim: rgba(0xFFFFFF, 242),
     rim_low: rgba(0xFFFFFF, 110),
     sheen: rgba(0xFFFFFF, 90),
-    shadow: rgba(0x1A2440, 46),
+    shadow: rgba(0x1C1C22, 44),
     popup: rgba(0xFAFAFC, 247),
+    footer: rgb(0xF7F7F8),
     text: rgb(0x1C1C1E),
     text2: rgb(0x45454C),
     text3: rgb(0x75757D),
@@ -521,6 +527,8 @@ mod tests {
                     (over(p.field, card), "fields"),
                     (over(p.code, card), "code"),
                     (popup, "menus"),
+                    (p.footer, "the bottom bar"),
+                    (over(p.control, p.footer), "buttons on the bottom bar"),
                 ] {
                     at_least(4.5, p.text, bg, &format!("{name}: text on {on}"));
                     at_least(4.5, p.text2, bg, &format!("{name}: secondary text on {on}"));

@@ -520,9 +520,10 @@ without it.
   remembers its window's size and place.
 * The app is drawn in the glass look of the
   [Raven](https://github.com/oscar-soirey/Raven) GUI library (Apache-2.0):
-  translucent panels with a lit rim over a soft coloured wallpaper, and
-  capsule-shaped controls. Its colours are checked for contrast over the
-  whole wallpaper.
+  translucent panels with a lit rim over a sober grey wallpaper, and
+  capsule-shaped controls. Colour is kept for what means something: the
+  status, warnings and the accent. The Settings tab's bar is docked at the
+  bottom. Its colours are checked for contrast over the whole wallpaper.
 
 Build it with `packaging/macos/build-app.sh`, which needs nothing beyond
 Rust and the command-line tools. It is signed ad hoc; built on the Mac that

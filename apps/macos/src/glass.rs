@@ -7,8 +7,7 @@
 use eframe::egui::epaint::tessellator::path::rounded_rectangle;
 use eframe::egui::epaint::{CornerRadiusF32, PathShape, PathStroke, RectShape};
 use eframe::egui::{
-    Color32, Frame, InnerResponse, Margin, Mesh, Painter, Rect, Shape, Stroke, StrokeKind, Ui,
-    pos2, vec2,
+    Color32, Frame, InnerResponse, Margin, Mesh, Painter, Pos2, Rect, Shape, Ui, pos2, vec2,
 };
 
 use crate::theme::{self, Palette};
@@ -20,8 +19,6 @@ pub enum Lift {
     Flat,
     /// A card or a tile.
     Raised,
-    /// A bar that floats over the page, a dialog.
-    Floating,
 }
 
 /// A surface of glass.
@@ -65,11 +62,6 @@ impl Glass {
         }
     }
 
-    /// A bar that floats over the page.
-    pub fn bar(p: &Palette) -> Glass {
-        Glass { rim: 0.8, lift: Lift::Floating, ..Glass::panel(p) }
-    }
-
     /// A capsule control: a chip, a segmented control's track.
     pub fn control(p: &Palette) -> Glass {
         Glass {
@@ -97,7 +89,7 @@ impl Glass {
 /// capsule).
 pub fn shapes(rect: Rect, radius: f32, glass: &Glass, p: &Palette) -> Vec<Shape> {
     let radius = radius.min(rect.width() / 2.0).min(rect.height() / 2.0).max(0.0);
-    let mut shapes = shadow(rect, radius, glass.lift, p.shadow);
+    let mut shapes: Vec<Shape> = shadow(rect, radius, glass.lift, p.shadow).into_iter().collect();
     shapes.push(Shape::Rect(RectShape::filled(rect, radius, glass.tint)));
     if glass.overlay != Color32::TRANSPARENT {
         shapes.push(Shape::Rect(RectShape::filled(rect, radius, glass.overlay)));
@@ -138,30 +130,59 @@ fn scale(color: Color32, k: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(r, g, b, a)
 }
 
-/// A soft shadow outside `rect`, slightly lower, in rings: drawn under the
-/// whole surface it would show through the glass.
-fn shadow(rect: Rect, radius: f32, lift: Lift, color: Color32) -> Vec<Shape> {
+/// A soft shadow outside `rect`, deeper below it than above: one mesh that
+/// fades from the edge outwards, which the GPU shades without steps. It
+/// lies outside the surface only, so that the glass, which lets what is
+/// under it through, does not show it.
+fn shadow(rect: Rect, radius: f32, lift: Lift, color: Color32) -> Option<Shape> {
     let (size, drop, strength) = match lift {
-        Lift::Flat => return Vec::new(),
-        Lift::Raised => (10.0, 2.0, 0.55),
-        Lift::Floating => (22.0, 6.0, 0.8),
+        Lift::Flat => return None,
+        Lift::Raised => (12.0, 3.0, 0.5),
     };
-    let steps = 8;
-    let width = size / steps as f32;
-    let rect = rect.translate(vec2(0.0, drop));
-    (0..steps)
-        .map(|i| {
-            let out = width * (i as f32 + 0.5);
-            let k = 1.0 - (i as f32 + 0.5) / steps as f32;
-            let c = color.gamma_multiply(strength * k * k);
-            Shape::Rect(RectShape::stroke(
-                rect.expand(out),
-                radius + out,
-                Stroke::new(width, c),
-                StrokeKind::Middle,
-            ))
-        })
-        .collect()
+    let edge = outline(rect, radius);
+    // Rings from the edge (k = 0) out to nothing (k = 1), the light falling
+    // off as (1 - k)²: each ring moves out along the edge's normal, and down.
+    const RINGS: usize = 5;
+    let mut mesh = Mesh::default();
+    for ring in 0..RINGS {
+        let k = ring as f32 / (RINGS - 1) as f32;
+        let c = color.gamma_multiply(strength * (1.0 - k) * (1.0 - k));
+        for &(at, normal) in &edge {
+            mesh.colored_vertex(at + normal * (size * k) + vec2(0.0, drop * k), c);
+        }
+    }
+    let n = edge.len() as u32;
+    for ring in 0..RINGS as u32 - 1 {
+        for i in 0..n {
+            let (a, b) = (ring * n + i, ring * n + (i + 1) % n);
+            mesh.add_triangle(a, b, a + n);
+            mesh.add_triangle(b, b + n, a + n);
+        }
+    }
+    Some(Shape::mesh(mesh))
+}
+
+/// The edge of `rect` with corners of `radius`, clockwise from the top
+/// left, each point with its outward normal: a fixed number of points per
+/// corner, also when the radius is 0.
+fn outline(rect: Rect, radius: f32) -> Vec<(Pos2, eframe::egui::Vec2)> {
+    const SEGMENTS: usize = 8;
+    let r = radius.max(0.0);
+    let corners = [
+        (pos2(rect.left() + r, rect.top() + r), 180.0_f32),
+        (pos2(rect.right() - r, rect.top() + r), 270.0),
+        (pos2(rect.right() - r, rect.bottom() - r), 0.0),
+        (pos2(rect.left() + r, rect.bottom() - r), 90.0),
+    ];
+    let mut points = Vec::with_capacity(4 * (SEGMENTS + 1));
+    for (centre, from) in corners {
+        for i in 0..=SEGMENTS {
+            let angle = (from + 90.0 * i as f32 / SEGMENTS as f32).to_radians();
+            let normal = vec2(angle.cos(), angle.sin());
+            points.push((centre + normal * r, normal));
+        }
+    }
+    points
 }
 
 /// A sheen: `top` under the top edge, fading out by the middle, within the
@@ -229,10 +250,37 @@ mod tests {
         let count = |g: &Glass| shapes(rect, 20.0, g, p).len();
         // A flat field: tint and rim.
         assert_eq!(count(&Glass::field(p)), 2);
-        // A raised panel: eight rings of shadow, tint, sheen, rim.
-        assert_eq!(count(&Glass::panel(p)), 11);
+        // A raised panel: shadow, tint, sheen, rim.
+        assert_eq!(count(&Glass::panel(p)), 4);
         // A tinted one adds its overlay.
-        assert_eq!(count(&Glass::tinted(p, Color32::RED)), 12);
+        assert_eq!(count(&Glass::tinted(p, Color32::RED)), 5);
+    }
+
+    #[test]
+    fn the_shadow_lies_outside_the_surface_and_fades_out() {
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 80.0));
+        let Some(Shape::Mesh(mesh)) = shadow(rect, 20.0, Lift::Raised, Color32::BLACK) else {
+            panic!("a mesh");
+        };
+        // Outside the rounded rectangle, or on its edge.
+        for v in &mesh.vertices {
+            let inner = rect.shrink(20.0);
+            let nearest = pos2(
+                v.pos.x.clamp(inner.left(), inner.right()),
+                v.pos.y.clamp(inner.top(), inner.bottom()),
+            );
+            assert!(v.pos.distance(nearest) >= 20.0 - 0.01, "{:?} inside", v.pos);
+        }
+        // Darkest at the edge, nothing at the outer ring.
+        let n = mesh.vertices.len() / 5;
+        assert!(mesh.vertices[..n].iter().all(|v| v.color.a() > 0));
+        assert!(mesh.vertices[4 * n..].iter().all(|v| v.color.a() == 0));
+        // Deeper below than above.
+        let bottom = mesh.vertices.iter().map(|v| v.pos.y).fold(f32::MIN, f32::max);
+        let top = mesh.vertices.iter().map(|v| v.pos.y).fold(f32::MAX, f32::min);
+        assert!(bottom - 80.0 > 0.0 - top);
+        // No shadow for what lies flat.
+        assert!(shadow(rect, 20.0, Lift::Flat, Color32::BLACK).is_none());
     }
 
     #[test]

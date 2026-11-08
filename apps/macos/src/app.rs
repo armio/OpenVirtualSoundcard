@@ -10,7 +10,7 @@ use eframe::egui::{
 };
 use ovsc_control::{Restart, Settings, SettingsChange, Status};
 
-use crate::glass::{self, Glass};
+use crate::glass::Glass;
 use crate::logic::{self, Lamp, Light, PacketWindow, Problem};
 use crate::theme;
 use crate::widgets::{self, Copied, Severity};
@@ -788,21 +788,16 @@ impl eframe::App for App {
                 .show(ui, |ui| self.alerts(ui));
         }
         if self.tab == Tab::Settings && self.form.is_some() {
-            // A bar of glass floating over the bottom of the page.
+            // A bar docked at the bottom, opaque, with a hairline above.
             egui::Panel::bottom("actions")
-                .frame(Frame::new().inner_margin(Margin {
+                .frame(Frame::new().fill(p.footer).inner_margin(Margin {
                     left: gutter,
                     right: gutter,
-                    top: 8,
-                    bottom: 14,
+                    top: 10,
+                    bottom: 12,
                 }))
-                .show_separator_line(false)
-                .show(ui, |ui| {
-                    let margin = Margin::symmetric(16, 10);
-                    glass::frame(ui, 22.0, margin, Glass::bar(p), |ui| {
-                        settings::action_bar(self, ui);
-                    });
-                });
+                .show_separator_line(true)
+                .show(ui, |ui| settings::action_bar(self, ui));
         }
         egui::CentralPanel::default()
             .frame(Frame::new().inner_margin(Margin {
