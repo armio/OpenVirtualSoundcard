@@ -47,7 +47,7 @@ use ovsc_ipc::transport::ServerTransport;
 
 use crate::config::{self, AppConfig, ClockSource};
 use crate::control::{self, Control, Health};
-use crate::netwatch::{self, Verdict};
+use crate::netwatch::Verdict;
 use crate::supervise::Supervision;
 use crate::{ClockStateLog, Stop, StopSignals, status_line};
 
@@ -172,6 +172,7 @@ async fn serve(
         control: &mut control,
         health: &health,
         sup,
+        secondary_problem: None,
     };
 
     let mut engine = match start_engine(&mut ctx, None, stop).await {
@@ -277,6 +278,9 @@ struct Ctx<'a> {
     /// Turns the counters into warnings for the app and the log.
     health: &'a Mutex<Health>,
     sup: Supervision,
+    /// What is wrong with the secondary network's interface, as the
+    /// running engine's watch last saw it.
+    secondary_problem: Option<String>,
 }
 
 impl Ctx<'_> {
@@ -289,6 +293,7 @@ impl Ctx<'_> {
             hal: self.server.status(),
             engine_error: error,
             health: Some(self.health),
+            secondary_problem: engine.and(self.secondary_problem.as_deref()),
         }
     }
 
@@ -458,8 +463,8 @@ async fn run_engine(
 ) -> anyhow::Result<Next> {
     let mut second = tokio::time::interval(Duration::from_secs(1));
     let mut clock_log = ClockStateLog::default();
-    let iface = &engine.device.info().iface;
-    let mut watch = ctx.sup.probe.watch(&iface.name, iface.ip);
+    let mut watch = ctx.sup.probe.watch_device(engine.device.info());
+    ctx.secondary_problem = None;
     let mut latency = engine.device.latency_requests();
     latency.mark_unchanged();
     // A latency set between the device's start and this subscription
@@ -471,7 +476,7 @@ async fn run_engine(
         tokio::select! {
             r = stop.requested() => return Ok(Next::Stop(r?)),
             () = ctx.status.tick() => {
-                let network = netwatch::status_note(watch.as_ref());
+                let network = watch.note();
                 info!(
                     "{}{network}; {}; hal: {}",
                     status_line(&engine.device, &engine.clock),
@@ -486,11 +491,11 @@ async fn run_engine(
                     anyhow::bail!("{fault}: restarting the daemon");
                 }
                 ctx.watch(Some(engine));
-                if let Some(w) = &mut watch {
-                    if let Verdict::Restart(why) = w.poll(ctx.sup.probe, &engine.clock) {
-                        warn!("{why}: restarting the network engine");
-                        return Ok(Next::RestartEngine);
-                    }
+                let verdict = watch.poll(ctx.sup.probe, &engine.clock);
+                ctx.secondary_problem = watch.secondary_problem();
+                if let Verdict::Restart(why) = verdict {
+                    warn!("{why}: restarting the network engine");
+                    return Ok(Next::RestartEngine);
                 }
             }
             Ok(()) = latency.changed() => ctx.apply_latency(engine),
@@ -603,6 +608,7 @@ impl Engine {
                 let mut ptp = PtpConfig::new(iface.ip, iface.mac);
                 ptp.event_port = cfg.clock.ptp_event_port;
                 ptp.general_port = cfg.clock.ptp_general_port;
+                ptp.secondary = config::ptp_secondary(&cfg.device);
                 let (follower, clock) =
                     PtpFollower::start(ptp).await.context("starting the PTP clock follower")?;
                 (clock, Some(follower))
@@ -1342,6 +1348,7 @@ mod tests {
             control: &mut control,
             health: &health,
             sup: quiet(),
+            secondary_problem: None,
         };
         let (_stop_tx, mut stop) = mpsc::unbounded_channel();
         let restart = start_engine(&mut ctx, Some(carry), &mut stop);

@@ -259,7 +259,7 @@ async fn a_refused_channel_update_gets_a_flow_of_its_own() {
                         .unwrap()
                         .push((h.opcode, FlowRequest::decode(&req).unwrap().channels));
                     handle += 1;
-                    dbcp::encode_flow_created(&h, [0, 0, 0, 0, 0, handle])
+                    dbcp::encode_flow_created(&h, [0, 0, 0, 0, 0, handle], 1)
                 }
                 dbcp::opcode::UPDATE_FLOW => {
                     seen.lock()
@@ -292,6 +292,7 @@ async fn a_refused_channel_update_gets_a_flow_of_its_own() {
                 dbcp1: 0x1102,
                 is_default_name: true,
                 multicast: None,
+                nred: 0,
             },
         });
     }
@@ -397,6 +398,133 @@ async fn audio_flows_between_two_devices() {
     feeder.join().unwrap();
     rx.shutdown().await;
     tx.shutdown().await;
+}
+
+/// Two devices on both networks of a redundant system: the flow between
+/// them runs on both, and a device on one network still gets its flow on
+/// that one. Linux routes all of 127.0.0.0/8 to lo, so addresses there
+/// stand in for each device's two interfaces.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_redundant_flow_runs_on_both_networks() {
+    let clock = system_clock();
+    let on = |name: &str, base: u16, pid: u16, primary: &str, secondary: &str| {
+        let mut cfg = config(name, base, pid);
+        cfg.interface = primary.into();
+        cfg.secondary_interface = secondary.into();
+        cfg
+    };
+    let tx = Device::start(on("red-tx", 24540, 11, "127.0.0.5", "127.0.0.6"), clock.clone())
+        .await
+        .unwrap();
+    let single =
+        Device::start(on("one-net", 24550, 12, "127.0.0.9", ""), clock.clone()).await.unwrap();
+    let directory = StaticDirectory::new();
+    for entry in tx.directory_entries().into_iter().chain(single.directory_entries()) {
+        directory.insert(entry);
+    }
+    let rx = Device::start_with_directory(
+        on("red-rx", 24560, 13, "127.0.0.7", "127.0.0.8"),
+        clock.clone(),
+        directory,
+    )
+    .await
+    .unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let feeders =
+        [start_feeder(tx.audio(), stop.clone()), start_feeder(single.audio(), stop.clone())];
+    let io = rx.audio();
+    rx.subscribe(1, "01", "red-tx").unwrap();
+    rx.subscribe(2, "02", "one-net").unwrap();
+    eventually("audio from both transmitters", || {
+        verify(&io, 0, 0)?;
+        verify(&io, 1, 1)
+    })
+    .await;
+
+    // The transmitter sends the flow to the receiver on each network.
+    let flows = tx.tx_flows();
+    assert_eq!(flows.len(), 1, "{flows:?}");
+    assert_eq!(*flows[0].destination.ip(), Ipv4Addr::new(127, 0, 0, 7));
+    assert_eq!(flows[0].secondary.map(|a| *a.ip()), Some(Ipv4Addr::new(127, 0, 0, 8)));
+    // The device on one network sends on that one.
+    assert_eq!(single.tx_flows()[0].secondary, None);
+    eventually("packets on both networks", || {
+        let (s, t) = (rx.stats(), tx.stats());
+        match (s.networks[0].rx_packets, s.networks[1].rx_packets, t.networks[1].tx_packets) {
+            (a, b, c) if a > 100 && b > 100 && c > 100 => Ok(()),
+            other => Err(format!("{other:?}")),
+        }
+    })
+    .await;
+    // The receiver lists the flow at both of its addresses, receiving on
+    // both, and the other flow at its primary address only.
+    eventually("both networks receiving", || {
+        let flows = futures_lite_block(rx_flows(24560));
+        let red = flows.iter().find(|f| f.secondary.is_some()).ok_or("no redundant flow")?;
+        let one = flows.iter().find(|f| f.secondary.is_none()).ok_or("no single flow")?;
+        assert_eq!(*red.secondary.unwrap().ip(), Ipv4Addr::new(127, 0, 0, 8));
+        // Each is published as receiving once the manager's pass after its
+        // packets arrive has run.
+        match (red.networks, one.networks) {
+            (0b11, 1) => Ok(()),
+            other => Err(format!("networks {other:?}")),
+        }
+    })
+    .await;
+    // Every packet came twice, and none counts as lost or twice.
+    let s = rx.stats();
+    assert_eq!(s.rx_lost_packets, 0, "{s:?}");
+    assert!(s.rx_packets < s.networks[0].rx_packets + s.networks[1].rx_packets, "{s:?}");
+    // The receiver says it is on two networks.
+    let resp = client::transact_ok(
+        Ipv4Addr::LOCALHOST,
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 24560)),
+        &arc::encode_simple_request(client::next_seq(), arc::opcode::CHANNEL_COUNTS),
+        Duration::from_millis(500),
+        3,
+    )
+    .await
+    .unwrap();
+    let counts = arc::ChannelCounts::decode_response(&Frame::parse(&resp).unwrap()).unwrap();
+    assert_eq!(counts.network_interfaces, 2);
+
+    stop.store(true, Ordering::Relaxed);
+    for f in feeders {
+        f.join().unwrap();
+    }
+    rx.shutdown().await;
+    single.shutdown().await;
+    tx.shutdown().await;
+}
+
+/// A secondary interface that cannot be found at start (its cable out)
+/// leaves the device on the primary network alone, saying why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_missing_secondary_interface_leaves_the_primary_running() {
+    let mut cfg = config("no-second", 24570, 14);
+    cfg.secondary_interface = "no-such-if9".into();
+    let dev = Device::start(cfg, system_clock()).await.unwrap();
+    assert!(dev.info().secondary.is_none());
+    assert!(dev.info().secondary_missing.as_deref().unwrap().contains("no-such-if9"));
+    // A secondary on the primary interface is a mistake, refused.
+    let mut cfg = config("same-twice", 24580, 15);
+    cfg.secondary_interface = "127.0.0.1".into();
+    assert!(Device::start(cfg, system_clock()).await.is_err());
+    dev.shutdown().await;
+}
+
+/// Runs `f` to completion from a synchronous check, on a thread of its own.
+#[cfg(target_os = "linux")]
+fn futures_lite_block<T: Send + 'static>(
+    f: impl std::future::Future<Output = T> + Send + 'static,
+) -> T {
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)
+    })
+    .join()
+    .unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -508,6 +636,7 @@ async fn a_re_requested_flow_sends_the_packets_asked_for() {
         channels: channels.to_vec(),
         rx_addr: Ipv4Addr::LOCALHOST,
         rx_port: rx.local_addr().unwrap().port(),
+        secondary: None,
     };
     let ask =
         |req: FlowRequest| async move { client::request_flow(Ipv4Addr::LOCALHOST, fc, &req).await };
@@ -699,6 +828,7 @@ async fn a_new_receive_latency_leaves_the_transmit_flows_alone() {
         channels: vec![1, 2],
         rx_addr: Ipv4Addr::LOCALHOST,
         rx_port: socket.local_addr().unwrap().port(),
+        secondary: None,
     };
     let flow_control = SocketAddr::from((Ipv4Addr::LOCALHOST, OVSC + 2));
     let handle = client::request_flow(Ipv4Addr::LOCALHOST, flow_control, &request).await.unwrap();

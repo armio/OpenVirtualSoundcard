@@ -22,7 +22,11 @@ The first public version, not released yet.
   LaunchDaemon share memory over XPC. Installed with `install.sh` or a
   package, removed with `uninstall.sh`.
 - macOS: the OpenVirtualSoundcard app, for status and settings over the
-  daemon's control socket.
+  daemon's control socket. It is drawn in the glass look of the Raven GUI
+  library, follows the system's light or dark appearance, keeps an outage
+  in view on both tabs (and in the window's title and the Dock), asks
+  before a change that interrupts audio or other devices' subscriptions and
+  says what it costs, and works with VoiceOver and the keyboard.
 - Settings from Dante Controller: device and channel names, subscriptions,
   latency, sample rate and encoding.
 - Monitoring in Dante Controller: clock state, signal meters, receive
@@ -51,13 +55,24 @@ The first public version, not released yet.
   transmit (send errors, lateness, skipped packets, resyncs, expired flows,
   real-time scheduling) and the clock (unlocks, steps, leader changes,
   holdover), logged as problems happen.
-- Health in the app and the log: the Audio light is green **Flowing** only
-  when nothing audible went wrong in the last 30 s, amber **Dropouts** when
-  something did, and red **Silent** when the driver has failed (with the
-  command that recovers it). Warnings in plain words cover what rose in the
-  last 30 s, with the urgent ones first; they are logged as `health:`
-  lines, and the status line says `healthy` or lists them.
-  Controllers' changes move to an **Earlier** list after 10 minutes.
+- Dante redundancy: with `[device] secondary_interface` (or **Secondary
+  network** in the app), the device is on both networks of a redundant
+  Dante system. Flows with redundant devices run on both networks, and
+  either network can fail without a gap; a packet is lost only when neither
+  network brought it in time. The clock follows the PTP leader on the
+  secondary network while the primary has none. Dante Controller sees both
+  interfaces; the app's Networks section and its warnings show what each
+  network brings. A secondary network that is down never stops the
+  primary's audio.
+- Health in the app and the log: the app's Audio tile is green **Flowing**
+  only while an application plays and nothing audible went wrong in the
+  last 30 s, grey **Idle** when none plays, amber **Dropouts** when
+  something did, and red whenever audio is down (**Silent** when the driver
+  has failed, with the command that recovers it). Warnings in plain words
+  cover what rose in the last 30 s, with the urgent ones first; they are
+  logged as `health:` lines, and the status line says `healthy` or lists
+  them. Controllers' changes are listed apart, those older than 10 minutes
+  greyed.
 
 ### Changed
 
@@ -98,6 +113,8 @@ The first public version, not released yet.
   fixed.
 - Transmit flows accept 2 to 32 frames per packet and 1 to 8 channels, as
   advertised. A flow requested again with another packet size is replaced.
+- A granted flow request is answered as real transmitters answer it: the
+  handle, then a result per network.
 - The macOS driver fades over 5 ms when its gate opens or closes, and sends
   silence for NaN or infinite output.
 - The state file is written durably with a backup, and a damaged one is kept

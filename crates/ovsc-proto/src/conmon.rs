@@ -183,25 +183,50 @@ fn put_name(c: &mut [u8], offset: usize, s: &str) {
     c[offset + NAME_FIELD - 1] = 0;
 }
 
-/// Network interface parameters (`INTERFACE_STATUS`).
-pub fn interface_status(
-    link_speed_mbps: u16,
-    mac: [u8; 6],
-    ip: Ipv4Addr,
-    netmask: Ipv4Addr,
-    gateway: Ipv4Addr,
-) -> Vec<u8> {
-    let mut w = Writer::with_capacity(64);
-    w.bytes(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
+/// One network interface in [`interface_status`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InterfaceAddrs {
+    pub mac: [u8; 6],
+    pub ip: Ipv4Addr,
+    pub netmask: Ipv4Addr,
+    pub gateway: Ipv4Addr,
+}
+
+/// Network interface parameters (`INTERFACE_STATUS`, PROTOCOL.md §7.4.3):
+/// the primary interface, then the secondary of a redundant device, laid
+/// out as an LX-DANTE with both interfaces reports them. The secondary
+/// carries no gateway or DNS server, as on every device captured.
+pub fn interface_status(link_speed_mbps: u16, interfaces: &[InterfaceAddrs]) -> Vec<u8> {
+    let n = interfaces.len().clamp(1, 2);
+    let mut w = Writer::with_capacity(36 + 52 * n);
+    w.u16(n as u16);
+    w.u16(0);
+    w.u16(0);
     w.u16(link_speed_mbps);
-    w.u16(1);
-    w.bytes(&mac);
-    w.bytes(&ip.octets());
-    w.bytes(&netmask.octets());
-    w.bytes(&gateway.octets());
-    w.bytes(&gateway.octets()); // DNS server; not used by peers
-    w.bytes(&[0x00, 0x18, 0x00, 0x30]);
-    w.zeros(28);
+    for (i, iface) in interfaces.iter().take(n).enumerate() {
+        let primary = i == 0;
+        // Mode: 1 on the primary (address by DHCP), 0 on the secondary.
+        w.u16(primary as u16);
+        w.bytes(&iface.mac);
+        w.bytes(&iface.ip.octets());
+        w.bytes(&iface.netmask.octets());
+        let gateway = if primary { iface.gateway } else { Ipv4Addr::UNSPECIFIED };
+        w.bytes(&gateway.octets()); // DNS server; not used by peers
+        w.bytes(&gateway.octets());
+        if i + 1 < n {
+            w.u32(0);
+        } else {
+            // The size of a pending-configuration record, and a pointer to
+            // the first, relative to the content: after the redundancy flags.
+            w.u16(0x18);
+            w.u16((0x30 + 28 * (n - 1)) as u16);
+        }
+    }
+    // Redundancy flags, 0 as on the LX-DANTE, whose two interfaces cannot
+    // be switched to one network; then no pending configuration.
+    w.u16(0);
+    w.u16(0);
+    w.zeros(24 * n);
     w.into_vec()
 }
 
@@ -595,11 +620,54 @@ mod tests {
     }
 
     #[test]
+    fn interface_status_is_laid_out_as_real_devices_report_it() {
+        let primary = InterfaceAddrs {
+            mac: [0x00, 0x1d, 0xc1, 0x08, 0x12, 0x58],
+            ip: Ipv4Addr::new(192, 168, 1, 108),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            gateway: Ipv4Addr::new(192, 168, 1, 1),
+        };
+        // One interface, as OpenVirtualSoundcard has always answered.
+        let one = hex::decode(concat!(
+            "0001 0000 000003e8 0001 001dc1081258 c0a8016c ffffff00 c0a80101 c0a80101 0018 0030",
+            "0000 0000",
+        ).replace(' ', ""))
+        .unwrap();
+        let c = interface_status(1000, &[primary]);
+        assert_eq!(&c[..40], &one[..]);
+        assert!(c[40..].iter().all(|&b| b == 0));
+        // Two: an LX-DANTE with both interfaces up (netaudio test vector
+        // `interface_status_lx_dante_packet_12362179`, public domain), from
+        // the content on. It has 0000000a after the primary record, of
+        // unknown meaning; A32 and WING have zeros there, as we do.
+        let mut real = hex::decode(
+            concat!(
+                "0002 0000 000003e8",
+                "0001 001dc1081258 c0a8016c ffffff00 c0a80101 c0a80101 0000000a",
+                "0000 001dc1081259 ac1fb93a ffff0000 00000000 00000000 0018004c",
+                "0000 0000",
+            )
+            .replace(' ', ""),
+        )
+        .unwrap();
+        real.extend([0; 48]);
+        real[32..36].copy_from_slice(&[0; 4]);
+        let secondary = InterfaceAddrs {
+            mac: [0x00, 0x1d, 0xc1, 0x08, 0x12, 0x59],
+            ip: Ipv4Addr::new(172, 31, 185, 58),
+            netmask: Ipv4Addr::new(255, 255, 0, 0),
+            gateway: Ipv4Addr::new(172, 31, 0, 1),
+        };
+        assert_eq!(interface_status(1000, &[primary, secondary]), real);
+    }
+
+    #[test]
     fn interface_and_clock_status_sizes() {
         let mac = [0x02, 0, 0, 0xaa, 0xbb, 0xcc];
         let ip = Ipv4Addr::new(10, 0, 0, 2);
         let mask = Ipv4Addr::new(255, 255, 255, 0);
-        assert_eq!(interface_status(1000, mac, ip, mask, ip).len(), 64);
+        let one = InterfaceAddrs { mac, ip, netmask: mask, gateway: ip };
+        assert_eq!(interface_status(1000, &[one]).len(), 64);
         let c = clocking_status(Sync::Locked, 5, mac, eui64_from_mac(mac));
         assert_eq!(&c[0..4], &[0, 3, 0, 3]);
         assert_eq!(&c[12..18], &mac);

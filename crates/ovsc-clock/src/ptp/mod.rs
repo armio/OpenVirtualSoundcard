@@ -97,6 +97,18 @@ pub struct PtpConfig {
     pub delay_req_interval: Duration,
     /// How long without Sync messages before the master is considered gone.
     pub master_timeout: Duration,
+    /// The secondary network, for a device on both networks of a redundant
+    /// Dante system: the follower takes the leader's messages there while
+    /// the primary network brings none.
+    pub secondary: Option<PtpSecondary>,
+}
+
+/// The secondary network of a redundant Dante system, for [`PtpConfig`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PtpSecondary {
+    /// IPv4 address of the interface on the secondary network.
+    pub interface: Ipv4Addr,
+    pub netmask: Ipv4Addr,
 }
 
 impl PtpConfig {
@@ -111,12 +123,14 @@ impl PtpConfig {
             multicast_group: Ipv4Addr::new(224, 0, 1, 129),
             delay_req_interval: Duration::from_secs(1),
             master_timeout: Duration::from_secs(5),
+            secondary: None,
         }
     }
 
     fn endpoints(&self) -> Endpoints {
         Endpoints {
             interface: self.interface,
+            secondary: self.secondary.map(|s| s.interface),
             group: self.multicast_group,
             event_port: self.event_port,
             general_port: self.general_port,
@@ -175,9 +189,14 @@ impl PtpFollower {
             servo: ServoConfig::default(),
             seed,
         });
-        let task = tokio::spawn(follower::run(core, event, general, endpoints, output.clone()));
+        let failover = config
+            .secondary
+            .map(|s| follower::Failover::new(s.interface, s.netmask, local_now_ns()));
+        let task =
+            tokio::spawn(follower::run(core, event, general, endpoints, output.clone(), failover));
         info!(
             interface = %config.interface,
+            secondary = ?config.secondary.map(|s| s.interface),
             uuid = %follower::fmt_uuid(&config.uuid),
             group = %config.multicast_group,
             event_port = config.event_port,

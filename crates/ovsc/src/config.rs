@@ -64,6 +64,21 @@ impl Default for ClockConfig {
 /// PTP followers correct (real oscillators stay within ±100 ppm).
 pub const MAX_RATE_PPM: f64 = 500.0;
 
+/// The PTP follower's secondary network, for a device on both networks of a
+/// redundant Dante system: the clock follows the leader there while the
+/// primary network has none.
+pub fn ptp_secondary(device: &ovsc_core::DeviceConfig) -> Option<ovsc_clock::ptp::PtpSecondary> {
+    // One that cannot be found is the device's to report: it runs on the
+    // primary network alone then (`DeviceInfo::secondary_missing`). One on
+    // the primary's network is refused when the device starts.
+    match device.secondary_interface.as_str() {
+        "" => None,
+        spec => ovsc_core::net::Interface::find(spec).ok().map(|iface| {
+            ovsc_clock::ptp::PtpSecondary { interface: iface.ip, netmask: iface.netmask }
+        }),
+    }
+}
+
 /// The rate of a free-running clock `ppm` parts per million fast (or slow,
 /// if negative): media nanoseconds per local nanosecond.
 pub fn rate_from_ppm(ppm: f64) -> anyhow::Result<f64> {
@@ -376,6 +391,11 @@ pub const EXAMPLE: &str = r#"# OpenVirtualSoundcard configuration.
 name = ""
 # Network interface name or IPv4 address. Empty: interface of the default route.
 interface = ""
+# Dante redundancy: the interface on the secondary network, by name or IPv4
+# address; another interface, on another network. Flows with redundant
+# devices then run on both networks, and either can fail without a gap.
+# Empty: one network.
+secondary_interface = ""
 sample_rate = 48000          # 44100, 48000, 88200, 96000, 176400 or 192000
 bits_per_sample = 24         # 16, 24 or 32
 tx_channels = 8              # a count, or a list of names: ["Left", "Right"]

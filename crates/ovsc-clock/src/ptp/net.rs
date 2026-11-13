@@ -29,6 +29,9 @@ pub(crate) const GENERAL_TOS: u32 = 46 << 2;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Endpoints {
     pub interface: Ipv4Addr,
+    /// The interface on the secondary network of a redundant system, where
+    /// the group is joined too.
+    pub secondary: Option<Ipv4Addr>,
     pub group: Ipv4Addr,
     pub event_port: u16,
     pub general_port: u16,
@@ -95,6 +98,17 @@ impl Endpoints {
                 format!("cannot join {} on interface {}: {e}", self.group, self.interface),
             )
         })?;
+        // The leader of a redundant system is heard on both networks; the
+        // follower takes one network's messages at a time (Failover).
+        if let Some(secondary) = self.secondary {
+            if let Err(e) = socket.join_multicast_v4(&self.group, &secondary) {
+                tracing::warn!(
+                    "cannot join {} on the secondary interface {secondary}: {e}; the clock \
+                     follows the primary network only",
+                    self.group
+                );
+            }
+        }
         // A socket bound to 0.0.0.0 on Linux also receives the group's
         // datagrams from every other interface on which any process joined
         // it (IP_MULTICAST_ALL defaults to 1), so a host with a second PTP
@@ -129,11 +143,26 @@ impl Endpoints {
 }
 
 fn bind_error(port: u16, e: io::Error) -> io::Error {
-    let hint = if e.kind() == io::ErrorKind::PermissionDenied && port < 1024 {
-        ". Ports below 1024 are privileged: run as root, or on Linux grant the \
-         CAP_NET_BIND_SERVICE capability (e.g. `sudo setcap cap_net_bind_service=+ep <binary>`)"
-    } else {
-        ""
+    let hint = match e.kind() {
+        io::ErrorKind::PermissionDenied if port < 1024 => {
+            ". Ports below 1024 are privileged: run as root, or on Linux grant the \
+             CAP_NET_BIND_SERVICE capability (e.g. `sudo setcap cap_net_bind_service=+ep <binary>`)"
+                .to_owned()
+        }
+        // The socket opts in to sharing the port (SO_REUSEADDR and
+        // SO_REUSEPORT), but the system lets two sockets share it only when
+        // both did: another program holds the port for itself.
+        io::ErrorKind::AddrInUse => format!(
+            ". Another program holds it for itself{}; `sudo lsof -nP -iUDP:{port}` names it",
+            if cfg!(target_vendor = "apple") {
+                ": on a Mac, usually AirPlay, whose own clock uses PTP on the same ports. \
+                 Turn off AirPlay Receiver (System Settings, General, AirDrop & Handoff) \
+                 and stop sending audio to AirPlay speakers"
+            } else {
+                ", such as another PTP daemon (ptp4l)"
+            }
+        ),
+        _ => String::new(),
     };
     io::Error::new(e.kind(), format!("cannot bind UDP port {port}: {e}{hint}"))
 }
@@ -349,9 +378,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_port_held_by_another_program_says_who_may_hold_it() {
+        let e = bind_error(319, io::Error::from(io::ErrorKind::AddrInUse));
+        assert_eq!(e.kind(), io::ErrorKind::AddrInUse);
+        let text = e.to_string();
+        assert!(text.starts_with("cannot bind UDP port 319: "), "{text}");
+        assert!(text.contains("`sudo lsof -nP -iUDP:319`"), "{text}");
+        #[cfg(target_vendor = "apple")]
+        assert!(text.contains("AirPlay Receiver"), "{text}");
+        // Other errors say only what happened.
+        let e = bind_error(319, io::Error::from(io::ErrorKind::InvalidInput));
+        assert!(!e.to_string().contains("lsof"));
+    }
+
+    #[test]
     fn sockets_are_marked_and_on_linux_filtered_by_interface() {
         let endpoints = Endpoints {
             interface: Ipv4Addr::LOCALHOST,
+            secondary: None,
             group: Ipv4Addr::new(224, 0, 1, 129),
             event_port: 0,
             general_port: 0,

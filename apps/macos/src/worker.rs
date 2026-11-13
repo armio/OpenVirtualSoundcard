@@ -33,10 +33,24 @@ pub enum Event {
     Problem(Problem),
     /// The daemon's status; sent when it changes.
     Status(Box<Status>),
+    /// The daemon answered a status request: sent after every one, changed
+    /// or not, so the app can tell a live status from a stale one.
+    Alive,
     Settings(Settings),
     Interfaces(Vec<InterfaceInfo>),
     /// The answer to [`Command::Apply`]: what restarts, or why it failed.
-    Applied(Result<Restart, String>),
+    Applied(Result<Restart, Unapplied>),
+}
+
+/// Why a change was not applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Unapplied {
+    /// The daemon refused it, in its words.
+    Refused(String),
+    /// The app could not tell: the connection failed during the request.
+    Unsure(String),
+    /// No change was sent: the daemon cannot be used now.
+    NotSent(String),
 }
 
 /// The UI's end of the worker. The thread ends when this is dropped.
@@ -142,7 +156,7 @@ impl Link {
                 Ok(Command::Reload) if usable => self.reload(client)?,
                 Ok(Command::Reload) => {}
                 Ok(Command::Apply(change)) if usable => self.apply(client, change)?,
-                Ok(Command::Apply(_)) => self.applied(Err(self.not_usable())),
+                Ok(Command::Apply(_)) => self.applied(Err(Unapplied::NotSent(self.not_usable()))),
                 Err(RecvTimeoutError::Timeout) => {
                     let was = usable;
                     usable = self.poll(client)?;
@@ -163,6 +177,7 @@ impl Link {
             Response::Status(status) => match Problem::check(&status) {
                 None => {
                     self.status(status);
+                    self.send(Event::Alive);
                     Ok(true)
                 }
                 Some(problem) => {
@@ -201,20 +216,21 @@ impl Link {
                 Ok(())
             }
             Ok(Response::Error { message }) => {
-                self.applied(Err(message));
+                self.applied(Err(Unapplied::Refused(message)));
                 Ok(())
             }
             Ok(other) => {
-                self.applied(Err(
+                self.applied(Err(Unapplied::Unsure(
                     "OpenVirtualSoundcard gave an answer this app does not understand.".into(),
-                ));
+                )));
                 Err(unexpected(&other))
             }
             Err(e) => {
-                self.applied(Err(format!(
-                    "{} The change may or may not have been saved.",
+                self.applied(Err(Unapplied::Unsure(format!(
+                    "{} The change may not have been saved: Settings shows what the daemon holds \
+                     once the app reconnects.",
                     Problem::from_io(&e).message()
-                )));
+                ))));
                 Err(e.into())
             }
         }
@@ -226,7 +242,7 @@ impl Link {
         let until = Instant::now() + time;
         loop {
             match self.commands.recv_timeout(until.saturating_duration_since(Instant::now())) {
-                Ok(Command::Apply(_)) => self.applied(Err(self.not_usable())),
+                Ok(Command::Apply(_)) => self.applied(Err(Unapplied::NotSent(self.not_usable()))),
                 Ok(Command::Reload) => {}
                 Err(RecvTimeoutError::Timeout) => return true,
                 Err(RecvTimeoutError::Disconnected) => return false,
@@ -257,7 +273,7 @@ impl Link {
         }
     }
 
-    fn applied(&self, result: Result<Restart, String>) {
+    fn applied(&self, result: Result<Restart, Unapplied>) {
         self.send(Event::Applied(result));
     }
 
@@ -281,9 +297,16 @@ mod tests {
     use super::*;
 
     impl Worker {
-        /// The next event, waiting up to five seconds.
+        /// The next event other than [`Event::Alive`], waiting up to five
+        /// seconds.
         fn next(&self) -> Event {
-            self.events.recv_timeout(Duration::from_secs(5)).expect("no event from the worker")
+            loop {
+                match self.events.recv_timeout(Duration::from_secs(5)) {
+                    Ok(Event::Alive) => continue,
+                    Ok(event) => return event,
+                    Err(e) => panic!("no event from the worker: {e}"),
+                }
+            }
         }
     }
 
@@ -321,6 +344,7 @@ mod tests {
         Settings {
             name: "studio-mac".into(),
             interface: "en7".into(),
+            secondary_interface: String::new(),
             sample_rate: 48_000,
             bits_per_sample: 24,
             rx_channels: 8,
@@ -373,16 +397,19 @@ mod tests {
         assert!(matches!(worker.next(), Event::Status(s) if *s == status(PROTOCOL_VERSION)));
         assert!(matches!(worker.next(), Event::Settings(s) if s == settings()));
         assert!(matches!(worker.next(), Event::Interfaces(i) if i.is_empty()));
-        // The worker wakes the UI just after queueing each event.
+        // The worker wakes the UI just after queueing each event: the three
+        // above and at least the first Alive.
         let deadline = Instant::now() + Duration::from_secs(1);
-        while wakes.load(Ordering::SeqCst) < 3 && Instant::now() < deadline {
+        while wakes.load(Ordering::SeqCst) < 4 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(wakes.load(Ordering::SeqCst), 3);
-        // An unchanged status is not sent again.
-        thread::sleep(POLL * 2);
-        assert!(worker.events().next().is_none());
-        assert_eq!(wakes.load(Ordering::SeqCst), 3);
+        assert!(wakes.load(Ordering::SeqCst) >= 4);
+        // An unchanged status is not sent again, but each poll says the
+        // daemon is alive.
+        thread::sleep(POLL * 2 + Duration::from_millis(300));
+        let later: Vec<Event> = worker.events().collect();
+        assert!(later.len() >= 2, "{later:?}");
+        assert!(later.iter().all(|e| matches!(e, Event::Alive)), "{later:?}");
     }
 
     #[test]
@@ -411,7 +438,9 @@ mod tests {
         }
         worker
             .send(Command::Apply(SettingsChange { name: Some("-".into()), ..Default::default() }));
-        assert!(matches!(worker.next(), Event::Applied(Err(m)) if m == "bad name"));
+        assert!(
+            matches!(worker.next(), Event::Applied(Err(Unapplied::Refused(m))) if m == "bad name")
+        );
         worker.send(Command::Reload);
         assert!(matches!(worker.next(), Event::Settings(_)));
     }
@@ -423,9 +452,10 @@ mod tests {
         assert!(matches!(worker.next(), Event::Problem(Problem::NotRunning)));
         worker
             .send(Command::Apply(SettingsChange { name: Some("x".into()), ..Default::default() }));
-        assert!(
-            matches!(worker.next(), Event::Applied(Err(m)) if m == Problem::NotRunning.message())
-        );
+        assert!(matches!(
+            worker.next(),
+            Event::Applied(Err(Unapplied::NotSent(m))) if m == Problem::NotRunning.message()
+        ));
     }
 
     #[test]

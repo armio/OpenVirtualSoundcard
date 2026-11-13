@@ -157,6 +157,45 @@ pub struct DeviceStatus {
     /// ([`Settings::lock_remote_settings`]).
     #[serde(default)]
     pub remote_settings_locked: bool,
+    /// On both networks of a redundant Dante system, how the two networks
+    /// do; `None` on one network, and from a daemon before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redundancy: Option<Redundancy>,
+}
+
+/// The two networks of a redundant Dante system, as the device sees them.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Redundancy {
+    /// The interface on the secondary network (`en8`) and its address.
+    pub secondary_interface: String,
+    pub secondary_ip: String,
+    /// What is wrong with the secondary interface, in plain words, if
+    /// anything: its link is down, it is gone, the daemon must restart to
+    /// use it again.
+    pub secondary_problem: Option<String>,
+    /// Receive flows that run on both networks (from redundant
+    /// transmitters), and how many of them packets arrive for on each.
+    pub redundant_flows: u32,
+    pub receiving_on_primary: u32,
+    pub receiving_on_secondary: u32,
+    /// Whether the clock follows the leader on the secondary network,
+    /// because the primary network has none.
+    pub clock_on_secondary: bool,
+    /// Each network's packets since the engine started.
+    pub primary: NetworkPackets,
+    pub secondary: NetworkPackets,
+}
+
+/// One network's audio packets.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkPackets {
+    pub tx: u64,
+    /// Packets the network stack refused to send on this network.
+    pub tx_errors: u64,
+    pub rx: u64,
+    /// Packets missing from what arrived on this network: not lost to the
+    /// audio while the other network brought them.
+    pub rx_lost: u64,
 }
 
 /// One receive channel.
@@ -179,6 +218,10 @@ pub struct TxFlowStatus {
     pub receiver: Option<String>,
     /// Where the audio goes, `address:port`.
     pub destination: String,
+    /// Where it also goes on the secondary network, for a flow sent on
+    /// both networks of a redundant system.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary: Option<String>,
     /// The 1-based transmit channels it carries, 0 for an empty slot.
     pub channels: Vec<u16>,
 }
@@ -251,6 +294,11 @@ pub struct Settings {
     /// The network interface: a name (`en7`), an IPv4 address, or empty for
     /// the interface of the default route.
     pub interface: String,
+    /// Dante redundancy: the interface on the secondary network, a name
+    /// (`en8`) or an IPv4 address; empty for one network. Empty from a
+    /// daemon before it.
+    #[serde(default)]
+    pub secondary_interface: String,
     pub sample_rate: u32,
     /// Bit depth of the transmitted audio.
     pub bits_per_sample: u16,
@@ -275,6 +323,8 @@ pub struct SettingsChange {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interface: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secondary_interface: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sample_rate: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -398,6 +448,7 @@ mod tests {
             Response::Settings(Settings {
                 name: "m1".into(),
                 interface: "en7".into(),
+                secondary_interface: "en8".into(),
                 sample_rate: 48_000,
                 bits_per_sample: 24,
                 rx_channels: 8,
@@ -417,6 +468,12 @@ mod tests {
             encode_line(&Response::Applied { restart: Restart::Receive }),
             "{\"result\":\"applied\",\"restart\":\"receive\"}\n"
         );
+        // An older daemon's settings and status, without redundancy, read.
+        let old = "{\"result\":\"settings\",\"name\":\"m1\",\"interface\":\"en7\",\
+                   \"sample_rate\":48000,\"bits_per_sample\":24,\"rx_channels\":8,\
+                   \"tx_channels\":8,\"latency_ms\":4.0}";
+        let Response::Settings(s) = decode_line::<Response>(old).unwrap() else { panic!() };
+        assert_eq!(s.secondary_interface, "");
         // An older daemon's answer to a new latency still reads.
         assert_eq!(
             decode_line::<Response>("{\"result\":\"applied\",\"restart\":\"device\"}").unwrap(),

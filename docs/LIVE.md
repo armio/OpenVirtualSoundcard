@@ -169,7 +169,7 @@ the transmit latency stays the file's (`tx_latency_ms`, or else its
 ### The show lock
 
 Once the latency, sample rate, encoding and names are set at soundcheck, turn
-on the show lock in the app (Settings, "Lock settings from the network"). It
+on the show lock in the app (Settings, **Show lock**). It
 applies at once and interrupts nothing. While it is on, Dante Controller and
 other controllers cannot change OVSC's latency, sample rate, encoding, device
 name or channel names; routing stays open, and changes made in the app still
@@ -210,6 +210,13 @@ computer during a show.
 * Run no other Dante software on the show Mac. OVSC moves its ports out of
   the way of Audinate's ConMon service, but Dante Virtual Soundcard and OVSC
   must not both carry the show.
+* On a redundant Dante system, give the Mac a second wired interface on the
+  secondary network and set it as **Secondary network** (`[device]
+  secondary_interface`, see `docs/MACOS.md`). Flows with the console then
+  run on both networks: a pulled cable or a failed switch on either costs
+  no audio. Check the app's **Networks** section before the show: both
+  networks should bring every redundant flow, and the clock should follow
+  the primary.
 
 ## The Mac
 
@@ -218,6 +225,10 @@ computer during a show.
   `pmset -g assertions`.
 * Turn off what can stall the Mac mid-show: automatic updates, Time Machine,
   Spotlight indexing of external drives, and background apps.
+* Turn off **AirPlay Receiver** (System Settings, General, AirDrop &
+  Handoff), and send no audio to AirPlay speakers. AirPlay keeps its own PTP
+  clock on the ports OVSC's clock needs, and while it holds them OVSC cannot
+  join the Dante network (`docs/MACOS.md`, Ports and other Dante software).
 * Set the plug-in host to the device **Open Virtual Soundcard** for both
   input and output, at the console's sample rate.
 * Put a true-peak limiter last in every chain that feeds in-ears or the PA.
@@ -251,10 +262,11 @@ With the show session running at the show's buffer size:
 2. **Clock.** The app's Clock is **Locked**, its Leader is the console (or
    the Preferred Leader), and Dante Controller shows OVSC as a follower of
    the same leader. No other leader is reported.
-3. **Status.** The app's Audio light is green **Flowing**, the Status tab
-   shows no warnings, and every subscribed receive channel reads
-   **receiving**. The log's status line reads `healthy` (before its
-   `hal:` part).
+3. **Status.** While the host plays, the app's Audio tile is green
+   **Flowing** (grey **Idle** means no application uses the device: check
+   the host's audio settings), the Status tab shows no warnings, and every
+   subscribed receive channel reads **Receiving**. The log's status line
+   reads `healthy` (before its `hal:` part).
 4. **Returns.** Each return arrives at the console: check its meters, and that
    the console shows OVSC's flows without late packets.
 5. **Real-time.** The log has no line saying a thread "is not real-time"
@@ -301,6 +313,8 @@ any of them.
 | A leader whose time differs by more than 250 µs (or a jump of more than 2 ms) | Silence, 1.6 s typically, up to about 5.5 s, then one slip | The clock steps once and relocks. Core Audio's timeline stays continuous; the host is not disturbed. |
 | The leader's time jumps by 0.25 to 2 ms, same leader | Possibly dropouts on the returns, for up to about 15 s | The clock slews back at 0.1 ms per second instead of stepping, so audio keeps flowing, but the console may find returns late until the error is below its latency slack. Rare: it needs the leader's own time to jump (for example a leader re-syncing to an external reference). |
 | Sync packets delayed by congestion | Nothing | The clock may unlock; it keeps its frequency and slews back gently. Repeated unlocks mean the network needs PTP priority. |
+| Redundant system: the primary or the secondary network fails (a cable, a switch) | Nothing | Each redundant flow plays from the other network's copy. If the primary has no PTP leader for 2 s, the clock follows the leader on the secondary (it holds over meanwhile) and returns to the primary after 10 s of steady messages there. The app warns; flows with devices on one network only stop with the primary. |
+| Redundant system: the secondary interface's adapter is re-attached, or comes back with another address | Nothing | The engine is not restarted: audio goes on on the primary network. The warning says to restart the daemon, between songs, to use the secondary network again. |
 | Cable pulled and put back (same address) | Silence while unplugged, then audio returns | Receive flows that deliver nothing for 3 s are requested again; audio usually returns well under 2 s after the link does. The console requests its flows from OVSC again on its own timing. |
 | The Mac's address changes | A few seconds of silence; the returns may take longer | About 2 s after the change the network engine restarts on the new address; inputs return when the clock locks. The returns come back once the console requests OVSC's flows again, on its own timing (often several seconds, more while it finds the new address): test this with your console. With `interface = ""` it could pick Wi-Fi: name the interface. |
 | The console reboots | Silence until the console is back, and a few seconds more | OVSC stops the dead flows and requests them again. An unanswered request (after a 2 s wait) is retried within 1 s; a console that refuses while it boots is retried after 1 s, backing off to 5 s; one whose records are gone is looked up again every 2 to 4 s. Inputs can return several seconds after the console is ready. |
@@ -316,21 +330,29 @@ any of them.
 
 ## Health and warnings
 
-The app's header has three lights. **Audio** is the one to watch:
+The app's header has three tiles, Audio, Clock and Driver. **Audio** is the
+one to watch:
 
-| Audio light | Meaning | What to do |
+| Audio tile | Meaning | What to do |
 |---|---|---|
-| green **Flowing** | Audio can flow, and nothing audible went wrong in the last 30 s. | Nothing. |
+| green **Flowing** | An application plays through OVSC, and nothing audible went wrong in the last 30 s. | Nothing. |
+| grey **Idle** | No application uses OVSC: the returns carry silence. | Choose **Open Virtual Soundcard** as the host's input and output. |
 | amber **Dropouts** | Audio flows, but something audible happened in the last 30 s. | Read the warnings: they say what and what to do. |
-| amber **Stopped** | The driver holds the audio back: inputs and returns are silent. Usually for seconds while the clock settles or the engine restarts. | If it lasts, read the warnings (clock, engine). |
+| amber **Held back** | The driver holds the audio back: inputs and returns are silent, usually for a second or two while the clock settles. After 2 s it turns red **Down**. | If it lasts, read the warnings (clock, engine). |
 | red **Silent**, with Driver red **Failed** | The Core Audio driver hit an internal error and is silent until Core Audio restarts. | Run `sudo killall coreaudiod` (the app has a button to copy it), then restart the host's audio. All audio on the Mac stops for a few seconds. |
+| red **No driver**, **No network** or **Down** | Audio is down: Core Audio has not loaded the driver, the network engine is not running, or the daemon reports another outage. | Read the red panel under the header: it says what and what to do. |
+| red **Off**, **No answer** or **Lost** | The daemon is not running, does not answer, or the app lost its connection: OVSC is silent, or may be. | The app shows the command that starts the daemon. Check the console's meters. |
+| amber **Restarting** | The daemon restarts after a change from the app, until audio is back. | Wait 10 to 20 s; the app says when audio is back. |
 
-The Status tab lists warnings in plain words, red ones first. A red warning
-means audio is down now in at least one direction: a failed driver, Core
-Audio no longer calling the driver, the driver's gate closed for 2 s while
-an application plays, a stopped transmit engine (the daemon then restarts
-itself), a clock that has not locked, or a clock that lost its leader after
-the holdover. Amber warnings follow:
+While audio is down, a red **Audio is down** panel stays under the header
+on both tabs, the window's title starts with "Audio down", and the Dock icon
+bounces once if the window is in the background. The panel lists what the
+daemon reports as audio down now in at least one direction: a failed
+driver, Core Audio no longer calling the driver, the driver's gate closed
+for 2 s while an application plays, a stopped transmit engine (the daemon
+then restarts itself), a clock that has not locked, or a clock that lost
+its leader after the holdover. The Status tab lists the other warnings, in
+amber:
 
 * **Counters that rose** in the last 30 s, with how many and what to do:
   lost or late received packets (from the first one), early packets and
@@ -346,8 +368,10 @@ the holdover. Amber warnings follow:
   before audio stops; the clock relocking; a jump of the clock; a new clock
   leader; subscribed channels without audio for 10 s; a transmit thread
   without real-time priority; another device using this one's name.
-* **Controllers' changes** for 10 minutes, then under **Earlier** at the
-  bottom.
+
+Controllers' changes are not warnings: they have their own section at the
+bottom of the Status tab, **Changes from controllers**, with those older
+than 10 minutes greyed.
 
 The same warnings reach the log at
 `/Library/Logs/OpenVirtualSoundcard/ovsc.log`: `health: <warning>` (WARN)
@@ -434,6 +458,13 @@ These rest on code reading, Linux tests and simulation, not on hardware:
   host, and whether the host restarts its audio engine on it. The flows
   themselves are tested on Linux, the driver's configuration with a
   simulated host.
+* Dante redundancy: tested with two OVSC devices on loopback addresses on
+  Linux, and in unit tests (the merge of the two networks' packets, the
+  clock's failover, the interface watcher). The layouts of a flow on two
+  networks (the DBCP request, the 0x2200 and 0x3200 records) are inferred
+  from single-network captures: no capture of a redundant flow exists yet.
+  Check with your console that it subscribes on both networks, and pull
+  each network's cable during a soundcheck.
 * The macOS end-to-end test (`ci/macos/e2e-local.sh`, every scenario against
   the real Core Audio device and a test PTP master on the same Mac) passed on
   an M1 Mac with macOS 26.6. That covers the driver, the daemon and Core

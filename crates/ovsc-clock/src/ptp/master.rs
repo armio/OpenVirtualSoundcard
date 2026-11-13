@@ -107,6 +107,7 @@ impl TestMaster {
         }
         let endpoints = Endpoints {
             interface: config.interface,
+            secondary: None,
             group: config.multicast_group,
             event_port: config.event_port,
             general_port: config.general_port,

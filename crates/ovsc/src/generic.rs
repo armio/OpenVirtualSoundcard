@@ -34,7 +34,7 @@ use ovsc_soundcard::{Bridge, BridgeConfig, BridgeStats};
 use crate::config::{self, AppConfig, BackendKind, ClockSource};
 use crate::control::{self, Health};
 use crate::coreaudio::{RETRY_FIRST, next_retry_delay};
-use crate::netwatch::{self, Verdict};
+use crate::netwatch::Verdict;
 use crate::supervise::Supervision;
 use crate::{ClockStateLog, Stop, backend, status_line};
 
@@ -120,13 +120,12 @@ async fn run_engine(
     // was not seen as a change: apply it now. The backend follows it by
     // itself (`AudioIo::latency_samples`).
     engine.device.restart_rx();
-    let iface = &engine.device.info().iface;
-    let mut watch = sup.probe.watch(&iface.name, iface.ip);
+    let mut watch = sup.probe.watch_device(engine.device.info());
     loop {
         tokio::select! {
             r = stop.requested() => return Ok(Next::Stop(r?)),
             _ = status.tick() => {
-                let network = netwatch::status_note(watch.as_ref());
+                let network = watch.note();
                 info!(
                     "{}{network}; {}",
                     status_line(&engine.device, &engine.clock),
@@ -146,11 +145,9 @@ async fn run_engine(
                     &engine.clock,
                     started.elapsed(),
                 );
-                if let Some(w) = &mut watch {
-                    if let Verdict::Restart(why) = w.poll(sup.probe, &engine.clock) {
-                        warn!("{why}: restarting the network engine");
-                        return Ok(Next::RestartEngine);
-                    }
+                if let Verdict::Restart(why) = watch.poll(sup.probe, &engine.clock) {
+                    warn!("{why}: restarting the network engine");
+                    return Ok(Next::RestartEngine);
                 }
                 audio.supervise(&engine.device).await;
             }
@@ -249,6 +246,7 @@ impl Engine {
                 let mut ptp = PtpConfig::new(iface.ip, iface.mac);
                 ptp.event_port = cfg.clock.ptp_event_port;
                 ptp.general_port = cfg.clock.ptp_general_port;
+                ptp.secondary = config::ptp_secondary(&cfg.device);
                 let (follower, clock) =
                     PtpFollower::start(ptp).await.context("starting the PTP clock follower")?;
                 (clock, Some(follower))
