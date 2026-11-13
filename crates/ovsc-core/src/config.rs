@@ -325,7 +325,7 @@ pub(crate) fn parse_device_id(s: &str) -> Result<[u8; 8]> {
 }
 
 /// Resolves the configured interface to an IPv4 address.
-pub(crate) fn parse_interface_ip(s: &str) -> Option<Ipv4Addr> {
+pub fn parse_interface_ip(s: &str) -> Option<Ipv4Addr> {
     s.parse().ok()
 }
 

@@ -121,7 +121,7 @@ async fn run_engine(
     // itself (`AudioIo::latency_samples`).
     engine.device.restart_rx();
     let iface = &engine.device.info().iface;
-    let mut watch = sup.probe.watch(&iface.name, iface.ip);
+    let mut watch = sup.probe.watch(&iface.name, iface.ip, false);
     loop {
         tokio::select! {
             r = stop.requested() => return Ok(Next::Stop(r?)),

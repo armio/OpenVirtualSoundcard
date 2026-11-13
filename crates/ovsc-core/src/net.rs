@@ -75,8 +75,9 @@ pub fn pick_ipv4(addrs: &[Ipv4Addr], allow_link_local: bool) -> Option<Ipv4Addr>
 
 /// The address [`Interface::find_ready`] runs on, among `addrs` of the
 /// interface `name`: `chosen` if the person gave an IP, else
-/// [`pick_ipv4`], or why there is none yet.
-fn select_ip(
+/// [`pick_ipv4`], or why there is none yet ([`Error::NotReady`] when only a
+/// link-local one exists and is not allowed).
+pub fn select_ip(
     name: &str,
     addrs: &[Ipv4Addr],
     chosen: Option<Ipv4Addr>,
