@@ -576,6 +576,46 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A state file shaped like the ones a running device saves (a name, a
+    /// claim and two subscriptions, with made-up names) still loads with
+    /// both subscriptions intact: the address changes of the engine and the
+    /// version bump must not cost a device its routing.
+    #[test]
+    fn a_saved_state_with_two_subscriptions_loads_unchanged() {
+        let dir = dir("two-subscriptions");
+        let path = dir.join("state.toml");
+        std::fs::write(
+            &path,
+            "name = \"stage-mac\"\ntx_names = [\"Left\", \"Right\"]\nrx_names = []\n\
+             latency_ns = 5000000\n\n\
+             [[subscriptions]]\nrx_channel = 1\ntx_channel = \"01\"\ntx_device = \"mixer-a1b2c3\"\n\n\
+             [[subscriptions]]\nrx_channel = 2\ntx_channel = \"02\"\ntx_device = \"mixer-a1b2c3\"\n\n\
+             [claim]\nname = \"stage-mac\"\nmac = \"02:00:5e:00:53:01\"\n",
+        )
+        .unwrap();
+        let r = SavedState::recover(&path);
+        assert_eq!(r.problem, None);
+        assert!(r.intact);
+        assert_eq!(r.state.name.as_deref(), Some("stage-mac"));
+        assert_eq!(
+            r.state.subscriptions,
+            [
+                SavedSubscription {
+                    rx_channel: 1,
+                    tx_channel: "01".into(),
+                    tx_device: "mixer-a1b2c3".into()
+                },
+                SavedSubscription {
+                    rx_channel: 2,
+                    tx_channel: "02".into(),
+                    tx_device: "mixer-a1b2c3".into()
+                },
+            ]
+        );
+        assert_eq!(r.state.latency_ns, Some(5_000_000));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn no_file_is_a_first_start() {
         let dir = dir("first");
