@@ -1294,7 +1294,7 @@ mod tests {
         // The person chose this address: no wait, whatever the interface
         // holds (the script gives it only a link-local address).
         run_scripted("127.0.0.1", 24860, given_ip::sup(), |running| async move {
-            wait_for("the engine", || running()).await;
+            wait_for("the engine", &running).await;
         })
         .await;
         let text = logs.text();
@@ -1308,7 +1308,7 @@ mod tests {
         let (logs, _guard) = capture();
         late::UPTIME_S.store(121, Ordering::SeqCst);
         run_scripted(loopback_name(), 24870, late::sup(), |running| async move {
-            wait_for("the engine", || running()).await;
+            wait_for("the engine", &running).await;
         })
         .await;
         let text = logs.text();
@@ -1334,7 +1334,7 @@ mod tests {
             // at the next try.
             dhcp::UPTIME_S.store(60, Ordering::SeqCst);
             dhcp::ROUTABLE.store(true, Ordering::SeqCst);
-            wait_for("the engine", || running()).await;
+            wait_for("the engine", &running).await;
         })
         .await;
         let text = logs.text();
