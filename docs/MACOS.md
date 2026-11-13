@@ -282,6 +282,19 @@ those ports too: stop them while OpenVirtualSoundcard runs. A configuration writ
 `[device.ports]`; the log then says `cannot bind UDP port 8800: Address
 already in use`. Add the section and restart the daemon.
 
+The clock follows the Dante leader with PTP on UDP 319 and 320, which no
+setting moves: every Dante device uses them. macOS's AirPlay keeps its own
+PTP clock on the same ports. The daemon opens them to share, but macOS lets
+two programs share a port only when both ask to, and AirPlay may hold them
+for itself. Then the engine cannot start: the app shows the engine as down,
+and the log says `cannot start the engine: starting the PTP clock follower:
+cannot bind UDP port 319: Address already in use`, naming AirPlay as the
+likely holder, and retries every few seconds. Turn off **AirPlay Receiver**
+(System Settings, General, AirDrop & Handoff), and do not send this Mac's
+audio to AirPlay speakers while OpenVirtualSoundcard runs: the engine starts
+at its next try. `sudo lsof -nP -iUDP:319 -iUDP:320` shows which programs
+hold the ports.
+
 ### Channels, sample rate and latency
 
 | Key | Values |
@@ -905,6 +918,11 @@ The configuration, the state and the logs stay for a later install; add
 3. Check the unified log (above) for the driver's messages.
    `ci/macos/diagnostics.sh` also shows what `amfid` logged about the bundle
    ([Gatekeeper and signing](#gatekeeper-and-signing)).
+
+4. The device appears but not on the network (the app shows the engine as
+   down): the app and the log give the reason. `cannot bind UDP port 319`
+   means another program holds the PTP ports, usually AirPlay (see [Ports
+   and other Dante software](#ports-and-other-dante-software)).
 
 ### The device is silent
 

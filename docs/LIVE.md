@@ -225,6 +225,10 @@ computer during a show.
   `pmset -g assertions`.
 * Turn off what can stall the Mac mid-show: automatic updates, Time Machine,
   Spotlight indexing of external drives, and background apps.
+* Turn off **AirPlay Receiver** (System Settings, General, AirDrop &
+  Handoff), and send no audio to AirPlay speakers. AirPlay keeps its own PTP
+  clock on the ports OVSC's clock needs, and while it holds them OVSC cannot
+  join the Dante network (`docs/MACOS.md`, Ports and other Dante software).
 * Set the plug-in host to the device **Open Virtual Soundcard** for both
   input and output, at the console's sample rate.
 * Put a true-peak limiter last in every chain that feeds in-ears or the PA.
