@@ -163,6 +163,23 @@ address, the daemon keeps running and retries every few seconds (2 s, backing
 off to 5 s), logging `cannot start the engine: ...; retrying until it
 starts`. The device stays present and silent meanwhile.
 
+When the interface is a name or empty, the daemon also waits for a routable
+address after boot. An interface that has only a self-assigned 169.254
+address is not ready until the Mac has been up for 120 s (`sysctl
+kern.boottime`): DHCP usually answers before that, and an engine started on
+the stand-in would have to be moved. The wait is logged once (`en0 has only
+the link-local address 169.254.x.y; waiting for a routable one (DHCP) until
+120 s after boot`) and the daemon keeps serving the driver meanwhile. After
+120 s the link-local address is accepted, so a direct cable with no DHCP
+still works; it starts up to two minutes after boot, and the log says `no
+routable address on en0 120 s after boot: using the link-local ... (direct
+link)`. A daemon that starts later than that (a restart) never waits. When
+`interface` is an IPv4 address, neither the wait nor the preference below
+applies: that address is used as given.
+
+An interface with a routable and a link-local address gets the routable one
+(`ovsc discover` and `ovsc info` pick it too).
+
 ### The device name
 
 Dante Controller lists devices by name, and subscriptions find their
@@ -884,6 +901,12 @@ attached and reads silence meanwhile) when:
 * the interface was attached again under a new index;
 * the interface no longer has the engine's address: a DHCP lease replacing
   a self-assigned 169.254 address, or a router handing out a new lease;
+* the engine runs on a link-local address (a direct cable, or DHCP slower
+  than the boot wait) and the interface now has a routable one, even if the
+  link-local one is still listed (`en0 now has 192.0.2.44: leaving the
+  link-local 169.254.x.y: restarting the network engine`). Not when
+  `interface` is an IP address: every restart would bind that address
+  again;
 * the interface got its address back after a cable pull, but the clock has
   not locked 15 s later.
 

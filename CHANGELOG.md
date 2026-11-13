@@ -10,6 +10,14 @@ The first public version, not released yet.
 
 ### Added
 
+- macOS: after boot, the daemon waits up to 120 s for a routable address
+  when the interface (a name, or empty) has only a self-assigned 169.254
+  one, so the engine does not start on a stand-in that DHCP replaces a
+  minute later. After that, link-local is accepted (a direct cable needs
+  it). An interface given as an IP address is never waited on.
+- The engine leaves a link-local address when a routable one appears on
+  its interface, even if the link-local one stays listed (not when
+  `interface` is an IP address).
 - A Dante-compatible device engine in Rust: mDNS discovery, the ARC, CMC,
   conmon and flow-control protocols, unicast audio flows both ways, and an
   in-process PTPv1 clock follower with kernel receive timestamps on macOS.

@@ -769,7 +769,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "ovsc"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -792,7 +792,7 @@ dependencies = [
 
 [[package]]
 name = "ovsc-clock"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "ovsc-shm",
@@ -805,7 +805,7 @@ dependencies = [
 
 [[package]]
 name = "ovsc-control"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -813,7 +813,7 @@ dependencies = [
 
 [[package]]
 name = "ovsc-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arc-swap",
  "hex",
@@ -836,7 +836,7 @@ dependencies = [
 
 [[package]]
 name = "ovsc-hal"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arc-swap",
  "libc",
@@ -846,7 +846,7 @@ dependencies = [
 
 [[package]]
 name = "ovsc-hal-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "ovsc-clock",
@@ -862,7 +862,7 @@ dependencies = [
 
 [[package]]
 name = "ovsc-ipc"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cc",
  "libc",
@@ -871,7 +871,7 @@ dependencies = [
 
 [[package]]
 name = "ovsc-proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hex",
  "thiserror 2.0.21",
@@ -879,11 +879,11 @@ dependencies = [
 
 [[package]]
 name = "ovsc-shm"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "ovsc-soundcard"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cpal",
  "ovsc-clock",

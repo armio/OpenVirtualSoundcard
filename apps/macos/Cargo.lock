@@ -1973,7 +1973,7 @@ dependencies = [
 
 [[package]]
 name = "ovsc-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "eframe",
  "ovsc-control",
@@ -1981,7 +1981,7 @@ dependencies = [
 
 [[package]]
 name = "ovsc-control"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
