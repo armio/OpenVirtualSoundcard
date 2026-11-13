@@ -405,7 +405,10 @@ async fn start_engine(
         let allow_link_local = ctx.sup.probe.uptime().is_none_or(link_local_allowed);
         let started = match ctx.sup.probe.find_ready(spec, allow_link_local) {
             Ok(iface) => {
+                // The device runs on the interface chosen here, not on one it
+                // looks up itself a moment later.
                 let on = iface.clone();
+                let iface = ctx.sup.probe.device_interface(iface);
                 Engine::start_with(iface, ctx.cfg, ctx.region, carry.clone())
                     .await
                     .map(|engine| (engine, on))
@@ -663,7 +666,7 @@ impl Engine {
             ClockSource::System => anyhow::bail!("the driver cannot follow the system clock"),
         };
         clock.set_mirror(Some(ShmClockMirror::new(region.clone())))?;
-        let device = match Self::start_device(cfg, region, &clock, carry).await {
+        let device = match Self::start_device(iface, cfg, region, &clock, carry).await {
             Ok(device) => device,
             Err(e) => {
                 if let Some(f) = follower {
@@ -685,6 +688,7 @@ impl Engine {
     /// Starts the device on `region`'s rings, following `clock`, from what
     /// a previous device left (`carry`), if any.
     async fn start_device(
+        iface: Interface,
         cfg: &AppConfig,
         region: &Arc<HalRegion>,
         clock: &MediaClock,
@@ -707,6 +711,7 @@ impl Engine {
             remote_changes,
             state,
             announced,
+            iface: Some(iface),
             ..Default::default()
         };
         Ok(Device::start_with_options(d.clone(), clock.clone(), options).await?)
@@ -1205,6 +1210,12 @@ mod tests {
                 /// Whether the interface has a routable address next to its
                 /// link-local one.
                 pub static ROUTABLE: AtomicBool = AtomicBool::new(false);
+                /// The addresses the engine's device was started on.
+                pub static STARTED_ON: Mutex<Vec<Ipv4Addr>> = Mutex::new(Vec::new());
+
+                fn started_on(iface: &Interface) {
+                    STARTED_ON.lock().unwrap().push(iface.ip);
+                }
 
                 fn addrs() -> Vec<Ipv4Addr> {
                     let mut a = vec![Ipv4Addr::new(169, 254, 1, 1)];
@@ -1224,7 +1235,7 @@ mod tests {
 
                 pub fn sup() -> Supervision {
                     static NEVER: AtomicBool = AtomicBool::new(false);
-                    let script = crate::netwatch::Script { look, addrs, uptime };
+                    let script = crate::netwatch::Script { look, addrs, uptime, started_on };
                     Supervision { probe: Probe::Scripted(script), panicked: &NEVER }
                 }
             }
@@ -1319,6 +1330,9 @@ mod tests {
         );
         assert_eq!(text.matches(&info).count(), 1, "{text}");
         assert!(!text.contains("waiting for a routable one"), "{text}");
+        // The device itself was handed the link-local address.
+        let on = late::STARTED_ON.lock().unwrap().clone();
+        assert_eq!(on, [std::net::Ipv4Addr::new(169, 254, 1, 1)], "{text}");
     }
 
     scripted!(dhcp);
@@ -1342,6 +1356,10 @@ mod tests {
         assert_eq!(text.matches(&warning).count(), 1, "{text}");
         assert_eq!(text.matches("engine started at attempt").count(), 1, "{text}");
         assert!(!text.contains("using the link-local"), "{text}");
+        // The device was handed the routable address, once, and never the
+        // link-local one.
+        let on = dhcp::STARTED_ON.lock().unwrap().clone();
+        assert_eq!(on, [std::net::Ipv4Addr::LOCALHOST], "{text}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

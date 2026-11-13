@@ -115,6 +115,10 @@ pub struct StartOptions {
     /// that device's claim of the name, made on this interface (see
     /// [`crate::SavedClaim`]).
     pub announced: Option<String>,
+    /// Run on this interface instead of looking up
+    /// [`DeviceConfig::interface`]: the caller already chose it (and may have
+    /// waited for it), and a second lookup could pick another address.
+    pub iface: Option<Interface>,
 }
 
 /// Packet counters since the device started.
@@ -210,7 +214,10 @@ impl Device {
                 warn!("ignoring the saved latency of {ms} ms");
             }
         }
-        let iface = Interface::find(&config.interface)?;
+        let iface = match options.iface {
+            Some(iface) => iface,
+            None => Interface::find(&config.interface)?,
+        };
         let info = DeviceInfo::new(&config, iface)?;
         let state = initial_state(&config, &info, saved, options.announced);
         let ip = info.iface.ip;

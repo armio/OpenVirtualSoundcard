@@ -91,6 +91,8 @@ pub struct Script {
     pub addrs: fn() -> Vec<Ipv4Addr>,
     /// How long the system has been up.
     pub uptime: fn() -> Option<Duration>,
+    /// Told the interface the engine's device is started on.
+    pub started_on: fn(&Interface),
 }
 
 impl Probe {
@@ -126,6 +128,24 @@ impl Probe {
             Probe::Fake(_) => boot_uptime(),
             #[cfg(test)]
             Probe::Scripted(s) => (s.uptime)(),
+        }
+    }
+
+    /// The interface to hand the engine's device, for the `chosen` one. A
+    /// scripted address does not exist on the machine running the tests, so
+    /// the device runs on the loopback address there, after the script is
+    /// told what was chosen.
+    pub fn device_interface(self, chosen: Interface) -> Interface {
+        match self {
+            #[cfg(test)]
+            Probe::Scripted(s) => {
+                (s.started_on)(&chosen);
+                match Interface::find("127.0.0.1") {
+                    Ok(lo) if !chosen.ip.is_loopback() => Interface { name: chosen.name, ..lo },
+                    _ => chosen,
+                }
+            }
+            _ => chosen,
         }
     }
 

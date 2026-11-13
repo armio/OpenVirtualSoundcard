@@ -392,3 +392,17 @@ async fn a_subscription_to_a_shared_name_goes_to_the_other_device() {
     soon(dev.shutdown()).await;
     soon(other.shutdown()).await;
 }
+
+/// A device runs on the interface it is handed, not on the one its
+/// configuration names: the daemon picks the interface once (waiting for a
+/// routable address after boot) and the device must not look again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_runs_on_the_interface_it_is_handed() {
+    let mut cfg = config(&unique("handed"), 25720, 49);
+    cfg.interface = "no-such-if0".into();
+    let iface = Interface::find("127.0.0.1").unwrap();
+    let options = StartOptions { iface: Some(iface.clone()), ..Default::default() };
+    let dev = Device::start_with_options(cfg, system_clock(), options).await.unwrap();
+    assert_eq!(dev.info().iface, iface);
+    soon(dev.shutdown()).await;
+}

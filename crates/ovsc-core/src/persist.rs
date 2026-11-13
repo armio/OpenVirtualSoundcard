@@ -576,9 +576,10 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A state file shaped like the ones a running device saves (a name, a
-    /// claim and two subscriptions, with made-up names) still loads with
-    /// both subscriptions intact: the address changes of the engine and the
+    /// A state file shaped like the ones the build before the name claim
+    /// saved (a name, channel names, a latency and two subscriptions, with
+    /// made-up names; no `[claim]` table) still loads with both
+    /// subscriptions intact: the address changes of the engine and the
     /// version bump must not cost a device its routing.
     #[test]
     fn a_saved_state_with_two_subscriptions_loads_unchanged() {
@@ -589,8 +590,7 @@ mod tests {
             "name = \"stage-mac\"\ntx_names = [\"Left\", \"Right\"]\nrx_names = []\n\
              latency_ns = 5000000\n\n\
              [[subscriptions]]\nrx_channel = 1\ntx_channel = \"01\"\ntx_device = \"mixer-a1b2c3\"\n\n\
-             [[subscriptions]]\nrx_channel = 2\ntx_channel = \"02\"\ntx_device = \"mixer-a1b2c3\"\n\n\
-             [claim]\nname = \"stage-mac\"\nmac = \"02:00:5e:00:53:01\"\n",
+             [[subscriptions]]\nrx_channel = 2\ntx_channel = \"02\"\ntx_device = \"mixer-a1b2c3\"\n",
         )
         .unwrap();
         let r = SavedState::recover(&path);
@@ -613,6 +613,7 @@ mod tests {
             ]
         );
         assert_eq!(r.state.latency_ns, Some(5_000_000));
+        assert_eq!(r.state.claim, None);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
