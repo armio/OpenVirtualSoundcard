@@ -12,6 +12,10 @@
 //!   drops the multicast memberships with it: PTP and mDNS go deaf, the
 //!   clock is lost some 35 s later and the device goes silent for good.
 //!
+//! * when the engine started on a link-local address (a direct cable, or
+//!   DHCP slower than the boot wait) and a routable one appears, even next
+//!   to it: the self-assigned address is only a stand-in.
+//!
 //! So the engine loops look at the interface every second
 //! ([`InterfaceWatch::check`]) and restart the whole engine (clock included:
 //! the PTP follower is bound to the address too) when it came back after
@@ -27,6 +31,9 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use ovsc_clock::{ClockState, MediaClock};
+#[cfg(test)]
+use ovsc_core::net::select_ip;
+use ovsc_core::net::{Interface, boot_uptime, pick_ipv4};
 
 /// How long the clock may stay unlocked after the interface got its address
 /// back before the engine restarts anyway: the multicast memberships may
@@ -69,15 +76,34 @@ pub enum Probe {
     /// Tests: a made-up view of the interfaces, watched whatever they are.
     #[cfg(test)]
     Fake(fn(&str) -> io::Result<Option<Seen>>),
+    /// Tests: made-up addresses and uptime for the engine's start as well.
+    #[cfg(test)]
+    Scripted(Script),
+}
+
+/// A made-up system for [`Probe::Scripted`].
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub struct Script {
+    /// What [`Probe::look`] says.
+    pub look: fn(&str) -> io::Result<Option<Seen>>,
+    /// The IPv4 addresses the interface has when the engine starts.
+    pub addrs: fn() -> Vec<Ipv4Addr>,
+    /// How long the system has been up.
+    pub uptime: fn() -> Option<Duration>,
+    /// Told the interface the engine's device is started on.
+    pub started_on: fn(&Interface),
 }
 
 impl Probe {
     /// A watch of the interface `name` the engine started on at `ip`, if
-    /// it is to be watched.
-    pub fn watch(self, name: &str, ip: Ipv4Addr) -> Option<InterfaceWatch> {
+    /// it is to be watched. `leave_link_local`: restart when the engine is
+    /// on a link-local address and a routable one appears (see
+    /// [`InterfaceWatch::leaving_link_local`]).
+    pub fn watch(self, name: &str, ip: Ipv4Addr, leave_link_local: bool) -> Option<InterfaceWatch> {
         match self {
             Probe::System if ip.is_loopback() || ip.is_unspecified() => None,
-            _ => Some(InterfaceWatch::new(name, ip)),
+            _ => Some(InterfaceWatch::new(name, ip).leaving_link_local(leave_link_local)),
         }
     }
 
@@ -88,6 +114,65 @@ impl Probe {
             Probe::System => look(name),
             #[cfg(test)]
             Probe::Fake(f) => f(name),
+            #[cfg(test)]
+            Probe::Scripted(s) => (s.look)(name),
+        }
+    }
+
+    /// How long the system has been up, if it says (see
+    /// [`ovsc_core::net::boot_uptime`]).
+    pub fn uptime(self) -> Option<Duration> {
+        match self {
+            Probe::System => boot_uptime(),
+            #[cfg(test)]
+            Probe::Fake(_) => boot_uptime(),
+            #[cfg(test)]
+            Probe::Scripted(s) => (s.uptime)(),
+        }
+    }
+
+    /// The interface to hand the engine's device, for the `chosen` one. A
+    /// scripted address does not exist on the machine running the tests, so
+    /// the device runs on the loopback address there, after the script is
+    /// told what was chosen.
+    pub fn device_interface(self, chosen: Interface) -> Interface {
+        match self {
+            #[cfg(test)]
+            Probe::Scripted(s) => {
+                (s.started_on)(&chosen);
+                match Interface::find("127.0.0.1") {
+                    Ok(lo) if !chosen.ip.is_loopback() => Interface { name: chosen.name, ..lo },
+                    _ => chosen,
+                }
+            }
+            _ => chosen,
+        }
+    }
+
+    /// The interface the engine is to start on, see
+    /// [`Interface::find_ready`].
+    pub fn find_ready(self, spec: &str, allow_link_local: bool) -> ovsc_core::Result<Interface> {
+        match self {
+            Probe::System => Interface::find_ready(spec, allow_link_local),
+            #[cfg(test)]
+            Probe::Fake(_) => Interface::find_ready(spec, allow_link_local),
+            #[cfg(test)]
+            Probe::Scripted(s) => {
+                let ip = select_ip(
+                    spec,
+                    &(s.addrs)(),
+                    ovsc_core::config::parse_interface_ip(spec),
+                    allow_link_local,
+                )?;
+                Ok(Interface {
+                    name: spec.to_owned(),
+                    ip,
+                    netmask: Ipv4Addr::new(255, 255, 0, 0),
+                    gateway: Ipv4Addr::UNSPECIFIED,
+                    mac: [0; 6],
+                    link_speed_mbps: 1000,
+                })
+            }
         }
     }
 }
@@ -111,6 +196,10 @@ pub struct InterfaceWatch {
     /// two checks in a row, so a passing glitch of the system's view of the
     /// interfaces does not cost an engine restart.
     pending: Option<String>,
+    /// Restart when the engine is on a link-local address and the
+    /// interface now has a routable one, even if the link-local one is
+    /// still listed.
+    leave_link_local: bool,
 }
 
 impl InterfaceWatch {
@@ -123,7 +212,18 @@ impl InterfaceWatch {
             lost: false,
             back_at: None,
             pending: None,
+            leave_link_local: false,
         }
+    }
+
+    /// Whether the engine is to leave a link-local address for a routable
+    /// one that appears next to it. Only for an engine that follows its
+    /// interface: with an IP address as the configured `interface` every
+    /// restart binds that address again, so the rule would restart the
+    /// engine for good.
+    pub fn leaving_link_local(mut self, on: bool) -> InterfaceWatch {
+        self.leave_link_local = on;
+        self
     }
 
     /// What is wrong with the interface now, if anything, for the status.
@@ -213,6 +313,14 @@ impl InterfaceWatch {
                 self.ip,
                 now.join(", ")
             ));
+        }
+        if self.leave_link_local && self.ip.is_link_local() {
+            if let Some(routable) = pick_ipv4(&seen.ipv4, false) {
+                return Some(format!(
+                    "{name} now has {routable}: leaving the link-local {}",
+                    self.ip
+                ));
+            }
         }
         if self.lost {
             info!("the network interface {name} has its address {} back", self.ip);
@@ -412,8 +520,8 @@ mod tests {
 
     #[test]
     fn loopback_is_not_watched_but_real_interfaces_are() {
-        assert!(Probe::System.watch("lo", Ipv4Addr::LOCALHOST).is_none());
-        assert!(Probe::System.watch("en7", IP).is_some());
+        assert!(Probe::System.watch("lo", Ipv4Addr::LOCALHOST, false).is_none());
+        assert!(Probe::System.watch("en7", IP, false).is_some());
     }
 
     #[cfg(unix)]
@@ -424,5 +532,78 @@ mod tests {
         assert!(seen.index > 0);
         assert!(seen.ipv4.contains(&Ipv4Addr::LOCALHOST), "{seen:?}");
         assert_eq!(look("no-such-interface0").unwrap(), None);
+    }
+
+    const ROUTABLE: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 44);
+
+    /// Like [`run`], with the watch of an engine that follows the
+    /// interface's address (`interface` is a name or empty, not an IP).
+    fn run_following(looks: &[(Option<Seen>, bool)]) -> Vec<Verdict> {
+        let mut w = InterfaceWatch::new("en7", IP).leaving_link_local(true);
+        let start = Instant::now();
+        looks
+            .iter()
+            .enumerate()
+            .map(|(i, (s, locked))| {
+                w.check(s.as_ref(), *locked, start + Duration::from_secs(i as u64))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_engine_on_link_local_leaves_it_when_a_routable_address_appears() {
+        // The link-local address stays listed next to the new one.
+        let v = run_following(&[
+            (seen(4, &[IP]), true),
+            (seen(4, &[IP, ROUTABLE]), true),
+            (seen(4, &[IP, ROUTABLE]), true),
+            (seen(4, &[IP, ROUTABLE]), true),
+        ]);
+        assert_eq!(restarts(&v), [2], "{v:?}");
+        let Verdict::Restart(why) = &v[2] else { unreachable!() };
+        assert_eq!(why, "en7 now has 192.0.2.44: leaving the link-local 169.254.10.20");
+    }
+
+    #[test]
+    fn one_look_at_a_routable_address_is_not_enough() {
+        let v = run_following(&[
+            (seen(4, &[IP]), true),
+            (seen(4, &[IP, ROUTABLE]), true),
+            (seen(4, &[IP]), true),
+            (seen(4, &[IP]), true),
+        ]);
+        assert!(restarts(&v).is_empty(), "{v:?}");
+    }
+
+    #[test]
+    fn an_engine_on_link_local_stays_while_nothing_new_appears() {
+        let v = run_following(&vec![(seen(4, &[IP]), true); 10]);
+        assert!(restarts(&v).is_empty(), "{v:?}");
+    }
+
+    #[test]
+    fn an_engine_given_a_link_local_ip_is_not_moved() {
+        // `interface` is that IP: every restart would bind it again.
+        let v = run(&vec![(seen(4, &[IP, ROUTABLE]), true); 10]);
+        assert!(restarts(&v).is_empty(), "{v:?}");
+    }
+
+    #[test]
+    fn an_engine_on_a_routable_address_ignores_an_extra_link_local_one() {
+        let mut w = InterfaceWatch::new("en7", ROUTABLE).leaving_link_local(true);
+        let start = Instant::now();
+        for i in 0..10 {
+            let s = seen(4, &[ROUTABLE, IP]);
+            let v = w.check(s.as_ref(), true, start + Duration::from_secs(i));
+            assert_eq!(v, Verdict::Keep);
+        }
+    }
+
+    #[test]
+    fn the_watch_is_told_whether_to_follow_the_address() {
+        let w = Probe::System.watch("en7", IP, true).unwrap();
+        assert!(w.leave_link_local);
+        let w = Probe::System.watch("en7", IP, false).unwrap();
+        assert!(!w.leave_link_local);
     }
 }

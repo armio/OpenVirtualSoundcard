@@ -2,6 +2,7 @@
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+use std::time::Duration;
 
 use socket2::{Domain, Protocol, Socket, Type};
 
@@ -19,10 +20,95 @@ pub struct Interface {
     pub link_speed_mbps: u16,
 }
 
+/// How long after boot an interface that only has a link-local (169.254.0.0/16)
+/// address is still "not ready": DHCP usually answers within that time, and
+/// an engine started on a provisional address has to be moved later.
+pub const LINK_LOCAL_AFTER_BOOT_S: u64 = 120;
+
+/// Whether the engine may start on a link-local address when the system has
+/// been up for `uptime`. A direct cable with no DHCP keeps working; it only
+/// starts up to [`LINK_LOCAL_AFTER_BOOT_S`] seconds after boot.
+pub fn link_local_allowed(uptime: Duration) -> bool {
+    uptime >= Duration::from_secs(LINK_LOCAL_AFTER_BOOT_S)
+}
+
+/// How long the system has been up, if it says. Only macOS is asked
+/// (`sysctl kern.boottime`); elsewhere, and when the system does not say,
+/// `None` (the engine does not wait).
+#[cfg(target_vendor = "apple")]
+pub fn boot_uptime() -> Option<Duration> {
+    let mut tv = libc::timeval { tv_sec: 0, tv_usec: 0 };
+    let mut len = std::mem::size_of::<libc::timeval>();
+    // SAFETY: a NUL-terminated name and a buffer of `len` bytes for a timeval.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.boottime".as_ptr(),
+            (&mut tv as *mut libc::timeval).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len != std::mem::size_of::<libc::timeval>() || tv.tv_sec <= 0 {
+        return None;
+    }
+    let booted = std::time::UNIX_EPOCH + Duration::new(tv.tv_sec as u64, 0);
+    std::time::SystemTime::now().duration_since(booted).ok()
+}
+
+/// See the macOS version.
+#[cfg(not(target_vendor = "apple"))]
+pub fn boot_uptime() -> Option<Duration> {
+    None
+}
+
+/// The address to run on among `addrs`: the first one outside
+/// 169.254.0.0/16; if there is none and `allow_link_local`, the first
+/// link-local one; else none.
+pub fn pick_ipv4(addrs: &[Ipv4Addr], allow_link_local: bool) -> Option<Ipv4Addr> {
+    addrs
+        .iter()
+        .find(|a| !a.is_link_local())
+        .or_else(|| if allow_link_local { addrs.first() } else { None })
+        .copied()
+}
+
+/// The address [`Interface::find_ready`] runs on, among `addrs` of the
+/// interface `name`: `chosen` if the person gave an IP, else
+/// [`pick_ipv4`], or why there is none yet ([`Error::NotReady`] when only a
+/// link-local one exists and is not allowed).
+pub fn select_ip(
+    name: &str,
+    addrs: &[Ipv4Addr],
+    chosen: Option<Ipv4Addr>,
+    allow_link_local: bool,
+) -> Result<Ipv4Addr> {
+    if let Some(ip) = chosen {
+        return Ok(ip);
+    }
+    pick_ipv4(addrs, allow_link_local).ok_or_else(|| match addrs.first() {
+        None => Error::Config(format!("interface {name} has no IPv4 address")),
+        Some(first) => Error::NotReady(format!(
+            "{name} has only the link-local address {first}; waiting for a routable one \
+             (DHCP) until {LINK_LOCAL_AFTER_BOOT_S} s after boot"
+        )),
+    })
+}
+
 impl Interface {
     /// Finds the interface named `spec`, the interface holding the IPv4
     /// address `spec`, or (if `spec` is empty) the default-route interface.
+    /// An interface with a routable and a link-local address gets the
+    /// routable one; one with only a link-local address gets that.
     pub fn find(spec: &str) -> Result<Self> {
+        Self::find_ready(spec, true)
+    }
+
+    /// Like [`Interface::find`], but with `allow_link_local` false an
+    /// interface that has only link-local addresses is not ready:
+    /// [`Error::NotReady`]. Ignored when `spec` is an IP address: the person
+    /// chose that address.
+    pub fn find_ready(spec: &str, allow_link_local: bool) -> Result<Self> {
         let interfaces = netdev::get_interfaces();
         let iface = if spec.is_empty() {
             netdev::get_default_interface()
@@ -47,13 +133,8 @@ impl Interface {
                 .ok_or_else(|| Error::Config(format!("no network interface named {spec:?}")))?
         };
 
-        let net = iface.ipv4.first().ok_or_else(|| {
-            Error::Config(format!("interface {} has no IPv4 address", iface.name))
-        })?;
-        let ip = match parse_interface_ip(spec) {
-            Some(ip) => ip,
-            None => net.addr(),
-        };
+        let addrs: Vec<Ipv4Addr> = iface.ipv4.iter().map(|n| n.addr()).collect();
+        let ip = select_ip(&iface.name, &addrs, parse_interface_ip(spec), allow_link_local)?;
         let netmask = iface
             .ipv4
             .iter()
@@ -331,5 +412,66 @@ mod tests {
         let port = first.local_addr().unwrap().port();
         let e = bind_udp(Ipv4Addr::LOCALHOST, port).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::AddrInUse);
+    }
+
+    const LL: Ipv4Addr = Ipv4Addr::new(169, 254, 7, 9);
+    const ROUTABLE: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 44);
+
+    #[test]
+    fn pick_ipv4_takes_a_link_local_address_only_when_allowed() {
+        assert_eq!(pick_ipv4(&[LL], true), Some(LL));
+        assert_eq!(pick_ipv4(&[LL], false), None);
+    }
+
+    #[test]
+    fn pick_ipv4_prefers_the_routable_address_in_either_order() {
+        for allow in [true, false] {
+            assert_eq!(pick_ipv4(&[LL, ROUTABLE], allow), Some(ROUTABLE));
+            assert_eq!(pick_ipv4(&[ROUTABLE, LL], allow), Some(ROUTABLE));
+            assert_eq!(pick_ipv4(&[ROUTABLE], allow), Some(ROUTABLE));
+            assert_eq!(pick_ipv4(&[], allow), None);
+        }
+    }
+
+    #[test]
+    fn link_local_is_allowed_from_120_s_after_boot() {
+        assert!(!link_local_allowed(Duration::ZERO));
+        assert!(!link_local_allowed(Duration::from_secs(119)));
+        assert!(link_local_allowed(Duration::from_secs(120)));
+        assert!(link_local_allowed(Duration::from_secs(86_400)));
+    }
+
+    #[test]
+    fn find_prefers_the_routable_address_when_both_are_listed() {
+        // `Interface::find` is `find_ready` with link-local allowed.
+        assert_eq!(select_ip("en9", &[LL, ROUTABLE], None, true).unwrap(), ROUTABLE);
+        assert_eq!(select_ip("en9", &[ROUTABLE, LL], None, true).unwrap(), ROUTABLE);
+        assert_eq!(select_ip("en9", &[LL], None, true).unwrap(), LL);
+    }
+
+    #[test]
+    fn a_link_local_only_interface_is_not_ready_until_allowed() {
+        let e = select_ip("en9", &[LL], None, false).unwrap_err();
+        assert!(matches!(e, Error::NotReady(_)), "{e:?}");
+        assert_eq!(
+            e.to_string(),
+            "en9 has only the link-local address 169.254.7.9; waiting for a routable one (DHCP) until 120 s after boot"
+        );
+        assert!(matches!(select_ip("en9", &[], None, false), Err(Error::Config(_))));
+        // The person's own address is never waited for.
+        assert_eq!(select_ip("en9", &[LL], Some(LL), false).unwrap(), LL);
+    }
+
+    #[test]
+    fn find_ready_with_an_ip_ignores_the_link_local_rule() {
+        let iface = Interface::find_ready("127.0.0.1", false).unwrap();
+        assert_eq!(iface.ip, Ipv4Addr::LOCALHOST);
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn the_boot_uptime_is_read_on_macos() {
+        let up = boot_uptime().expect("kern.boottime");
+        assert!(up > Duration::from_secs(1), "{up:?}");
     }
 }

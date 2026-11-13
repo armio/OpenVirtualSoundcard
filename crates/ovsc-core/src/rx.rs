@@ -169,7 +169,7 @@ fn classify(e: &Error) -> (SubscriptionStatus, Retry) {
         Error::Refused(dbcp::error::SAMPLE_RATE_MISMATCH) => {
             (status::CHANNEL_FORMAT, Retry::REFUSED)
         }
-        Error::Refused(_) | Error::Protocol(_) | Error::Config(_) => {
+        Error::Refused(_) | Error::Protocol(_) | Error::Config(_) | Error::NotReady(_) => {
             (SubscriptionStatus::TxFail, Retry::REFUSED)
         }
         Error::Io(e) if is_local(e) => (status::RX_FAIL, Retry::FAST),

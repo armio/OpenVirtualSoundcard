@@ -4,7 +4,7 @@ members = ["crates/*"]
 exclude = ["tools"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 license = "GPL-3.0-or-later"
@@ -12,15 +12,15 @@ repository = "https://github.com/armio/OpenVirtualSoundcard"
 authors = ["OpenVirtualSoundcard contributors"]
 
 [workspace.dependencies]
-ovsc-proto = { path = "crates/ovsc-proto", version = "0.1.0" }
-ovsc-clock = { path = "crates/ovsc-clock", version = "0.1.0" }
-ovsc-core = { path = "crates/ovsc-core", version = "0.1.0" }
-ovsc-soundcard = { path = "crates/ovsc-soundcard", version = "0.1.0" }
-ovsc-shm = { path = "crates/ovsc-shm", version = "0.1.0" }
-ovsc-ipc = { path = "crates/ovsc-ipc", version = "0.1.0" }
-ovsc-hal = { path = "crates/ovsc-hal", version = "0.1.0" }
-ovsc-hal-server = { path = "crates/ovsc-hal-server", version = "0.1.0" }
-ovsc-control = { path = "crates/ovsc-control", version = "0.1.0" }
+ovsc-proto = { path = "crates/ovsc-proto", version = "0.1.1" }
+ovsc-clock = { path = "crates/ovsc-clock", version = "0.1.1" }
+ovsc-core = { path = "crates/ovsc-core", version = "0.1.1" }
+ovsc-soundcard = { path = "crates/ovsc-soundcard", version = "0.1.1" }
+ovsc-shm = { path = "crates/ovsc-shm", version = "0.1.1" }
+ovsc-ipc = { path = "crates/ovsc-ipc", version = "0.1.1" }
+ovsc-hal = { path = "crates/ovsc-hal", version = "0.1.1" }
+ovsc-hal-server = { path = "crates/ovsc-hal-server", version = "0.1.1" }
+ovsc-control = { path = "crates/ovsc-control", version = "0.1.1" }
 
 anyhow = "1"
 arc-swap = "1"

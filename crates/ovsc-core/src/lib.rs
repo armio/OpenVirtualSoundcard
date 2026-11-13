@@ -47,6 +47,10 @@ pub enum Error {
     Config(String),
     #[error("protocol: {0}")]
     Protocol(#[from] ovsc_proto::Error),
+    /// The interface exists but only has an address the engine should not
+    /// start on yet; retry later.
+    #[error("{0}")]
+    NotReady(String),
     #[error("timed out waiting for {0}")]
     Timeout(String),
     #[error("not found: {0}")]

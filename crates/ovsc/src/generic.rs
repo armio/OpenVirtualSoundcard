@@ -27,6 +27,7 @@ use tracing::{debug, error, info, warn};
 
 use ovsc_clock::ptp::{PtpConfig, PtpFollower};
 use ovsc_clock::{MediaClock, free_running_clock_with_rate, system_clock};
+use ovsc_core::config::parse_interface_ip;
 use ovsc_core::net::Interface;
 use ovsc_core::{Device, SavedState, StartOptions};
 use ovsc_soundcard::{Bridge, BridgeConfig, BridgeStats};
@@ -121,7 +122,8 @@ async fn run_engine(
     // itself (`AudioIo::latency_samples`).
     engine.device.restart_rx();
     let iface = &engine.device.info().iface;
-    let mut watch = sup.probe.watch(&iface.name, iface.ip);
+    let mut watch =
+        sup.probe.watch(&iface.name, iface.ip, parse_interface_ip(&cfg.device.interface).is_none());
     loop {
         tokio::select! {
             r = stop.requested() => return Ok(Next::Stop(r?)),

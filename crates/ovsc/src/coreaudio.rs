@@ -38,7 +38,8 @@ use tracing::{debug, error, info, warn};
 use ovsc_clock::ptp::{PtpConfig, PtpFollower};
 use ovsc_clock::{MediaClock, free_running_clock_with_rate};
 use ovsc_control::{Request, Response, Restart, SettingsChange};
-use ovsc_core::net::Interface;
+use ovsc_core::config::parse_interface_ip;
+use ovsc_core::net::{Interface, LINK_LOCAL_AFTER_BOOT_S, link_local_allowed};
 use ovsc_core::{Device, FormatRequest, RemoteChanges, SavedState, StartOptions};
 use ovsc_hal_server::{
     EngineInfo, HalOptions, HalRegion, HalServer, ShmClockMirror, driver_config,
@@ -393,25 +394,63 @@ async fn start_engine(
     let mut delay = RETRY_FIRST;
     let mut attempts = 0u32;
     let mut last_error = String::new();
+    let spec = ctx.cfg.device.interface.as_str();
+    let follows_interface = parse_interface_ip(spec).is_none();
+    let mut waiting_said = false;
     loop {
         attempts += 1;
-        match Engine::start(ctx.cfg, ctx.region, carry.clone()).await {
-            Ok(engine) => {
+        // Right after boot an interface with only a self-assigned address is
+        // not ready: DHCP is still answering (see `link_local_allowed`).
+        // Later, and for an interface given as an IP, it is.
+        let allow_link_local = ctx.sup.probe.uptime().is_none_or(link_local_allowed);
+        let started = match ctx.sup.probe.find_ready(spec, allow_link_local) {
+            Ok(iface) => {
+                // The device runs on the interface chosen here, not on one it
+                // looks up itself a moment later.
+                let on = iface.clone();
+                let iface = ctx.sup.probe.device_interface(iface);
+                Engine::start_with(iface, ctx.cfg, ctx.region, carry.clone())
+                    .await
+                    .map(|engine| (engine, on))
+            }
+            Err(e) => Err(e.into()),
+        };
+        match started {
+            Ok((engine, iface)) => {
                 if attempts > 1 {
                     info!("engine started at attempt {attempts}");
                 }
+                if follows_interface && iface.ip.is_link_local() {
+                    info!(
+                        "no routable address on {} {LINK_LOCAL_AFTER_BOOT_S} s after boot: using \
+                         the link-local {} (direct link)",
+                        iface.name, iface.ip
+                    );
+                }
                 return Ok(Ok(engine));
             }
-            Err(e) => {
-                let e = format!("{e:#}");
-                // Once per distinct cause: a Mac can wait long for its network.
-                if e != last_error {
-                    warn!("cannot start the engine: {e}; retrying until it starts");
-                } else {
-                    debug!("cannot start the engine: {e}");
+            Err(e) => match e.downcast_ref::<ovsc_core::Error>() {
+                Some(ovsc_core::Error::NotReady(why)) => {
+                    // Once: the wait is expected, and can last two minutes.
+                    if !waiting_said {
+                        warn!("{why}");
+                        waiting_said = true;
+                    } else {
+                        debug!("{why}");
+                    }
+                    last_error = why.clone();
                 }
-                last_error = e;
-            }
+                _ => {
+                    let e = format!("{e:#}");
+                    // Once per distinct cause: a Mac can wait long for its network.
+                    if e != last_error {
+                        warn!("cannot start the engine: {e}; retrying until it starts");
+                    } else {
+                        debug!("cannot start the engine: {e}");
+                    }
+                    last_error = e;
+                }
+            },
         }
         ctx.listener.poll();
         let mut retry = std::pin::pin!(tokio::time::sleep(delay));
@@ -459,7 +498,10 @@ async fn run_engine(
     let mut second = tokio::time::interval(Duration::from_secs(1));
     let mut clock_log = ClockStateLog::default();
     let iface = &engine.device.info().iface;
-    let mut watch = ctx.sup.probe.watch(&iface.name, iface.ip);
+    // An interface given as an IP is bound again at every restart: the
+    // watcher must not look for a better address then.
+    let follows_interface = parse_interface_ip(&ctx.cfg.device.interface).is_none();
+    let mut watch = ctx.sup.probe.watch(&iface.name, iface.ip, follows_interface);
     let mut latency = engine.device.latency_requests();
     latency.mark_unchanged();
     // A latency set between the device's start and this subscription
@@ -591,13 +633,23 @@ impl Engine {
     /// Starts the device on `region`'s rings, with its clock mirrored into
     /// the region, from what a previous device left (`carry`), if any.
     /// Whatever started is stopped again on failure.
+    #[cfg(test)]
     async fn start(
         cfg: &AppConfig,
         region: &Arc<HalRegion>,
         carry: Option<Carry>,
     ) -> anyhow::Result<Engine> {
-        let d = &cfg.device;
-        let iface = Interface::find(&d.interface)?;
+        let iface = Interface::find(&cfg.device.interface)?;
+        Self::start_with(iface, cfg, region, carry).await
+    }
+
+    /// [`Engine::start`] on `iface`, which the caller chose.
+    async fn start_with(
+        iface: Interface,
+        cfg: &AppConfig,
+        region: &Arc<HalRegion>,
+        carry: Option<Carry>,
+    ) -> anyhow::Result<Engine> {
         let (clock, follower) = match cfg.clock.source {
             ClockSource::Ptp => {
                 let mut ptp = PtpConfig::new(iface.ip, iface.mac);
@@ -614,7 +666,7 @@ impl Engine {
             ClockSource::System => anyhow::bail!("the driver cannot follow the system clock"),
         };
         clock.set_mirror(Some(ShmClockMirror::new(region.clone())))?;
-        let device = match Self::start_device(cfg, region, &clock, carry).await {
+        let device = match Self::start_device(iface, cfg, region, &clock, carry).await {
             Ok(device) => device,
             Err(e) => {
                 if let Some(f) = follower {
@@ -636,6 +688,7 @@ impl Engine {
     /// Starts the device on `region`'s rings, following `clock`, from what
     /// a previous device left (`carry`), if any.
     async fn start_device(
+        iface: Interface,
         cfg: &AppConfig,
         region: &Arc<HalRegion>,
         clock: &MediaClock,
@@ -658,6 +711,7 @@ impl Engine {
             remote_changes,
             state,
             announced,
+            iface: Some(iface),
             ..Default::default()
         };
         Ok(Device::start_with_options(d.clone(), clock.clone(), options).await?)
@@ -1101,6 +1155,211 @@ mod tests {
         };
         let (result, ()) = tokio::join!(daemon, driver);
         result.unwrap();
+    }
+
+    /// What the daemon logged in a test, for the lines that tell the person
+    /// what it waits for.
+    #[derive(Clone, Default)]
+    struct Logs(Arc<Mutex<Vec<u8>>>);
+
+    impl Logs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+        type Writer = Logs;
+        fn make_writer(&'a self) -> Logs {
+            self.clone()
+        }
+    }
+
+    /// Logs this test's thread writes (a current-thread runtime keeps the
+    /// whole daemon on it) until the guard drops.
+    fn capture() -> (Logs, tracing::subscriber::DefaultGuard) {
+        let logs = Logs::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        (logs, tracing::subscriber::set_default(sub))
+    }
+
+    /// A supervision whose interface has the addresses and the uptime a test
+    /// sets, one set of statics per test (the tests run side by side).
+    macro_rules! scripted {
+        ($name:ident) => {
+            mod $name {
+                use super::*;
+                use std::net::Ipv4Addr;
+                use std::sync::atomic::AtomicU64;
+
+                pub static UPTIME_S: AtomicU64 = AtomicU64::new(30);
+                /// Whether the interface has a routable address next to its
+                /// link-local one.
+                pub static ROUTABLE: AtomicBool = AtomicBool::new(false);
+                /// The addresses the engine's device was started on.
+                pub static STARTED_ON: Mutex<Vec<Ipv4Addr>> = Mutex::new(Vec::new());
+
+                fn started_on(iface: &Interface) {
+                    STARTED_ON.lock().unwrap().push(iface.ip);
+                }
+
+                fn addrs() -> Vec<Ipv4Addr> {
+                    let mut a = vec![Ipv4Addr::new(169, 254, 1, 1)];
+                    if ROUTABLE.load(Ordering::SeqCst) {
+                        a.push(Ipv4Addr::LOCALHOST);
+                    }
+                    a
+                }
+
+                fn uptime() -> Option<Duration> {
+                    Some(Duration::from_secs(UPTIME_S.load(Ordering::SeqCst)))
+                }
+
+                fn look(_: &str) -> std::io::Result<Option<Seen>> {
+                    Ok(Some(Seen { index: 1, ipv4: vec![Ipv4Addr::LOCALHOST] }))
+                }
+
+                pub fn sup() -> Supervision {
+                    static NEVER: AtomicBool = AtomicBool::new(false);
+                    let script = crate::netwatch::Script { look, addrs, uptime, started_on };
+                    Supervision { probe: Probe::Scripted(script), panicked: &NEVER }
+                }
+            }
+        };
+    }
+
+    /// The system's loopback interface, which a device can run on by name.
+    fn loopback_name() -> &'static str {
+        if cfg!(target_vendor = "apple") { "lo0" } else { "lo" }
+    }
+
+    /// Runs the daemon on `interface` under `sup` while `driver` runs;
+    /// `driver` gets the flag that says whether the engine runs.
+    async fn run_scripted<F, Fut>(interface: &str, base: u16, sup: Supervision, driver: F)
+    where
+        F: FnOnce(Box<dyn Fn() -> bool>) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let registry = MemRegistry::new();
+        let (stop_tx, mut stop) = mpsc::unbounded_channel();
+        let daemon = serve(app_config(interface, base), None, service(&registry), sup, &mut stop);
+        let driver = async {
+            let (_client, received, w) = attach(&registry).await;
+            let (mapped, _) = map(&w);
+            // SAFETY: the mapping outlives every use of the view below.
+            let view = unsafe { RegionRef::from_raw(mapped.as_ptr(), mapped.len()) }.unwrap();
+            let running = Box::new(move || {
+                view.daemon().flags.load(Ordering::Acquire) & DAEMON_ENGINE_RUNNING != 0
+            });
+            driver(running).await;
+            // The daemon was serving the driver throughout.
+            assert!(!received.got_bye());
+            stop_tx.send("test").unwrap();
+            wait_for("the bye", || received.got_bye()).await;
+        };
+        let (result, ()) = tokio::join!(daemon, driver);
+        result.unwrap();
+    }
+
+    scripted!(waits);
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_link_local_only_interface_is_waited_on_early_after_boot() {
+        let (logs, _guard) = capture();
+        waits::UPTIME_S.store(30, Ordering::SeqCst);
+        run_scripted(loopback_name(), 24850, waits::sup(), |running| async move {
+            // Past the first retry (2 s) as well: still no engine, the
+            // daemon still serving, and the warning said once.
+            tokio::time::sleep(Duration::from_millis(2600)).await;
+            assert!(!running(), "the engine started on a link-local address");
+        })
+        .await;
+        let text = logs.text();
+        let warning = "WARN ovsc::coreaudio: lo0 has only the link-local address 169.254.1.1; \
+                       waiting for a routable one (DHCP) until 120 s after boot";
+        let warning = warning.replace("lo0", loopback_name());
+        assert_eq!(text.matches(&warning).count(), 1, "{text}");
+        assert!(!text.contains("using the link-local"), "{text}");
+    }
+
+    scripted!(given_ip);
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_interface_given_as_an_ip_is_never_waited_on() {
+        let (logs, _guard) = capture();
+        given_ip::UPTIME_S.store(30, Ordering::SeqCst);
+        // The person chose this address: no wait, whatever the interface
+        // holds (the script gives it only a link-local address).
+        run_scripted("127.0.0.1", 24860, given_ip::sup(), |running| async move {
+            wait_for("the engine", &running).await;
+        })
+        .await;
+        let text = logs.text();
+        assert!(!text.contains("waiting for a routable one"), "{text}");
+    }
+
+    scripted!(late);
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn link_local_is_used_from_120_s_after_boot() {
+        let (logs, _guard) = capture();
+        late::UPTIME_S.store(121, Ordering::SeqCst);
+        run_scripted(loopback_name(), 24870, late::sup(), |running| async move {
+            wait_for("the engine", &running).await;
+        })
+        .await;
+        let text = logs.text();
+        let info = format!(
+            "INFO ovsc::coreaudio: no routable address on {} 120 s after boot: using the \
+             link-local 169.254.1.1 (direct link)",
+            loopback_name()
+        );
+        assert_eq!(text.matches(&info).count(), 1, "{text}");
+        assert!(!text.contains("waiting for a routable one"), "{text}");
+        // The device itself was handed the link-local address.
+        let on = late::STARTED_ON.lock().unwrap().clone();
+        assert_eq!(on, [std::net::Ipv4Addr::new(169, 254, 1, 1)], "{text}");
+    }
+
+    scripted!(dhcp);
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_routable_address_that_arrives_while_waiting_starts_the_engine_once() {
+        let (logs, _guard) = capture();
+        dhcp::UPTIME_S.store(30, Ordering::SeqCst);
+        run_scripted(loopback_name(), 24880, dhcp::sup(), |running| async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert!(!running());
+            // DHCP answers at 60 s; the engine starts on the routable one
+            // at the next try.
+            dhcp::UPTIME_S.store(60, Ordering::SeqCst);
+            dhcp::ROUTABLE.store(true, Ordering::SeqCst);
+            wait_for("the engine", &running).await;
+        })
+        .await;
+        let text = logs.text();
+        let warning = format!("WARN ovsc::coreaudio: {} has only", loopback_name());
+        assert_eq!(text.matches(&warning).count(), 1, "{text}");
+        assert_eq!(text.matches("engine started at attempt").count(), 1, "{text}");
+        assert!(!text.contains("using the link-local"), "{text}");
+        // The device was handed the routable address, once, and never the
+        // link-local one.
+        let on = dhcp::STARTED_ON.lock().unwrap().clone();
+        assert_eq!(on, [std::net::Ipv4Addr::LOCALHOST], "{text}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
