@@ -147,16 +147,32 @@ async fn test_master_goes_silent_when_another_master_appears() {
     master.shutdown();
 }
 
-/// Whether `e`, from starting a follower that reads the interface, says
-/// this process may not: such tests then stop, saying so. Reading the
-/// interface needs root (or CAP_NET_RAW on Linux, access to /dev/bpf on
-/// macOS).
-fn not_allowed(e: &std::io::Error) -> bool {
-    let denied = e.kind() == std::io::ErrorKind::PermissionDenied;
-    if denied {
-        eprintln!("not run: reading the interface is not allowed here ({e})");
+/// Whether this process may read the interface, which needs root (or
+/// CAP_NET_RAW on Linux, access to /dev/bpf on macOS), and whether the
+/// loopback interface can be read as the fallback reads Ethernet (Linux's
+/// can; macOS's lo0 is not Ethernet): a follower that reads it starts.
+/// Tests that need it stop where it cannot, saying so.
+async fn reading_the_interface_is_allowed() -> bool {
+    let mut config = PtpConfig::new(LOOPBACK, FOLLOWER_UUID);
+    config.event_port = 31719;
+    config.general_port = 31720;
+    config.capture = PtpCapture::Always;
+    match PtpFollower::start(config).await {
+        Ok((follower, _)) => {
+            follower.shutdown();
+            true
+        }
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            eprintln!("not run: the loopback interface cannot be read here ({e})");
+            false
+        }
+        Err(e) => panic!("reading the interface: {e}"),
     }
-    denied
 }
 
 /// A Sync from a master no test runs, to the group on `port`, sent from a
@@ -190,11 +206,10 @@ async fn follower_locks_reading_the_interface() {
     config.general_port = PORT + 1;
     config.delay_req_interval = Duration::from_millis(500);
     config.capture = PtpCapture::Always;
-    let (follower, clock) = match PtpFollower::start(config).await {
-        Ok(f) => f,
-        Err(e) if not_allowed(&e) => return,
-        Err(e) => panic!("start follower: {e}"),
-    };
+    if !reading_the_interface_is_allowed().await {
+        return;
+    }
+    let (follower, clock) = PtpFollower::start(config).await.expect("start follower");
     assert!(follower.reads_interface());
 
     let started = Instant::now();
@@ -230,11 +245,10 @@ async fn ports_held_by_another_program_are_read_from_the_interface() {
     assert_eq!(e.kind(), std::io::ErrorKind::AddrInUse, "{e}");
 
     // With it, the follower reads the interface and hears a master.
-    let (follower, clock) = match PtpFollower::start(config).await {
-        Ok(f) => f,
-        Err(e) if not_allowed(&e) => return,
-        Err(e) => panic!("start follower: {e}"),
-    };
+    if !reading_the_interface_is_allowed().await {
+        return;
+    }
+    let (follower, clock) = PtpFollower::start(config).await.expect("start follower");
     assert!(follower.reads_interface());
     let sender = raw_socket(0);
     let started = Instant::now();
