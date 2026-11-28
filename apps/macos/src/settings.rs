@@ -2,363 +2,553 @@
 //! stays in view, and the confirmation before a change that interrupts
 //! audio or other devices' subscriptions.
 
-use eframe::egui::{self, Frame, Id, Key, Label, RichText, TextEdit, Ui, vec2};
-use ovsc_control::{InterfaceInfo, SettingsChange};
+use std::time::Instant;
 
-use crate::app::{App, Connection, Form, Outcome};
+use gpui::{
+    AnyElement, Context, Corner, Div, IntoElement, ParentElement, SharedString, Stateful, Styled,
+    Window, anchored, deferred, div, point, prelude::*, px,
+};
+use ovsc_control::Settings;
+
 use crate::logic::{self, Light};
-use crate::theme;
-use crate::widgets;
+use crate::model::{Connection, Outcome};
+use crate::theme::{self, CONTROL_HEIGHT, CONTROL_RADIUS, Palette, SEMIBOLD, WHITE};
+use crate::view::{AppView, Menu};
+use crate::widgets::{self, Kind};
 
 /// The width of the menus and the name field.
 const CONTROL_WIDTH: f32 = 200.0;
 
-pub fn show(app: &mut App, ui: &mut Ui) {
-    let up = matches!(app.connection, Connection::Up(_));
-    let usable = up && !app.applying;
-    let interfaces = app.interfaces.clone();
-    let applying_lock = app.applying && app.sent.lock_remote_settings.is_some();
-    let Some(form) = &mut app.form else {
-        ui.add_space(32.0);
-        ui.vertical_centered(|ui| {
-            if up {
-                ui.spinner();
-                ui.label("Reading the settings…");
-            } else {
-                ui.label(
-                    RichText::new("The settings appear once the app reaches the daemon.").weak(),
-                );
-            }
-        });
-        return;
+pub fn show(
+    view: &AppView,
+    p: &Palette,
+    window: &mut Window,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    let model = &view.model;
+    let up = matches!(model.connection, Connection::Up(_));
+    let Some(form) = &model.form else {
+        let body = if up {
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(10.0))
+                .child(widgets::spinner("reading", 20.0, p.text2))
+                .child("Reading the settings…")
+        } else {
+            div().text_color(p.text2).child("The settings appear once the app reaches the daemon.")
+        };
+        return div().w_full().pt(px(40.0)).flex().justify_center().child(body).into_any_element();
     };
-    let before = form.edited.clone();
-    let name_problem = logic::edited_name_problem(&form.current.name, &form.edited.name);
-    let mut enter = false;
-    let mut lock = None;
-    ui.add_enabled_ui(usable, |ui| {
-        widgets::section(ui, "Device", None, |ui| {
-            enter = name_row(ui, form, name_problem);
-        });
-        widgets::section(ui, "Audio format and network", None, |ui| {
-            ui.add(
-                Label::new(theme::caption(
-                    "Changing any of these restarts OpenVirtualSoundcard: audio stops for 10–20 s \
-                     in both directions.",
-                ))
-                .wrap(),
-            );
-            widgets::separator(ui);
-            format_rows(ui, form, &interfaces);
-        });
-        widgets::section(ui, "Receive latency", None, |ui| {
-            let Form { current, edited } = form;
-            let choices: Vec<(f64, String)> = logic::latency_choices(current.latency_ms)
-                .into_iter()
-                .map(|ms| (ms, logic::latency_label(ms)))
-                .collect();
-            let changed = edited.latency_ms != current.latency_ms;
-            let help = theme::caption(
-                "How long received audio waits before it plays: more is safer on a busy \
-                 network. Changing it stops the inputs for about a second; the returns carry on.",
-            );
-            widgets::setting_row(ui, "Latency", Some(help), changed, |ui| {
-                let r = menu(ui, "latency", CONTROL_WIDTH, &mut edited.latency_ms, &choices);
-                was(ui, changed, logic::latency_label(current.latency_ms));
-                r
-            });
-        });
-    });
-    // The show lock applies at once, and stays usable while other edits
-    // are pending.
-    ui.add_enabled_ui(usable || applying_lock, |ui| {
-        widgets::section(ui, "Show lock", None, |ui| {
-            let help = theme::caption(format!("{} Applies at once.", logic::LOCK_HELP));
-            let mut on = form.edited.lock_remote_settings;
-            widgets::setting_row(
-                ui,
-                "Refuse changes from Dante Controller",
-                Some(help),
-                false,
-                |ui| {
-                    if applying_lock {
-                        ui.spinner()
-                    } else {
-                        let r = widgets::toggle(ui, &mut on);
-                        if r.changed() {
-                            lock = Some(on);
-                        }
-                        r
-                    }
-                },
-            );
-        });
-    });
-    if form.edited != before && !matches!(app.outcome, Some(Outcome::Restarting { .. })) {
-        app.outcome = None;
-    }
-    if let Some(on) = lock {
-        if let Some(form) = &mut app.form {
-            form.edited.lock_remote_settings = on;
-        }
-        app.apply(SettingsChange { lock_remote_settings: Some(on), ..Default::default() });
-    }
-    if enter {
-        request_apply(app);
-    }
-}
+    let usable = model.usable();
+    let (current, edited) = (&form.current, &form.edited);
 
-/// The device name, with its rule up front and its error in its place.
-/// True when Return was pressed in it.
-fn name_row(ui: &mut Ui, form: &mut Form, problem: Option<&str>) -> bool {
-    let p = theme::palette(ui);
-    let changed = form.edited.name.trim() != form.current.name;
-    let help = match problem {
-        Some(problem) => RichText::new(problem).small().color(p.red_ink),
-        None => theme::caption(
+    // Device.
+    let name_problem = logic::edited_name_problem(&current.name, &edited.name);
+    let help = match name_problem {
+        Some(problem) => div()
+            .text_size(px(theme::SMALL))
+            .text_color(p.red_ink)
+            .child(problem)
+            .into_any_element(),
+        None => widgets::caption(
             "Up to 31 letters, digits and hyphens, shown in Dante Controller. Renaming breaks \
              other devices' subscriptions to this one.",
-        ),
+            p,
+        )
+        .into_any_element(),
     };
-    let mut enter = false;
-    widgets::setting_row(ui, "Name", Some(help), changed, |ui| {
-        let r = ui.add(
-            TextEdit::singleline(&mut form.edited.name)
-                .desired_width(CONTROL_WIDTH)
-                .char_limit(logic::MAX_NAME_LEN),
-        );
-        enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-        // The field's edge: red with a problem, else one you can see
-        // against the glass (3:1); focused, egui draws its own.
-        let edge = match problem {
-            Some(_) => Some(egui::Stroke::new(1.5, p.red)),
-            None if !r.has_focus() => Some(egui::Stroke::new(1.0, p.control_stroke)),
-            None => None,
-        };
-        if let Some(edge) = edge {
-            ui.painter().rect_stroke(r.rect, theme::CONTROL_RADIUS, edge, egui::StrokeKind::Inside);
-        }
-        r
-    });
-    enter
-}
+    let name = widgets::setting_row(
+        p,
+        "Name",
+        Some(help),
+        edited.name.trim() != current.name,
+        div().w(px(CONTROL_WIDTH)).child(view.name_input.clone()),
+    );
+    let device = widgets::section(p, "Device", None, name);
 
-/// The settings that restart the daemon.
-fn format_rows(ui: &mut Ui, form: &mut Form, interfaces: &[InterfaceInfo]) {
-    let p = theme::palette(ui);
-    let Form { current, edited } = form;
-    let choices = logic::interface_choices(interfaces, &[&current.interface, &edited.interface]);
-    let changed = edited.interface != current.interface;
-    let help = logic::wifi_warning(interfaces, &edited.interface)
-        .map(|w| RichText::new(w).small().color(p.amber_ink));
-    let width = (ui.available_width() * 0.55).clamp(CONTROL_WIDTH, 340.0);
-    widgets::setting_row(ui, "Network interface", help, changed, |ui| {
-        menu(ui, "interface", width, &mut edited.interface, &choices)
-    });
-    widgets::separator(ui);
-
-    let choices = logic::secondary_choices(
+    // The settings that restart the daemon.
+    let wide = (f32::from(window.viewport_size().width) * 0.55 - 40.0).clamp(CONTROL_WIDTH, 340.0);
+    let interfaces = &model.interfaces;
+    let interface_choices: Vec<(String, String)> =
+        logic::interface_choices(interfaces, &[&current.interface, &edited.interface]);
+    let interface = widgets::setting_row(
+        p,
+        "Network interface",
+        logic::wifi_warning(interfaces, &edited.interface).map(|w| {
+            div().text_size(px(theme::SMALL)).text_color(p.amber_ink).child(w).into_any_element()
+        }),
+        edited.interface != current.interface,
+        select(
+            view,
+            Menu::Interface,
+            wide,
+            &edited.interface,
+            interface_choices,
+            |s, v| s.interface = v,
+            usable,
+            p,
+            cx,
+        ),
+    );
+    let secondary_choices: Vec<(String, String)> = logic::secondary_choices(
         interfaces,
         &[&current.secondary_interface, &edited.secondary_interface],
     );
-    let changed = edited.secondary_interface != current.secondary_interface;
-    let help = match logic::secondary_problem(interfaces, edited) {
-        Some(problem) => RichText::new(problem).small().color(p.red_ink),
-        None => theme::caption(
+    let secondary_help = match logic::secondary_problem(interfaces, edited) {
+        Some(problem) => div()
+            .text_size(px(theme::SMALL))
+            .text_color(p.red_ink)
+            .child(problem)
+            .into_any_element(),
+        None => widgets::caption(
             "Dante redundancy: a second Ethernet adapter on the secondary network. Flows with \
              redundant devices then run on both networks.",
-        ),
+            p,
+        )
+        .into_any_element(),
     };
-    widgets::setting_row(ui, "Secondary network", Some(help), changed, |ui| {
-        menu(ui, "secondary", width, &mut edited.secondary_interface, &choices)
-    });
-    widgets::separator(ui);
-
-    let rates: Vec<(u32, String)> = logic::rate_choices(current.sample_rate)
+    let secondary = widgets::setting_row(
+        p,
+        "Secondary network",
+        Some(secondary_help),
+        edited.secondary_interface != current.secondary_interface,
+        select(
+            view,
+            Menu::Secondary,
+            wide,
+            &edited.secondary_interface,
+            secondary_choices,
+            |s, v| s.secondary_interface = v,
+            usable,
+            p,
+            cx,
+        ),
+    );
+    let rates = logic::rate_choices(current.sample_rate)
         .into_iter()
         .map(|r| (r, logic::rate_label(r)))
         .collect();
-    let changed = edited.sample_rate != current.sample_rate;
-    widgets::setting_row(ui, "Sample rate", None, changed, |ui| {
-        let r = menu(ui, "rate", CONTROL_WIDTH, &mut edited.sample_rate, &rates);
-        was(ui, changed, logic::rate_label(current.sample_rate));
-        r
-    });
-    widgets::separator(ui);
-
-    let bits: Vec<(u16, String)> = logic::bits_choices(current.bits_per_sample)
+    let rate = with_was(
+        select(
+            view,
+            Menu::Rate,
+            CONTROL_WIDTH,
+            &edited.sample_rate,
+            rates,
+            |s, v| s.sample_rate = v,
+            usable,
+            p,
+            cx,
+        ),
+        (edited.sample_rate != current.sample_rate).then(|| logic::rate_label(current.sample_rate)),
+        p,
+    );
+    let rate = widgets::setting_row(
+        p,
+        "Sample rate",
+        None,
+        edited.sample_rate != current.sample_rate,
+        rate,
+    );
+    let bits_choices = logic::bits_choices(current.bits_per_sample)
         .into_iter()
         .map(|b| (b, logic::bits_label(b)))
         .collect();
-    let changed = edited.bits_per_sample != current.bits_per_sample;
-    widgets::setting_row(ui, "Bit depth", None, changed, |ui| {
-        let r = menu(ui, "bits", CONTROL_WIDTH, &mut edited.bits_per_sample, &bits);
-        was(ui, changed, logic::bits_label(current.bits_per_sample));
-        r
-    });
-    widgets::separator(ui);
-
+    let bits = with_was(
+        select(
+            view,
+            Menu::Bits,
+            CONTROL_WIDTH,
+            &edited.bits_per_sample,
+            bits_choices,
+            |s, v| s.bits_per_sample = v,
+            usable,
+            p,
+            cx,
+        ),
+        (edited.bits_per_sample != current.bits_per_sample)
+            .then(|| logic::bits_label(current.bits_per_sample)),
+        p,
+    );
+    let bits = widgets::setting_row(
+        p,
+        "Bit depth",
+        None,
+        edited.bits_per_sample != current.bits_per_sample,
+        bits,
+    );
     let counts = |n: u16| -> Vec<(u16, String)> {
         logic::channel_choices(n).into_iter().map(|c| (c, c.to_string())).collect()
     };
-    let changed = edited.rx_channels != current.rx_channels;
-    let rx = counts(current.rx_channels);
-    widgets::setting_row(ui, "Receive channels", None, changed, |ui| {
-        let r = menu(ui, "rx", CONTROL_WIDTH, &mut edited.rx_channels, &rx);
-        was(ui, changed, current.rx_channels.to_string());
-        r
-    });
-    widgets::separator(ui);
-    let changed = edited.tx_channels != current.tx_channels;
-    let tx = counts(current.tx_channels);
-    widgets::setting_row(ui, "Transmit channels", None, changed, |ui| {
-        let r = menu(ui, "tx", CONTROL_WIDTH, &mut edited.tx_channels, &tx);
-        was(ui, changed, current.tx_channels.to_string());
-        r
-    });
+    let rx = with_was(
+        select(
+            view,
+            Menu::Rx,
+            CONTROL_WIDTH,
+            &edited.rx_channels,
+            counts(current.rx_channels),
+            |s, v| s.rx_channels = v,
+            usable,
+            p,
+            cx,
+        ),
+        (edited.rx_channels != current.rx_channels).then(|| current.rx_channels.to_string()),
+        p,
+    );
+    let rx = widgets::setting_row(
+        p,
+        "Receive channels",
+        None,
+        edited.rx_channels != current.rx_channels,
+        rx,
+    );
+    let tx = with_was(
+        select(
+            view,
+            Menu::Tx,
+            CONTROL_WIDTH,
+            &edited.tx_channels,
+            counts(current.tx_channels),
+            |s, v| s.tx_channels = v,
+            usable,
+            p,
+            cx,
+        ),
+        (edited.tx_channels != current.tx_channels).then(|| current.tx_channels.to_string()),
+        p,
+    );
+    let tx = widgets::setting_row(
+        p,
+        "Transmit channels",
+        None,
+        edited.tx_channels != current.tx_channels,
+        tx,
+    );
+    let format = widgets::section(
+        p,
+        "Audio format and network",
+        None,
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .child(widgets::caption(
+                "Changing any of these restarts OpenVirtualSoundcard: audio stops for 10–20 s in \
+                 both directions.",
+                p,
+            ))
+            .child(widgets::separator(p))
+            .child(interface)
+            .child(widgets::separator(p))
+            .child(secondary)
+            .child(widgets::separator(p))
+            .child(rate)
+            .child(widgets::separator(p))
+            .child(bits)
+            .child(widgets::separator(p))
+            .child(rx)
+            .child(widgets::separator(p))
+            .child(tx),
+    );
+
+    // Latency.
+    let latencies = logic::latency_choices(current.latency_ms)
+        .into_iter()
+        .map(|ms| (LatencyChoice(ms), logic::latency_label(ms)))
+        .collect();
+    let latency_changed = edited.latency_ms != current.latency_ms;
+    let latency = with_was(
+        select(
+            view,
+            Menu::Latency,
+            CONTROL_WIDTH,
+            &LatencyChoice(edited.latency_ms),
+            latencies,
+            |s, v| s.latency_ms = v.0,
+            usable,
+            p,
+            cx,
+        ),
+        latency_changed.then(|| logic::latency_label(current.latency_ms)),
+        p,
+    );
+    let latency = widgets::section(
+        p,
+        "Receive latency",
+        None,
+        widgets::setting_row(
+            p,
+            "Latency",
+            Some(
+                widgets::caption(
+                    "How long received audio waits before it plays: more is safer on a busy \
+                     network. Changing it stops the inputs for about a second; the returns carry \
+                     on.",
+                    p,
+                )
+                .into_any_element(),
+            ),
+            latency_changed,
+            latency,
+        ),
+    );
+
+    // The show lock applies at once, and stays usable while other edits
+    // are pending.
+    let on = edited.lock_remote_settings;
+    let switch = if model.applying_lock() {
+        widgets::spinner("lock-spinner", 18.0, p.text2).into_any_element()
+    } else {
+        widgets::toggle("show-lock", on, usable, p)
+            .when(usable, |t| {
+                t.on_click(cx.listener(move |view, _, window, cx| {
+                    view.model.set_lock(!on);
+                    view.after_edit(window, cx);
+                }))
+            })
+            .into_any_element()
+    };
+    let lock = widgets::section(
+        p,
+        "Show lock",
+        None,
+        widgets::setting_row(
+            p,
+            "Refuse changes from Dante Controller",
+            Some(
+                widgets::caption(format!("{} Applies at once.", logic::LOCK_HELP), p)
+                    .into_any_element(),
+            ),
+            false,
+            switch,
+        ),
+    );
+
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .child(device)
+        .child(format)
+        .child(latency)
+        .child(lock)
+        .into_any_element()
 }
 
-/// A pop-up menu over `choices`, showing the label of `value`.
-fn menu<T: PartialEq + Clone>(
-    ui: &mut Ui,
-    id: &str,
+/// A latency in a menu: equal when the labels would be.
+#[derive(Clone, Copy)]
+struct LatencyChoice(f64);
+
+impl PartialEq for LatencyChoice {
+    fn eq(&self, other: &Self) -> bool {
+        (self.0 - other.0).abs() < 1e-9
+    }
+}
+
+/// A control with the value before the edit beside it.
+fn with_was(control: impl IntoElement, was: Option<String>, p: &Palette) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .when_some(was, |d, was| d.child(widgets::caption(format!("was {was}"), p)))
+        .child(control)
+}
+
+/// A pop-up menu over `choices`, showing the label of `value`. Picking a
+/// choice edits the form through `set`.
+#[allow(clippy::too_many_arguments)]
+fn select<T: Clone + PartialEq + 'static>(
+    view: &AppView,
+    menu: Menu,
     width: f32,
-    value: &mut T,
-    choices: &[(T, String)],
-) -> egui::Response {
-    let selected = choices
+    value: &T,
+    choices: Vec<(T, String)>,
+    set: fn(&mut Settings, T),
+    enabled: bool,
+    p: &Palette,
+    cx: &mut Context<AppView>,
+) -> Div {
+    let label = choices
         .iter()
         .find(|(v, _)| v == value)
         .map(|(_, label)| label.clone())
         .unwrap_or_default();
-    egui::ComboBox::from_id_salt(id)
-        .width(width)
-        .selected_text(selected)
-        .show_ui(ui, |ui| {
-            for (v, label) in choices {
-                ui.selectable_value(value, v.clone(), label);
-            }
-        })
-        .response
-}
-
-/// The value before the edit, beside a changed control.
-fn was(ui: &mut Ui, changed: bool, old: String) {
-    if changed {
-        ui.label(theme::caption(format!("was {old}")));
+    let open = enabled && view.open_menu == Some(menu);
+    let id = format!("{menu:?}");
+    let button = div()
+        .id(SharedString::from(format!("menu-{id}")))
+        .w(px(width))
+        .h(px(CONTROL_HEIGHT))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(6.0))
+        .pl(px(10.0))
+        .pr(px(6.0))
+        .rounded(px(CONTROL_RADIUS))
+        .bg(if open { p.control_press } else { p.control })
+        .child(div().min_w_0().truncate().child(label))
+        .child(widgets::chevron(p.text2))
+        .when(!enabled, |b| b.opacity(0.45))
+        .when(enabled, |b| {
+            b.cursor_pointer()
+                .hover(|s| s.bg(p.control_hover))
+                .on_click(cx.listener(move |view, _, _, cx| view.toggle_menu(menu, cx)))
+        });
+    let mut wrapper = div().relative().child(button);
+    if open {
+        let items = choices.into_iter().enumerate().map(|(i, (choice, label))| {
+            let selected = &choice == value;
+            div()
+                .id(SharedString::from(format!("{id}-{i}")))
+                .h(px(24.0))
+                .mx(px(4.0))
+                .pl(px(6.0))
+                .pr(px(12.0))
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .rounded(px(5.0))
+                .cursor_pointer()
+                .hover(|s| s.bg(p.accent).text_color(WHITE))
+                .child(div().w(px(14.0)).flex_shrink_0().child(if selected { "✓" } else { "" }))
+                .child(div().whitespace_nowrap().child(label))
+                .on_click(cx.listener(move |view, _, window, cx| {
+                    let choice = choice.clone();
+                    view.model.edit(|s| set(s, choice));
+                    view.open_menu = None;
+                    view.after_edit(window, cx);
+                }))
+        });
+        let list = div()
+            .id(SharedString::from(format!("{id}-list")))
+            .min_w(px(width))
+            .max_h(px(320.0))
+            .overflow_y_scroll()
+            .py(px(4.0))
+            .flex()
+            .flex_col()
+            .bg(p.popup)
+            .border_1()
+            .border_color(p.card_edge)
+            .rounded(px(8.0))
+            .shadow(vec![gpui::BoxShadow {
+                color: p.shadow.into(),
+                offset: point(px(0.0), px(6.0)),
+                blur_radius: px(18.0),
+                spread_radius: px(0.0),
+            }])
+            .children(items)
+            .on_mouse_down_out(cx.listener(|view, _, _, cx| view.close_menu(cx)));
+        wrapper = wrapper.child(
+            div().absolute().left_0().top(px(CONTROL_HEIGHT + 4.0)).child(
+                deferred(
+                    anchored()
+                        .anchor(Corner::TopLeft)
+                        .snap_to_window_with_margin(px(8.0))
+                        .child(list),
+                )
+                .with_priority(1),
+            ),
+        );
     }
-}
-
-/// Applies the edit: at once, or after the confirmation when it interrupts
-/// audio or other devices' subscriptions.
-pub fn request_apply(app: &mut App) {
-    let up = matches!(app.connection, Connection::Up(_));
-    let Some(form) = &app.form else { return };
-    let change = logic::change(&form.current, &form.edited);
-    if !up
-        || app.applying
-        || change.is_empty()
-        || logic::edited_name_problem(&form.current.name, &form.edited.name).is_some()
-    {
-        return;
-    }
-    let receivers = logic::receivers(app.device());
-    match logic::confirmation(&change, &form.current, &receivers, &app.interfaces) {
-        Some(confirmation) => {
-            app.confirm = Some((change, confirmation));
-            app.confirm_opened = true;
-        }
-        None => app.apply(change),
-    }
+    wrapper
 }
 
 /// The bar under the Settings tab: what is pending or what became of the
 /// last change on the left, Revert and Apply on the right. It stays in
 /// view at any window size.
-pub fn action_bar(app: &mut App, ui: &mut Ui) {
-    let Some(form) = &app.form else { return };
-    let up = matches!(app.connection, Connection::Up(_));
-    let change = logic::change(&form.current, &form.edited);
-    let name_problem = logic::edited_name_problem(&form.current.name, &form.edited.name);
-    let receivers = logic::receivers(app.device());
-    let confirmation = if change.is_empty() || name_problem.is_some() {
-        None
-    } else {
-        logic::confirmation(&change, &form.current, &receivers, &app.interfaces)
-    };
-    let lines = logic::change_lines(&form.current, &change, &app.interfaces);
-    let can_apply = up && !app.applying && !change.is_empty() && name_problem.is_none();
-    let can_revert = !app.applying && !change.is_empty();
-    let (mut apply, mut revert) = (false, false);
-    egui::Sides::new().shrink_left().spacing(16.0).show(
-        ui,
-        |ui| status_line(ui, app, &lines, name_problem, confirmation.as_ref()),
-        |ui| {
-            let label = if confirmation.is_some() { "Apply…" } else { "Apply" };
-            let button = widgets::primary_button(ui, label, can_apply);
-            if ui.add_enabled(can_apply, button).clicked() {
-                apply = true;
-            }
-            let button = egui::Button::new("Revert").min_size(vec2(88.0, theme::CONTROL_HEIGHT));
-            if ui.add_enabled(can_revert, button).on_hover_text("Discard the edits.").clicked() {
-                revert = true;
-            }
-        },
-    );
-    if apply {
-        request_apply(app);
-    }
-    if revert {
-        if let Some(form) = &mut app.form {
-            form.edited = form.current.clone();
-        }
-        app.outcome = None;
-        app.worker.send(crate::worker::Command::Reload);
-    }
+pub fn action_bar(
+    view: &AppView,
+    p: &Palette,
+    now: Instant,
+    cx: &mut Context<AppView>,
+) -> Stateful<Div> {
+    let model = &view.model;
+    let confirmation = model.pending_confirmation();
+    let can_apply = model.can_apply();
+    let can_revert = !model.applying && model.pending();
+    let label = if confirmation.is_some() { "Apply…" } else { "Apply" };
+    let apply = widgets::button("apply", label, Kind::Primary, can_apply, p).when(can_apply, |b| {
+        b.on_click(cx.listener(|view, _, window, cx| {
+            view.model.request_apply();
+            view.after_edit(window, cx);
+        }))
+    });
+    let revert =
+        widgets::button("revert", "Revert", Kind::Plain, can_revert, p).when(can_revert, |b| {
+            b.tooltip(widgets::Tooltip::text("Discard the edits.")).on_click(cx.listener(
+                |view, _, window, cx| {
+                    view.model.revert();
+                    view.after_edit(window, cx);
+                },
+            ))
+        });
+    div()
+        .id("action-bar")
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(16.0))
+        .px(px(theme::GUTTER))
+        .pt(px(10.0))
+        .pb(px(12.0))
+        .min_h(px(56.0))
+        .bg(p.footer)
+        .border_t_1()
+        .border_color(p.separator)
+        .child(div().flex_1().min_w_0().child(status_line(view, confirmation.as_ref(), p, now)))
+        .child(div().flex_shrink_0().flex().gap(px(8.0)).child(revert).child(apply))
 }
 
 /// The left of the action bar, in one or two lines.
 fn status_line(
-    ui: &mut Ui,
-    app: &App,
-    lines: &[String],
-    name_problem: Option<&str>,
+    view: &AppView,
     confirmation: Option<&logic::Confirmation>,
-) {
-    let p = theme::palette(ui);
-    let line = |ui: &mut Ui, light: Option<Light>, text: RichText| {
-        ui.horizontal(|ui| {
-            if let Some(light) = light {
-                widgets::mark(ui, light, 14.0);
-            }
-            ui.add(Label::new(text).wrap());
-        });
+    p: &Palette,
+    now: Instant,
+) -> AnyElement {
+    let model = &view.model;
+    let line = |light: Option<Light>, text: String, color: theme::Color| {
+        div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .when_some(light, |d, light| d.child(widgets::mark(light, 14.0, p)))
+            .child(div().flex_1().min_w_0().text_color(color).child(text))
+            .into_any_element()
     };
-    if app.applying {
-        ui.horizontal(|ui| {
-            ui.spinner();
-            ui.label("Applying…");
-        });
-        return;
+    if model.applying {
+        return div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(widgets::spinner("applying", 14.0, p.text2))
+            .child("Applying…")
+            .into_any_element();
     }
+    let Some(form) = &model.form else { return div().into_any_element() };
+    let (change, name_problem) = model.pending_change().unwrap_or_default();
+    let lines = logic::change_lines(&form.current, &change, &model.interfaces);
     // A refusal explains why the edit is still pending: it comes first.
-    if let Some(Outcome::Failed { text, kept }) = &app.outcome {
-        ui.vertical(|ui| {
-            line(ui, Some(Light::Red), RichText::new(text).color(p.red_ink));
-            if *kept && !lines.is_empty() {
-                ui.label(theme::caption("The edit stays here: change it, or Revert."));
-            }
-        });
-        return;
+    if let Some(Outcome::Failed { text, kept }) = &model.outcome {
+        return div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(line(Some(Light::Red), text.clone(), p.red_ink))
+            .when(*kept && !lines.is_empty(), |d| {
+                d.child(widgets::caption("The edit stays here: change it, or Revert.", p))
+            })
+            .into_any_element();
     }
     if !lines.is_empty() {
         if let Some(problem) = name_problem {
-            line(
-                ui,
-                Some(Light::Red),
-                RichText::new(format!("{problem} Fix the name to apply.")).color(p.red_ink),
-            );
-            return;
+            return line(Some(Light::Red), format!("{problem} Fix the name to apply."), p.red_ink);
         }
         let fields: Vec<&str> = lines.iter().filter_map(|l| l.split(':').next()).collect();
         let n = lines.len();
@@ -367,120 +557,96 @@ fn status_line(
             if n == 1 { "" } else { "s" },
             fields.join(", ")
         );
-        ui.vertical(|ui| {
-            ui.add(Label::new(theme::headline(what)).wrap());
-            if let Some(c) = confirmation {
-                ui.add(Label::new(RichText::new(&c.cost).color(p.amber_ink)).wrap());
-            }
-        });
-        return;
+        return div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(widgets::headline(what))
+            .when_some(confirmation, |d, c| {
+                d.child(div().text_color(p.amber_ink).child(c.cost.clone()))
+            })
+            .into_any_element();
     }
-    match &app.outcome {
-        Some(Outcome::Saved { text, .. }) => line(ui, Some(Light::Green), RichText::new(text)),
-        Some(Outcome::ToDo(text)) => line(ui, Some(Light::Amber), RichText::new(text)),
-        Some(Outcome::Restarting { since, .. }) if app.restarting(ui.ctx()) => {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.add(
-                    Label::new(format!(
-                        "Restarting OpenVirtualSoundcard · {}",
-                        logic::ago_label(since.elapsed())
-                    ))
-                    .wrap(),
-                );
-            });
-            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
-        }
+    match &model.outcome {
+        Some(Outcome::Saved { text, .. }) => line(Some(Light::Green), text.clone(), p.text),
+        Some(Outcome::ToDo(text)) => line(Some(Light::Amber), text.clone(), p.text),
+        Some(Outcome::Restarting { since, .. }) if model.restarting(now) => div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(widgets::spinner("restarting", 14.0, p.text2))
+            .child(format!(
+                "Restarting OpenVirtualSoundcard · {}",
+                logic::ago_label(now.saturating_duration_since(*since))
+            ))
+            .into_any_element(),
         // The restart's time is up and audio is still down.
-        Some(Outcome::Restarting { since, .. }) => {
-            line(
-                ui,
-                Some(Light::Red),
-                RichText::new(format!(
-                    "Audio is not back {} after the restart: the Status tab says why.",
-                    logic::ago_label(since.elapsed())
-                ))
-                .color(p.red_ink),
-            );
-            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
-        }
+        Some(Outcome::Restarting { since, .. }) => line(
+            Some(Light::Red),
+            format!(
+                "Audio is not back {} after the restart: the Status tab says why.",
+                logic::ago_label(now.saturating_duration_since(*since))
+            ),
+            p.red_ink,
+        ),
         Some(Outcome::Back { after, .. }) => line(
-            ui,
             Some(Light::Green),
-            RichText::new(format!(
+            format!(
                 "Back after {}. Check that the console receives the returns.",
                 logic::ago_label(*after)
-            )),
+            ),
+            p.text,
         ),
-        Some(Outcome::Failed { text, .. }) => {
-            line(ui, Some(Light::Red), RichText::new(text).color(p.red_ink))
-        }
+        Some(Outcome::Failed { text, .. }) => line(Some(Light::Red), text.clone(), p.red_ink),
         None => {
-            ui.label(theme::caption("No changes. Settings are kept across restarts."));
+            widgets::caption("No changes. Settings are kept across restarts.", p).into_any_element()
         }
     }
 }
 
 /// The confirmation before a change that interrupts audio or other
-/// devices' subscriptions: what changes, what it costs, and Cancel first.
-pub fn confirm_modal(app: &mut App, ctx: &egui::Context) {
-    let Some((change, c)) = &app.confirm else { return };
-    let (change, c) = (change.clone(), c.clone());
-    let focus_cancel = std::mem::take(&mut app.confirm_opened);
-    let mut answer = None;
-    let modal = egui::Modal::new(Id::new("confirm-change"))
-        .frame(Frame::popup(&ctx.global_style()).corner_radius(theme::CARD_RADIUS).inner_margin(22))
-        .show(ctx, |ui| {
-            let p = theme::palette(ui);
-            ui.set_width(420.0);
-            ui.horizontal(|ui| {
-                widgets::mark(ui, Light::Amber, 22.0);
-                ui.label(theme::semibold(c.title, 16.0));
-            });
-            ui.add_space(8.0);
-            Frame::new()
-                .fill(p.code)
-                .corner_radius(theme::FIELD_RADIUS)
-                .inner_margin(egui::Margin::symmetric(12, 8))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    for line in &c.changes {
-                        ui.add(Label::new(theme::headline(line)).wrap());
-                    }
-                });
-            ui.add_space(8.0);
-            ui.add(Label::new(theme::headline(&c.cost)).wrap());
-            ui.add(Label::new(RichText::new(&c.text).color(p.text2)).wrap());
-            ui.add_space(16.0);
-            ui.horizontal(|ui| {
-                let w = 96.0;
-                ui.add_space(
-                    (ui.available_width() - 2.0 * w - ui.spacing().item_spacing.x).max(0.0),
-                );
-                let cancel =
-                    ui.add(egui::Button::new("Cancel").min_size(vec2(w, theme::CONTROL_HEIGHT)));
-                if focus_cancel {
-                    cancel.request_focus();
-                }
-                if cancel.clicked() {
-                    answer = Some(false);
-                }
-                let action = widgets::destructive_button(ui, c.button)
-                    .min_size(vec2(w, theme::CONTROL_HEIGHT));
-                if ui.add(action).clicked() {
-                    answer = Some(true);
-                }
-            });
-        });
-    if answer.is_none() && modal.should_close() {
-        answer = Some(false);
-    }
-    match answer {
-        Some(true) => {
-            app.confirm = None;
-            app.apply(change);
-        }
-        Some(false) => app.confirm = None,
-        None => {}
-    }
+/// devices' subscriptions: what changes, what it costs, and Cancel as the
+/// default (Return and Escape).
+pub fn confirm_dialog(view: &AppView, p: &Palette, cx: &mut Context<AppView>) -> Stateful<Div> {
+    let c = view.model.confirm.as_ref().map(|(_, c)| c.clone()).expect("a confirmation is up");
+    let cancel = widgets::button("confirm-cancel", "Cancel", Kind::Plain, true, p)
+        .min_w(px(96.0))
+        .border_2()
+        .border_color(p.focus)
+        .on_click(cx.listener(|view, _, window, cx| {
+            view.model.answer_confirmation(false);
+            view.after_edit(window, cx);
+        }));
+    let go = widgets::button("confirm-go", c.button, Kind::Destructive, true, p)
+        .min_w(px(96.0))
+        .on_click(cx.listener(|view, _, window, cx| {
+            view.model.answer_confirmation(true);
+            view.after_edit(window, cx);
+        }));
+    widgets::scrim(p).track_focus(view.modal_focus()).key_context("Modal").child(
+        widgets::dialog(p, 440.0)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(widgets::mark(Light::Amber, 22.0, p))
+                    .child(div().text_size(px(16.0)).font_weight(SEMIBOLD).child(c.title)),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .px(px(12.0))
+                    .py(px(8.0))
+                    .rounded(px(theme::FIELD_RADIUS))
+                    .bg(p.code)
+                    .children(c.changes.iter().map(|line| widgets::headline(line.clone()))),
+            )
+            .child(widgets::headline(c.cost.clone()))
+            .child(div().text_color(p.text2).child(c.text.clone()))
+            .child(div().pt(px(6.0)).flex().justify_end().gap(px(8.0)).child(cancel).child(go)),
+    )
 }

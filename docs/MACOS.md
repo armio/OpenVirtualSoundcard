@@ -470,7 +470,7 @@ without it.
   **Locking** or **Holdover**, red **Unlocked**, or grey **Free running**
   (no Dante network). **Driver** is green **Loaded** (saying whether an
   application uses it), or red **Not loaded** or **Failed**. Hovering over
-  a tile says more, and VoiceOver reads the same.
+  a tile says more.
 * While audio is down, a red **Audio is down** panel stays under the header
   on both tabs, with what happened, what to do, and any command to run with
   a button to copy it (`sudo killall coreaudiod` for a failed driver). The
@@ -526,20 +526,23 @@ without it.
     soon as it is switched, and interrupts nothing.
 
   A change the daemon refuses stays in the form, with the daemon's reason.
-  Closing the window with changes not applied asks first (quitting with
-  `⌘Q` does not).
-* `⌘1` and `⌘2` (or `⌘,`) switch to Status and Settings, and `⌘W` closes
-  the window. The app follows the system's light or dark appearance, and
-  remembers its window's size and place.
-* The app is drawn in the glass look of the
-  [Raven](https://github.com/oscar-soirey/Raven) GUI library (Apache-2.0):
-  translucent panels with a lit rim over a sober grey wallpaper, and
-  capsule-shaped controls. Colour is kept for what means something: the
+  Closing the window or quitting with changes not applied asks first.
+* `⌘1` and `⌘2` (or `⌘,`) switch to Status and Settings, `⌘W` closes the
+  window, `⌘M` minimises it and `⌘Q` quits; Escape closes a menu or a
+  question. The app follows the system's light or dark appearance, and
+  remembers its window's size and place (in
+  `~/Library/Application Support/OpenVirtualSoundcard/window`).
+* The app is drawn with [GPUI](https://www.gpui.rs), the GPU-accelerated
+  toolkit of the Zed editor (Apache-2.0), on Metal, in the system font. Its
+  look is sober and native: grouped cards on a plain window, as System
+  Settings draws them, with colour kept for what means something: the
   status, warnings and the accent. The Settings tab's bar is docked at the
-  bottom. Its colours are checked for contrast over the whole wallpaper.
+  bottom. A test checks the contrast of every colour pair it draws, in
+  both appearances. It has no VoiceOver support: GPUI has none yet.
 
 Build it with `packaging/macos/build-app.sh`, which needs nothing beyond
-Rust and the command-line tools. It is signed ad hoc; built on the Mac that
+Rust and the command-line tools: GPUI compiles its Metal shaders when the
+app starts, so Xcode is not needed. It is signed ad hoc; built on the Mac that
 runs it, it carries no quarantine, so Gatekeeper lets it open. Its icon is
 drawn in [`apps/macos/icon/OpenVirtualSoundcard.svg`](../apps/macos/icon/OpenVirtualSoundcard.svg);
 `apps/macos/icon/make-icon.sh` renders it into the `.icns` the bundle carries

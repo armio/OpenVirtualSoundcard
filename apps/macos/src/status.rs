@@ -1,150 +1,166 @@
 //! The Status tab: what is worth a look, the inputs and the returns, then
 //! the clock and the counters, the device and the driver. Outages are
-//! pinned above both tabs (see [`crate::app`]); this tab shows the rest.
+//! pinned above both tabs (see [`crate::view`]); this tab shows the rest.
 
-use eframe::egui::{self, Label, RichText, Ui};
-use ovsc_control::{DeviceStatus, Status};
+use std::time::Instant;
 
-use crate::app::{App, Connection};
+use gpui::{
+    AnyElement, Context, Div, FontWeight, IntoElement, ParentElement, SharedString, Styled, Window,
+    div, prelude::*, px,
+};
+use ovsc_control::{DeviceStatus, Redundancy, Status};
+
 use crate::logic::{self, Light, PacketWindow, Problem};
-use crate::theme;
-use crate::widgets::{self, Copied, Severity, Width};
+use crate::model::Connection;
+use crate::theme::{self, Color, Palette, SEMIBOLD};
+use crate::view::AppView;
+use crate::widgets::{self, Severity, Width};
 
-pub fn show(app: &mut App, ui: &mut Ui) {
-    let restarting = app.restarting(ui.ctx());
-    let App { connection, copied, packets, .. } = app;
-    let Connection::Up(status) = connection else {
-        empty_state(connection, restarting, copied, ui);
-        return;
+pub fn show(
+    view: &AppView,
+    p: &Palette,
+    now: Instant,
+    wide: bool,
+    window: &mut Window,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    let model = &view.model;
+    let Connection::Up(status) = &model.connection else {
+        return empty_state(view, p, now, cx).into_any_element();
     };
+    let mut page = div().w_full().flex().flex_col();
     let (_, other) = logic::split_warnings(status);
     let (problems, news) = logic::problems_and_news(other);
     if !problems.is_empty() {
-        ui.add_space(theme::SECTION_GAP - 6.0);
         let heading = match problems.len() {
             1 => "Warning".to_owned(),
             n => format!("{n} warnings"),
         };
-        widgets::notice(ui, Severity::Warning, &heading, |ui| {
-            for (i, warning) in problems.iter().enumerate() {
-                if i > 0 {
-                    ui.add_space(6.0);
-                }
-                widgets::warning(ui, warning, copied);
-            }
-        });
+        let mut notice = widgets::notice("warnings", p, Severity::Warning, heading);
+        for warning in &problems {
+            notice = notice.child(div().pt(px(4.0)).child(view.warning(warning, p, cx)));
+        }
+        page = page.child(div().pt(px(theme::SECTION_GAP - 6.0)).child(notice));
     }
     if let Some(device) = &status.device {
         let (light, summary) = logic::rx_summary(&device.rx_channels);
-        widgets::section(ui, "Receive channels", Some((light, &summary)), |ui| {
-            rx_table(ui, device)
-        });
+        page = page.child(widgets::section(
+            p,
+            "Receive channels",
+            Some((light, summary)),
+            rx_table(device, p),
+        ));
         let (light, summary) = logic::tx_summary(device);
-        widgets::section(ui, "Transmit channels", Some((light, &summary)), |ui| {
-            tx_table(ui, device)
-        });
+        page = page.child(widgets::section(
+            p,
+            "Transmit channels",
+            Some((light, summary)),
+            tx_table(device, p),
+        ));
         if let Some(r) = &device.redundancy {
-            networks_section(ui, device, r);
+            page = page.child(networks_section(device, r, p, window));
         }
     }
-    widgets::pair(
-        ui,
-        |ui| clock_section(ui, status),
-        |ui| match &status.device {
-            Some(device) => packets_section(ui, status, device, packets),
-            None => {
-                widgets::section(ui, "Packets", None, |ui| {
-                    ui.label(RichText::new("Not on the network.").weak());
-                });
-            }
-        },
+    let packets = match &status.device {
+        Some(device) => {
+            packets_section(status, device, &model.packets, p, window).into_any_element()
+        }
+        None => widgets::section(
+            p,
+            "Packets",
+            None,
+            div().text_color(p.text2).child("Not on the network."),
+        )
+        .into_any_element(),
+    };
+    page = page.child(widgets::pair(wide, clock_section(status, p, window), packets)).child(
+        widgets::pair(wide, device_section(status, p, window), driver_section(status, p, window)),
     );
-    widgets::pair(ui, |ui| device_section(ui, status), |ui| driver_section(ui, status));
     if !news.is_empty() || !status.earlier.is_empty() {
-        let p = theme::palette(ui);
-        widgets::section(ui, "Changes from controllers", None, |ui| {
-            for item in &news {
-                ui.add(Label::new(*item).wrap());
-            }
-            if !news.is_empty() && !status.earlier.is_empty() {
-                widgets::separator(ui);
-            }
-            for item in &status.earlier {
-                ui.add(Label::new(RichText::new(item).color(p.text2)).wrap());
-            }
-        });
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .children(news.iter().map(|item| div().child(item.to_string())))
+            .when(!news.is_empty() && !status.earlier.is_empty(), |d| {
+                d.child(widgets::separator(p))
+            })
+            .children(
+                status.earlier.iter().map(|item| div().text_color(p.text2).child(item.clone())),
+            );
+        page = page.child(widgets::section(p, "Changes from controllers", None, body));
     }
     if !status.driver.detail.is_empty() {
-        ui.add_space(theme::SECTION_GAP - 6.0);
-        egui::CollapsingHeader::new(theme::headline("Diagnostics"))
-            .id_salt("diagnostics")
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.label(theme::caption("The driver's status, for a bug report."));
-                widgets::card(ui, |ui| {
-                    ui.add(
-                        Label::new(RichText::new(&status.driver.detail).monospace().small())
-                            .wrap()
-                            .selectable(true),
-                    );
-                });
-                if ui.button("Copy").clicked() {
-                    ui.ctx().copy_text(status.driver.detail.clone());
-                }
-            });
+        page = page.child(diagnostics(view, &status.driver.detail, p, cx));
     }
+    page.into_any_element()
 }
 
 /// Instead of the tab, when there is no status: what is wrong, what it
 /// means for the audio, and the way back.
-fn empty_state(connection: &Connection, restarting: bool, copied: &mut Copied, ui: &mut Ui) {
-    let p = theme::palette(ui);
-    ui.add_space((ui.available_height() * 0.10).clamp(16.0, 64.0));
-    ui.vertical_centered(|ui| {
-        // Wide enough for the start command's path on one line.
-        ui.set_max_width(600.0);
-        match connection {
-            Connection::Connecting => {
-                ui.spinner();
-                ui.label("Connecting to OpenVirtualSoundcard…");
-            }
-            Connection::Down(_) if restarting => {
-                ui.spinner();
-                ui.label(theme::semibold("Waiting for OpenVirtualSoundcard to come back…", 16.0));
-            }
-            Connection::Down(problem) => {
-                let light = match problem {
-                    Problem::NotRunning | Problem::NoAnswer | Problem::Lost => Light::Red,
-                    _ => Light::Amber,
-                };
-                widgets::mark(ui, light, 36.0);
-                ui.add_space(6.0);
-                ui.add(Label::new(theme::semibold(problem.title(), 18.0)).wrap());
-                if let Some(detail) = problem.detail() {
-                    ui.add_space(4.0);
-                    let font = egui::TextStyle::Body.resolve(ui.style());
-                    let job = widgets::rich_text(ui, &detail, font, p.text);
-                    ui.add(Label::new(job).wrap().selectable(true));
-                }
-                ui.add_space(4.0);
-                ui.add(Label::new(RichText::new(problem.hint()).color(p.text2)).wrap());
-                if let Some(command) = problem.command() {
-                    ui.add_space(8.0);
-                    widgets::command_row(ui, command, copied);
-                }
-                ui.add_space(10.0);
-                ui.label(theme::caption("The app tries again every second."));
-            }
-            Connection::Up(_) => {}
+fn empty_state(view: &AppView, p: &Palette, now: Instant, cx: &mut Context<AppView>) -> Div {
+    let waiting = |text: &'static str| {
+        div()
+            .w_full()
+            .pt(px(48.0))
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(10.0))
+            .child(widgets::spinner("waiting", 22.0, p.text2))
+            .child(div().text_size(px(15.0)).font_weight(SEMIBOLD).child(text))
+    };
+    match &view.model.connection {
+        Connection::Connecting => waiting("Connecting to OpenVirtualSoundcard…"),
+        Connection::Down(_) if view.model.restarting(now) => {
+            waiting("Waiting for OpenVirtualSoundcard to come back…")
         }
-    });
+        Connection::Down(problem) => {
+            let light = match problem {
+                Problem::NotRunning | Problem::NoAnswer | Problem::Lost => Light::Red,
+                _ => Light::Amber,
+            };
+            let body = div()
+                .w_full()
+                .max_w(px(600.0))
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(6.0))
+                .child(widgets::mark(light, 36.0, p))
+                .child(
+                    div()
+                        .pt(px(4.0))
+                        .text_size(px(18.0))
+                        .font_weight(SEMIBOLD)
+                        .text_center()
+                        .child(problem.title()),
+                )
+                .when_some(problem.detail(), |d, detail| {
+                    d.child(div().w_full().text_center().child(widgets::rich_text(
+                        &detail,
+                        p.text,
+                        FontWeight::NORMAL,
+                        p,
+                    )))
+                })
+                .child(div().w_full().text_center().text_color(p.text2).child(problem.hint()))
+                .when_some(problem.command(), |d, command| {
+                    let copy = view.copy_button("copy-start", command, p, cx);
+                    d.child(
+                        div().w_full().pt(px(6.0)).child(widgets::command_row(p, command, copy)),
+                    )
+                })
+                .child(widgets::caption("The app tries again every second.", p).pt(px(8.0)));
+            div().w_full().pt(px(40.0)).flex().flex_col().items_center().child(body)
+        }
+        Connection::Up(_) => div(),
+    }
 }
 
-fn rx_table(ui: &mut Ui, device: &DeviceStatus) {
-    let p = theme::palette(ui);
+fn rx_table(device: &DeviceStatus, p: &Palette) -> AnyElement {
     if device.rx_channels.is_empty() {
-        ui.label(RichText::new("No receive channels.").weak());
-        return;
+        return div().text_color(p.text2).child("No receive channels.").into_any_element();
     }
     let columns = [
         ("", Width::Fixed(14.0)),
@@ -153,155 +169,171 @@ fn rx_table(ui: &mut Ui, device: &DeviceStatus) {
         ("Source", Width::Share(1.5)),
         ("Subscription", Width::Share(1.3)),
     ];
-    widgets::table(ui, "rx", &columns, device.rx_channels.len(), |ui, row, col| {
-        let channel = &device.rx_channels[row];
-        let light = logic::channel_light(channel);
-        match col {
-            0 if light == Light::Grey => {
-                ui.label(RichText::new(logic::NONE).color(p.text3));
-            }
-            0 => {
-                widgets::mark(ui, light, 12.0).on_hover_text(logic::subscription_label(channel));
-            }
-            1 => {
-                ui.label(RichText::new((row + 1).to_string()).color(p.text2));
-            }
-            2 => {
-                ui.add(Label::new(&channel.name).truncate());
-            }
-            3 => {
-                let (source, color) = match &channel.source {
-                    Some(source) => (source.as_str(), p.text),
-                    None => (logic::NONE, p.text3),
-                };
-                ui.add(Label::new(RichText::new(source).color(color)).truncate());
-            }
-            _ => {
-                let color = match light {
-                    Light::Red | Light::Amber => p.ink(light),
-                    Light::Grey => p.text3,
-                    Light::Green => p.text,
-                };
-                let state = logic::subscription_label(channel);
-                ui.add(Label::new(RichText::new(state).color(color)).truncate());
-            }
-        }
-    });
+    let rows = device
+        .rx_channels
+        .iter()
+        .enumerate()
+        .map(|(i, channel)| {
+            let light = logic::channel_light(channel);
+            let state = logic::subscription_label(channel);
+            let mark = if light == Light::Grey {
+                div().text_color(p.text3).child(logic::NONE).into_any_element()
+            } else {
+                div()
+                    .id(SharedString::from(format!("rx-mark-{i}")))
+                    .child(widgets::mark(light, 12.0, p))
+                    .tooltip(widgets::Tooltip::text(state.clone()))
+                    .into_any_element()
+            };
+            let (source, source_color) = match &channel.source {
+                Some(source) => (source.clone(), p.text),
+                None => (logic::NONE.to_owned(), p.text3),
+            };
+            let state_color = match light {
+                Light::Red | Light::Amber => p.ink(light),
+                Light::Grey => p.text3,
+                Light::Green => p.text,
+            };
+            vec![
+                mark,
+                cell((i + 1).to_string(), p.text2),
+                cell(channel.name.clone(), p.text),
+                cell(source, source_color),
+                cell(state, state_color),
+            ]
+        })
+        .collect();
+    widgets::table(p, &columns, rows).into_any_element()
 }
 
-fn tx_table(ui: &mut Ui, device: &DeviceStatus) {
-    let p = theme::palette(ui);
+/// A table cell's text, cut short with an ellipsis.
+fn cell(text: impl Into<SharedString>, color: Color) -> AnyElement {
+    div().min_w_0().truncate().text_color(color).child(text.into()).into_any_element()
+}
+
+fn tx_table(device: &DeviceStatus, p: &Palette) -> AnyElement {
     if device.tx_flows.is_empty() {
-        ui.add(
-            Label::new(
-                RichText::new(
-                    "No device receives from this one: patch the returns in Dante Controller.",
-                )
-                .color(p.text2),
-            )
-            .wrap(),
-        );
-        return;
+        return div()
+            .text_color(p.text2)
+            .child("No device receives from this one: patch the returns in Dante Controller.")
+            .into_any_element();
     }
     let columns = [
         ("Received by", Width::Share(1.4)),
         ("Address", Width::Share(1.0)),
         ("Channels", Width::Share(1.0)),
     ];
-    widgets::table(ui, "tx", &columns, device.tx_flows.len(), |ui, row, col| {
-        let flow = &device.tx_flows[row];
-        match col {
-            0 => ui.add(Label::new(logic::flow_receiver(flow)).truncate()),
-            1 => ui.add(
-                Label::new(RichText::new(logic::flow_address_label(flow)).color(p.text2))
-                    .truncate(),
-            ),
-            _ => ui.add(Label::new(logic::channels_label(&flow.channels)).truncate()),
-        };
-    });
+    let rows = device
+        .tx_flows
+        .iter()
+        .map(|flow| {
+            vec![
+                cell(logic::flow_receiver(flow), p.text),
+                cell(logic::flow_address_label(flow), p.text2),
+                cell(logic::channels_label(&flow.channels), p.text),
+            ]
+        })
+        .collect();
+    widgets::table(p, &columns, rows).into_any_element()
+}
+
+/// A value in name and value rows.
+fn value(text: impl Into<SharedString>, color: Color) -> AnyElement {
+    div().text_color(color).child(text.into()).into_any_element()
+}
+
+/// A number in name and value rows: monospaced, so that it does not jump.
+fn number(text: impl Into<SharedString>, color: Color) -> AnyElement {
+    div()
+        .font_family(theme::mono())
+        .text_size(px(12.0))
+        .text_color(color)
+        .child(text.into())
+        .into_any_element()
 }
 
 /// The two networks of a redundant Dante system: which carry the audio and
 /// the clock.
-fn networks_section(ui: &mut Ui, device: &DeviceStatus, r: &ovsc_control::Redundancy) {
-    let p = theme::palette(ui);
+fn networks_section(device: &DeviceStatus, r: &Redundancy, p: &Palette, window: &Window) -> Div {
     let (light, summary) = logic::networks_summary(r);
-    widgets::section(ui, "Networks", Some((light, &summary)), |ui| {
-        let rows: Vec<(&str, RichText)> = logic::network_rows(device, r)
-            .into_iter()
-            .map(|(name, value, light)| {
-                let text = match light {
-                    Light::Amber | Light::Red => RichText::new(value).color(p.ink(light)),
-                    Light::Grey => RichText::new(value).monospace().color(p.text2),
-                    Light::Green => RichText::new(value),
-                };
-                (name, text)
-            })
-            .collect();
-        widgets::rows(ui, "networks", &rows);
-    });
+    let rows: Vec<(&'static str, AnyElement)> = logic::network_rows(device, r)
+        .into_iter()
+        .map(|(name, text, light)| {
+            let v = match light {
+                Light::Amber | Light::Red => value(text, p.ink(light)),
+                Light::Grey => number(text, p.text2),
+                Light::Green => value(text, p.text),
+            };
+            (name, v)
+        })
+        .collect();
+    let names: Vec<&str> = rows.iter().map(|(n, _)| *n).collect();
+    let width = widgets::names_width(&names, window);
+    widgets::section(p, "Networks", Some((light, summary)), widgets::rows(p, width, rows))
 }
 
-fn clock_section(ui: &mut Ui, status: &Status) {
-    let p = theme::palette(ui);
+fn clock_section(status: &Status, p: &Palette, window: &Window) -> Div {
     let (light, _) = logic::clock_light(&status.clock);
-    widgets::section(ui, "Clock", None, |ui| {
-        let rows: Vec<(&str, RichText)> = logic::clock_rows(&status.clock)
-            .into_iter()
-            .map(|(name, value)| {
-                let text = match name {
-                    "State" if light != Light::Green => RichText::new(value).color(p.ink(light)),
-                    "Offset" | "Network delay" | "Drift" => RichText::new(value).monospace(),
-                    _ => RichText::new(value),
-                };
-                (name, text)
-            })
-            .collect();
-        widgets::rows(ui, "clock", &rows);
-    });
+    let rows: Vec<(&'static str, AnyElement)> = logic::clock_rows(&status.clock)
+        .into_iter()
+        .map(|(name, text)| {
+            let v = match name {
+                "State" if light != Light::Green => value(text, p.ink(light)),
+                "Offset" | "Network delay" | "Drift" => number(text, p.text),
+                _ => value(text, p.text),
+            };
+            (name, v)
+        })
+        .collect();
+    let names: Vec<&str> = rows.iter().map(|(n, _)| *n).collect();
+    let width = widgets::names_width(&names, window);
+    widgets::section(p, "Clock", None, widgets::rows(p, width, rows))
 }
 
-fn packets_section(ui: &mut Ui, status: &Status, device: &DeviceStatus, window: &PacketWindow) {
-    let p = theme::palette(ui);
+fn packets_section(
+    status: &Status,
+    device: &DeviceStatus,
+    window_30s: &PacketWindow,
+    p: &Palette,
+    window: &Window,
+) -> Div {
     let counts = device.packets;
-    let (late, lost, without_audio) = window.rises();
+    let (late, lost, without_audio) = window_30s.rises();
     let counter = |total: u64, rise: u64| {
         if rise > 0 {
-            RichText::new(format!(
-                "{} · +{} in 30 s",
-                logic::count_label(total),
-                logic::count_label(rise)
-            ))
-            .monospace()
-            .color(p.amber_ink)
+            number(
+                format!("{} · +{} in 30 s", logic::count_label(total), logic::count_label(rise)),
+                p.amber_ink,
+            )
         } else {
-            RichText::new(logic::count_label(total)).monospace()
+            number(logic::count_label(total), p.text)
         }
     };
     let underruns = if status.driver.io_running {
         counter(counts.tx_underruns, without_audio)
     } else {
-        RichText::new(format!("{} (no application playing)", logic::NONE)).color(p.text2)
+        value(format!("{} (no application playing)", logic::NONE), p.text2)
     };
-    widgets::section(ui, "Packets", Some((Light::Grey, "since the engine started")), |ui| {
-        widgets::rows(
-            ui,
-            "packets",
-            &[
-                ("Received", RichText::new(logic::count_label(counts.rx)).monospace()),
-                ("Arrived too late", counter(counts.rx_late, late)),
-                ("Lost", counter(counts.rx_lost, lost)),
-                ("Sent", RichText::new(logic::count_label(counts.tx)).monospace()),
-                ("Sent without audio", underruns),
-            ],
-        );
-    });
+    let rows = vec![
+        ("Received", number(logic::count_label(counts.rx), p.text)),
+        ("Arrived too late", counter(counts.rx_late, late)),
+        ("Lost", counter(counts.rx_lost, lost)),
+        ("Sent", number(logic::count_label(counts.tx), p.text)),
+        ("Sent without audio", underruns),
+    ];
+    let names: Vec<&str> = rows.iter().map(|(n, _)| *n).collect();
+    let width = widgets::names_width(&names, window);
+    widgets::section(
+        p,
+        "Packets",
+        Some((Light::Grey, "since the engine started".to_owned())),
+        widgets::rows(p, width, rows),
+    )
 }
 
-fn device_section(ui: &mut Ui, status: &Status) {
-    let p = theme::palette(ui);
+fn device_section(status: &Status, p: &Palette, window: &Window) -> Div {
     let version = format!("App {} · daemon {}", env!("CARGO_PKG_VERSION"), status.version);
-    widgets::section(ui, "Device", None, |ui| match &status.device {
+    let body = match &status.device {
         Some(d) => {
             let interface = match (d.interface.is_empty(), d.ip.is_empty()) {
                 (false, false) => format!("{} ({})", d.interface, d.ip),
@@ -309,51 +341,79 @@ fn device_section(ui: &mut Ui, status: &Status) {
                 (true, false) => d.ip.clone(),
                 (true, true) => logic::NONE.to_owned(),
             };
-            widgets::rows(
-                ui,
-                "device",
-                &[
-                    ("Interface", RichText::new(interface)),
-                    ("Sample rate", RichText::new(logic::rate_label(d.sample_rate))),
-                    ("Bit depth", RichText::new(logic::bits_label(d.bits_per_sample))),
-                    ("Receive latency", RichText::new(logic::latency_label(d.latency_ms))),
-                    ("Show lock", RichText::new(logic::lock_label(d.remote_settings_locked))),
-                    ("Version", RichText::new(version).color(p.text2)),
-                ],
-            );
+            let rows = vec![
+                ("Interface", value(interface, p.text)),
+                ("Sample rate", value(logic::rate_label(d.sample_rate), p.text)),
+                ("Bit depth", value(logic::bits_label(d.bits_per_sample), p.text)),
+                ("Receive latency", value(logic::latency_label(d.latency_ms), p.text)),
+                ("Show lock", value(logic::lock_label(d.remote_settings_locked), p.text)),
+                ("Version", value(version, p.text2)),
+            ];
+            let names: Vec<&str> = rows.iter().map(|(n, _)| *n).collect();
+            let width = widgets::names_width(&names, window);
+            widgets::rows(p, width, rows)
         }
         None => {
-            ui.label(RichText::new("Not on the network: see above.").color(p.text2));
-            widgets::rows(ui, "device", &[("Version", RichText::new(version).color(p.text2))]);
+            let width = widgets::names_width(&["Version"], window);
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(div().text_color(p.text2).child("Not on the network: see above."))
+                .child(widgets::rows(p, width, vec![("Version", value(version, p.text2))]))
         }
-    });
+    };
+    widgets::section(p, "Device", None, body)
 }
 
-fn driver_section(ui: &mut Ui, status: &Status) {
-    let p = theme::palette(ui);
+fn driver_section(status: &Status, p: &Palette, window: &Window) -> Div {
     let driver = &status.driver;
-    let yes_no = |b: bool| RichText::new(if b { "Yes" } else { "No" });
+    let yes_no = |b: bool| value(if b { "Yes" } else { "No" }, p.text);
     let loaded = if driver.faulted {
-        RichText::new("Failed: restart Core Audio").color(p.red_ink)
+        value("Failed: restart Core Audio", p.red_ink)
     } else if driver.connected {
         yes_no(true)
     } else {
-        RichText::new("No").color(p.red_ink)
+        value("No", p.red_ink)
     };
     let audio = logic::audio_lamp(status);
     let audio_text = match audio.light {
-        Light::Green | Light::Grey => RichText::new(&audio.word),
-        light => RichText::new(&audio.word).color(p.ink(light)),
+        Light::Green | Light::Grey => value(audio.word.clone(), p.text),
+        light => value(audio.word.clone(), p.ink(light)),
     };
-    widgets::section(ui, "Core Audio driver", None, |ui| {
-        widgets::rows(
-            ui,
-            "driver",
-            &[
-                ("Loaded by Core Audio", loaded),
-                ("Used by an application", yes_no(driver.io_running)),
-                ("Audio", audio_text),
-            ],
-        );
-    });
+    let rows = vec![
+        ("Loaded by Core Audio", loaded),
+        ("Used by an application", yes_no(driver.io_running)),
+        ("Audio", audio_text),
+    ];
+    let names: Vec<&str> = rows.iter().map(|(n, _)| *n).collect();
+    let width = widgets::names_width(&names, window);
+    widgets::section(p, "Core Audio driver", None, widgets::rows(p, width, rows))
+}
+
+/// The driver's status line, folded away: for a bug report.
+fn diagnostics(view: &AppView, detail: &str, p: &Palette, cx: &mut Context<AppView>) -> Div {
+    let open = view.diagnostics_open;
+    let toggle = div()
+        .id("diagnostics")
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .cursor_pointer()
+        .child(div().w(px(10.0)).text_color(p.text2).child(if open { "▾" } else { "▸" }))
+        .child(div().font_weight(SEMIBOLD).child("Diagnostics"))
+        .on_click(cx.listener(|view, _, _, cx| {
+            view.diagnostics_open = !view.diagnostics_open;
+            cx.notify();
+        }));
+    div().w_full().flex().flex_col().gap(px(8.0)).pt(px(theme::SECTION_GAP)).child(toggle).when(
+        open,
+        |d| {
+            d.child(widgets::caption("The driver's status, for a bug report.", p))
+                .child(widgets::card(p).child(
+                    div().font_family(theme::mono()).text_size(px(11.0)).child(detail.to_owned()),
+                ))
+                .child(div().flex().child(view.copy_button("copy-diagnostics", detail, p, cx)))
+        },
+    )
 }
