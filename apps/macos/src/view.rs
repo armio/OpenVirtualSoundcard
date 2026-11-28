@@ -675,8 +675,10 @@ impl Render for AppView {
     }
 }
 
-/// The Dock's attention while audio is down, on macOS.
+/// The Dock's attention while audio is down, on macOS. objc 0.2's macros
+/// test `feature = "cargo-clippy"`, a cfg this crate does not declare.
 #[cfg(target_os = "macos")]
+#[allow(unexpected_cfgs)]
 mod dock {
     use objc::runtime::Object;
     use objc::{class, msg_send, sel, sel_impl};
