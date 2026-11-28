@@ -9,11 +9,10 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::net::UdpSocket;
 use tracing::{debug, info, trace, warn};
 
 use super::bmc::{MasterChange, MasterDataset, MasterSelector};
-use super::net::{Endpoints, RECV_BUF_LEN, SplitMix64, recv_timestamped, source_ipv4};
+use super::net::{Endpoints, Kind, Link, RECV_BUF_LEN, SplitMix64, source_ipv4};
 use super::servo::{Servo, ServoConfig, ServoEvent, ServoState};
 use super::wire::{
     Body, DecodeError, DelayRespBody, Flags, FollowUpBody, Header, Message, PortIdentity,
@@ -567,6 +566,8 @@ impl Core {
                 .unwrap_or(u32::MAX),
             last_sync_ns: self.counters.last_sync_ns,
             holdover_until_ns: self.holdover_deadline_ns,
+            // ClockOutput says how the traffic is read.
+            reads_interface: false,
         }
     }
 
@@ -602,11 +603,14 @@ pub(crate) fn fmt_uuid(uuid: &[u8; 6]) -> String {
 pub(crate) struct ClockOutput {
     writer: ClockWriter,
     stopped: Mutex<bool>,
+    /// The PTP traffic is read from the interface (see [`Link`]): every
+    /// status says so.
+    reads_interface: bool,
 }
 
 impl ClockOutput {
-    pub fn new(writer: ClockWriter) -> ClockOutput {
-        ClockOutput { writer, stopped: Mutex::new(false) }
+    pub fn new(writer: ClockWriter, reads_interface: bool) -> ClockOutput {
+        ClockOutput { writer, stopped: Mutex::new(false), reads_interface }
     }
 
     pub fn apply(&self, output: Output) {
@@ -617,7 +621,9 @@ impl ClockOutput {
         match output {
             Output::Publish(snap) => self.writer.publish(snap),
             Output::Invalidate => self.writer.invalidate(),
-            Output::Status(status) => self.writer.set_status(status),
+            Output::Status(status) => self
+                .writer
+                .set_status(ClockStatus { reads_interface: self.reads_interface, ..status }),
         }
     }
 
@@ -634,8 +640,7 @@ impl ClockOutput {
 /// sends Delay_Reqs. Runs until aborted.
 pub(crate) async fn run(
     mut core: Core,
-    event: UdpSocket,
-    general: UdpSocket,
+    mut link: Link,
     endpoints: Endpoints,
     output: Arc<ClockOutput>,
     mut failover: Option<Failover>,
@@ -648,22 +653,17 @@ pub(crate) async fn run(
         let wait = core.next_deadline(now).saturating_sub(now);
         let sleep = tokio::time::sleep(Duration::from_nanos(wait));
         let mut backoff = false;
-        // `biased`: the event socket is polled first, so when both are ready
-        // a Sync gets its receive timestamp before a Follow_Up is processed.
         tokio::select! {
             biased;
-            r = recv_timestamped(&event, &mut event_buf) => match r {
+            (kind, r) = link.recv(&mut event_buf, &mut general_buf) => match (kind, r) {
                 // Syncs, and other followers' Delay_Reqs: from the network
                 // followed only.
-                Ok((n, src, t)) => {
+                (Kind::Event, Ok((n, src, t))) => {
                     if failover.is_none_or(|f| f.takes(f.network(src))) {
                         core.handle_packet(&event_buf[..n], src, t, &mut out);
                     }
                 }
-                Err(e) => backoff = recv_error(e),
-            },
-            r = recv_timestamped(&general, &mut general_buf) => match r {
-                Ok((n, src, t)) => {
+                (Kind::General, Ok((n, src, t))) => {
                     let net = failover.map(|f| f.network(src));
                     if let (Some(f), Some(net)) = (&mut failover, net) {
                         f.heard(net, local_now_ns());
@@ -672,7 +672,7 @@ pub(crate) async fn run(
                         core.handle_packet(&general_buf[..n], src, t, &mut out);
                     }
                 }
-                Err(e) => backoff = recv_error(e),
+                (_, Err(e)) => backoff = recv_error(e),
             },
             () = sleep => {}
         }
@@ -689,7 +689,9 @@ pub(crate) async fn run(
                 ),
             }
             // Delay_Reqs go to the leader followed.
-            if let Err(e) = socket2::SockRef::from(&event).set_multicast_if_v4(&interface) {
+            if let Err(e) =
+                socket2::SockRef::from(link.event_socket()).set_multicast_if_v4(&interface)
+            {
                 warn!("cannot send PTP Delay_Reqs on {interface}: {e}");
             }
         }
@@ -701,7 +703,7 @@ pub(crate) async fn run(
         if core.delay_req_due(local_now_ns()) {
             let t3 = local_now_ns();
             if let Some(packet) = core.make_delay_req(t3) {
-                if let Err(e) = event.send_to(&packet, endpoints.event_dest()).await {
+                if let Err(e) = link.event_socket().send_to(&packet, endpoints.event_dest()).await {
                     warn!("cannot send PTP Delay_Req: {e}");
                 }
             }

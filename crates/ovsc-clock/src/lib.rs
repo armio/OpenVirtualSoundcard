@@ -125,6 +125,10 @@ pub struct ClockStatus {
     /// master not heard yet): the local time at which it will be
     /// invalidated unless they arrive.
     pub holdover_until_ns: Option<u64>,
+    /// The PTP traffic is read from the network interface directly,
+    /// because another program holds the PTP ports for itself (on a Mac,
+    /// usually AirPlay); see [`ptp::PtpCapture`].
+    pub reads_interface: bool,
 }
 
 /// Receives every change of a [`MediaClock`], for example to copy it into

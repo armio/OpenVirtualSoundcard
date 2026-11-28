@@ -66,6 +66,12 @@ The first public version, not released yet.
   interfaces; the app's Networks section and its warnings show what each
   network brings. A secondary network that is down never stops the
   primary's audio.
+- The PTP clock works beside AirPlay: when another program holds the PTP
+  ports (UDP 319 and 320) for itself, as AirPlay's own clock does on a Mac,
+  the follower reads the PTP traffic from the interface directly (BPF on
+  macOS, a packet socket on Linux) and sends its Delay_Reqs from a port of
+  its own. `[clock] ptp_capture` is `auto` (the default), `always` or
+  `never`; the app shows the clock's source as read from the interface.
 - Health in the app and the log: the app's Audio tile is green **Flowing**
   only while an application plays and nothing audible went wrong in the
   last 30 s, grey **Idle** when none plays, amber **Dropouts** when

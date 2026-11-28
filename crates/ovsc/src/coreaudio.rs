@@ -608,6 +608,7 @@ impl Engine {
                 let mut ptp = PtpConfig::new(iface.ip, iface.mac);
                 ptp.event_port = cfg.clock.ptp_event_port;
                 ptp.general_port = cfg.clock.ptp_general_port;
+                ptp.capture = cfg.clock.ptp_capture.into();
                 ptp.secondary = config::ptp_secondary(&cfg.device);
                 let (follower, clock) =
                     PtpFollower::start(ptp).await.context("starting the PTP clock follower")?;

@@ -452,8 +452,11 @@ fn clock_info(cfg: &AppConfig, clock: &MediaClock) -> ClockInfo {
     // Without a leader, a clock that runs on until a deadline holds over:
     // audio still flows, for now (MACOS.md, "Clock states and silence").
     let holdover = s.master.is_none() && s.holdover_until_ns.is_some();
+    // The PTP traffic read from the interface: another program holds the
+    // PTP ports for itself.
+    let source = if s.reads_interface { "ptp-capture" } else { clock_source(cfg) };
     ClockInfo {
-        source: clock_source(cfg).into(),
+        source: source.into(),
         state: if holdover { "Holdover".to_owned() } else { format!("{:?}", s.state) },
         locked: matches!(s.state, ClockState::Locked | ClockState::FreeRunning),
         leader: s.master.map(|m| m.addr.to_string()),
@@ -861,6 +864,23 @@ backend = "coreaudio"
         assert!(new.contains("# Name shown in Dante Controller.\nname = \"ovsc\""), "{new}");
         let cfg: AppConfig = toml::from_str(&new).unwrap();
         assert_eq!((cfg.device.sample_rate, cfg.device.interface.as_str()), (96_000, "en7"));
+    }
+
+    #[test]
+    fn a_clock_reading_the_interface_says_so() {
+        let cfg = AppConfig::default();
+        let (clock, writer) = ovsc_clock::MediaClock::new();
+        writer.set_status(ovsc_clock::ClockStatus {
+            state: ClockState::Locked,
+            ..Default::default()
+        });
+        assert_eq!(clock_info(&cfg, &clock).source, "ptp");
+        writer.set_status(ovsc_clock::ClockStatus {
+            state: ClockState::Locked,
+            reads_interface: true,
+            ..Default::default()
+        });
+        assert_eq!(clock_info(&cfg, &clock).source, "ptp-capture");
     }
 
     #[test]

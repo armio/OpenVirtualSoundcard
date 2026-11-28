@@ -739,6 +739,8 @@ pub fn clock_lamp(clock: &ClockInfo) -> Lamp {
 pub fn clock_source_label(source: &str) -> String {
     match source {
         "ptp" => "The network (PTP)".to_owned(),
+        // Another program (AirPlay, on a Mac) holds the PTP ports.
+        "ptp-capture" => "The network (PTP), read from the interface".to_owned(),
         "free" => "This Mac's own clock".to_owned(),
         other => other.to_owned(),
     }
@@ -2225,5 +2227,12 @@ mod tests {
         assert!(problem.message().contains("different versions"));
         assert!(problem.message().contains("9.0.0"));
         assert!(problem.hint().contains(&format!("{}", PROTOCOL_VERSION + 1)));
+    }
+
+    #[test]
+    fn clock_sources_in_words() {
+        assert_eq!(clock_source_label("ptp"), "The network (PTP)");
+        assert_eq!(clock_source_label("ptp-capture"), "The network (PTP), read from the interface");
+        assert_eq!(clock_source_label("free"), "This Mac's own clock");
     }
 }

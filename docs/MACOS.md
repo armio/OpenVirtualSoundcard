@@ -286,14 +286,29 @@ The clock follows the Dante leader with PTP on UDP 319 and 320, which no
 setting moves: every Dante device uses them. macOS's AirPlay keeps its own
 PTP clock on the same ports. The daemon opens them to share, but macOS lets
 two programs share a port only when both ask to, and AirPlay may hold them
-for itself. Then the engine cannot start: the app shows the engine as down,
-and the log says `cannot start the engine: starting the PTP clock follower:
-cannot bind UDP port 319: Address already in use`, naming AirPlay as the
-likely holder, and retries every few seconds. Turn off **AirPlay Receiver**
-(System Settings, General, AirDrop & Handoff), and do not send this Mac's
-audio to AirPlay speakers while OpenVirtualSoundcard runs: the engine starts
-at its next try. `sudo lsof -nP -iUDP:319 -iUDP:320` shows which programs
-hold the ports.
+for itself while **AirPlay Receiver** is on (System Settings, General,
+AirDrop & Handoff) or audio goes to AirPlay speakers.
+
+Then the daemon reads the PTP traffic from the Dante interface directly, as
+a packet capture does (BPF, which it may use as root), and sends its own
+clock requests (Delay_Req) from a port of its own; a Dante leader answers
+them to the PTP group, not to the sender's port. The log says `cannot bind
+UDP port 319: Address already in use. ... Reading the PTP traffic from the
+interface instead`, and the app's Clock section shows the source as
+**The network (PTP), read from the interface**. Nothing else changes: the
+receive times still come from the kernel (BPF's, in microseconds), and the
+audio is the same. `[clock] ptp_capture` chooses:
+
+| `ptp_capture` | The PTP traffic |
+|---|---|
+| `"auto"` (default) | Through the ports; from the interface while another program holds them. |
+| `"always"` | Always from the interface. |
+| `"never"` | Always through the ports: while another program holds them, the engine cannot start, and retries every few seconds. |
+
+This way of reading PTP is new and not yet tested with Dante hardware with
+AirPlay on. For a show, keeping AirPlay Receiver off remains the simplest
+and most predictable setup. `sudo lsof -nP -iUDP:319 -iUDP:320` shows which
+programs hold the ports.
 
 ### Channels, sample rate and latency
 
@@ -924,8 +939,10 @@ The configuration, the state and the logs stay for a later install; add
 
 4. The device appears but not on the network (the app shows the engine as
    down): the app and the log give the reason. `cannot bind UDP port 319`
-   means another program holds the PTP ports, usually AirPlay (see [Ports
-   and other Dante software](#ports-and-other-dante-software)).
+   means another program holds the PTP ports, usually AirPlay, and that
+   reading them from the interface failed too, or is off (`ptp_capture =
+   "never"`; see [Ports and other Dante
+   software](#ports-and-other-dante-software)).
 
 ### The device is silent
 

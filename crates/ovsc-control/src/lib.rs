@@ -244,7 +244,9 @@ pub struct PacketCounts {
 /// The media clock.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClockInfo {
-    /// `"ptp"` (following the network) or `"free"` (this Mac's own clock).
+    /// `"ptp"` (following the network), `"ptp-capture"` (following it, the
+    /// PTP traffic read from the interface because another program holds
+    /// the PTP ports for itself) or `"free"` (this Mac's own clock).
     pub source: String,
     /// `"Unlocked"`, `"Locking"`, `"Locked"`, `"Holdover"` or `"FreeRunning"`.
     pub state: String,

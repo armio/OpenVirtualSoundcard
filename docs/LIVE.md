@@ -227,8 +227,9 @@ computer during a show.
   Spotlight indexing of external drives, and background apps.
 * Turn off **AirPlay Receiver** (System Settings, General, AirDrop &
   Handoff), and send no audio to AirPlay speakers. AirPlay keeps its own PTP
-  clock on the ports OVSC's clock needs, and while it holds them OVSC cannot
-  join the Dante network (`docs/MACOS.md`, Ports and other Dante software).
+  clock on the ports OVSC's clock needs. While it holds them, OVSC reads the
+  PTP traffic from the interface instead, which is new and not yet proven on
+  a show (`docs/MACOS.md`, Ports and other Dante software).
 * Set the plug-in host to the device **Open Virtual Soundcard** for both
   input and output, at the console's sample rate.
 * Put a true-peak limiter last in every chain that feeds in-ears or the PA.

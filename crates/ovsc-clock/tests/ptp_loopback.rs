@@ -12,7 +12,7 @@ use ovsc_clock::ptp::master::{TestMaster, TestMasterConfig};
 use ovsc_clock::ptp::wire::{
     Body, COMM_TECH_ETHERNET, Flags, Header, Message, PortIdentity, Subdomain, SyncBody, Timestamp,
 };
-use ovsc_clock::ptp::{PtpConfig, PtpFollower};
+use ovsc_clock::ptp::{PtpCapture, PtpConfig, PtpFollower};
 use ovsc_clock::{ClockState, free_running_clock, system_clock};
 use socket2::{Domain, Protocol, Socket, Type};
 
@@ -145,4 +145,110 @@ async fn test_master_goes_silent_when_another_master_appears() {
     watch_for(Duration::from_millis(100));
     assert_eq!(watch_for(Duration::from_millis(500)), 0, "test master still sends Syncs");
     master.shutdown();
+}
+
+/// Whether `e`, from starting a follower that reads the interface, says
+/// this process may not: such tests then stop, saying so. Reading the
+/// interface needs root (or CAP_NET_RAW on Linux, access to /dev/bpf on
+/// macOS).
+fn not_allowed(e: &std::io::Error) -> bool {
+    let denied = e.kind() == std::io::ErrorKind::PermissionDenied;
+    if denied {
+        eprintln!("not run: reading the interface is not allowed here ({e})");
+    }
+    denied
+}
+
+/// A Sync from a master no test runs, to the group on `port`, sent from a
+/// port of its own.
+fn foreign_sync(sender: &UdpSocket, port: u16, seq: u16) {
+    let other = PortIdentity { uuid: [0x00, 0x1d, 0xc1, 0x0a, 0x0b, 0x0c], port_id: 1 };
+    let sync = Message {
+        header: Header::new(Subdomain::DEFAULT, other, seq, Flags::ASSIST),
+        body: Body::Sync(SyncBody {
+            origin_timestamp: Timestamp::from_ns(system_clock().now_ns().unwrap()),
+            grandmaster_communication_technology: COMM_TECH_ETHERNET,
+            grandmaster_clock_uuid: other.uuid,
+            grandmaster_clock_stratum: 4,
+            grandmaster_clock_identifier: *b"DFLT",
+            ..SyncBody::default()
+        }),
+    };
+    sender.send_to(&sync.encode(), SocketAddrV4::new(GROUP, port)).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn follower_locks_reading_the_interface() {
+    const PORT: u16 = 31519;
+    let reference = free_running_clock();
+    let master =
+        TestMaster::start(master_config(PORT, Duration::from_millis(125)), reference.clone())
+            .await
+            .expect("start test master");
+    let mut config = PtpConfig::new(LOOPBACK, FOLLOWER_UUID);
+    config.event_port = PORT;
+    config.general_port = PORT + 1;
+    config.delay_req_interval = Duration::from_millis(500);
+    config.capture = PtpCapture::Always;
+    let (follower, clock) = match PtpFollower::start(config).await {
+        Ok(f) => f,
+        Err(e) if not_allowed(&e) => return,
+        Err(e) => panic!("start follower: {e}"),
+    };
+    assert!(follower.reads_interface());
+
+    let started = Instant::now();
+    while clock.status().state != ClockState::Locked {
+        assert!(started.elapsed() < Duration::from_secs(10), "not locked: {:?}", clock.status());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let status = follower.status();
+    eprintln!("locked after {:?}: {status:?}", started.elapsed());
+    assert!(status.reads_interface);
+    assert_eq!(status.master.expect("master info").uuid, MASTER_UUID);
+    // The master answered the Delay_Reqs sent from the follower's own port.
+    assert!(status.mean_path_delay_ns > 0 && status.mean_path_delay_ns < 1_000_000, "{status:?}");
+    let diff = clock.now_ns().unwrap() as i64 - reference.now_ns().unwrap() as i64;
+    assert!(diff.abs() < 1_000_000, "follower is {diff} ns off the master");
+    follower.shutdown();
+    master.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ports_held_by_another_program_are_read_from_the_interface() {
+    const PORT: u16 = 31619;
+    // Another program holds the event port for itself (no SO_REUSEADDR or
+    // SO_REUSEPORT), as AirPlay does on a Mac.
+    let _squatter = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, PORT)).unwrap();
+    let mut config = PtpConfig::new(LOOPBACK, FOLLOWER_UUID);
+    config.event_port = PORT;
+    config.general_port = PORT + 1;
+
+    // Without the fallback the follower cannot start.
+    let never = PtpConfig { capture: PtpCapture::Never, ..config.clone() };
+    let e = PtpFollower::start(never).await.expect_err("the port is held");
+    assert_eq!(e.kind(), std::io::ErrorKind::AddrInUse, "{e}");
+
+    // With it, the follower reads the interface and hears a master.
+    let (follower, clock) = match PtpFollower::start(config).await {
+        Ok(f) => f,
+        Err(e) if not_allowed(&e) => return,
+        Err(e) => panic!("start follower: {e}"),
+    };
+    assert!(follower.reads_interface());
+    let sender = raw_socket(0);
+    let started = Instant::now();
+    let mut seq = 0;
+    while clock.status().master.is_none() {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "no master heard: {:?}",
+            clock.status()
+        );
+        foreign_sync(&sender, PORT, seq);
+        seq += 1;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(clock.status().reads_interface);
+    follower.shutdown();
 }

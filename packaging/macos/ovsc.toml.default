@@ -57,6 +57,11 @@ settings = 38700
 # "ptp" follows the Dante network's PTP master. "free" runs on this Mac's
 # own clock, for a network without a master.
 source = "ptp"
+# PTP uses UDP 319 and 320, which AirPlay's own clock may hold for itself
+# while AirPlay Receiver is on. "auto" then reads the PTP traffic from the
+# network interface directly; "always" does so from the start; "never"
+# fails while another program holds the ports.
+# ptp_capture = "auto"
 
 [audio]
 backend = "coreaudio"
