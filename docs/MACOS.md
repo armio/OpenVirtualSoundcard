@@ -163,6 +163,52 @@ address, the daemon keeps running and retries every few seconds (2 s, backing
 off to 5 s), logging `cannot start the engine: ...; retrying until it
 starts`. The device stays present and silent meanwhile.
 
+### Dante redundancy: two networks
+
+On a redundant Dante system (separate primary and secondary networks, each
+with its own switches, and devices with a port on each), give the Mac a
+second wired interface on the secondary network and name it in
+`[device] secondary_interface`, or choose it under **Secondary network** in
+the app's Settings (this restarts the daemon):
+
+```toml
+[device]
+interface = "en7"            # the primary network
+secondary_interface = "en8"  # the secondary network, often 172.31.x.x/16
+```
+
+The secondary interface must be another interface, on another network than
+the primary's. With it, OVSC:
+
+* announces itself on both networks (Dante Controller lists both
+  addresses), and asks redundant transmitters for their flows on both. A
+  device on one network still gets its flows on the primary;
+* receives each redundant flow on both networks and plays whichever copy
+  arrives: either network can fail, a cable or a switch, without a gap;
+* sends its own flows on both networks to receivers that ask for that;
+* follows the PTP leader on the primary network, and on the secondary while
+  the primary has none (after 2 s without its messages; back to the primary
+  after 10 s of steady messages there);
+* keeps its control services (Dante Controller's view, renames, settings)
+  on the primary network.
+
+The app's Status tab then has a **Networks** section: what each network
+brings, its packets, and which network the clock follows. Warnings say
+when a network brings nothing, and redundancy is lost.
+
+A secondary interface without an address when the daemon starts (its cable
+out) leaves the device on the primary network alone, with a warning, until
+the daemon restarts. The daemon never restarts on its own for the secondary
+interface: audio goes on on the primary meanwhile. If the secondary
+interface comes back with another address, or after its adapter was
+detached and attached again, the warning says to restart the daemon to use
+it again (`sudo launchctl kickstart -k system/org.openvirtualsoundcard.daemon`,
+between songs).
+
+Redundancy needs macOS or Linux. What real Dante devices send for a flow on
+two networks has not been captured yet: see `docs/PROTOCOL.md` §11 and the
+interoperation notes in `docs/LIVE.md`.
+
 ### The device name
 
 Dante Controller lists devices by name, and subscriptions find their
@@ -235,6 +281,34 @@ answers ARC there. Dante Virtual Soundcard and Dante Via are Dante devices on
 those ports too: stop them while OpenVirtualSoundcard runs. A configuration written by an earlier version lacks
 `[device.ports]`; the log then says `cannot bind UDP port 8800: Address
 already in use`. Add the section and restart the daemon.
+
+The clock follows the Dante leader with PTP on UDP 319 and 320, which no
+setting moves: every Dante device uses them. macOS's AirPlay keeps its own
+PTP clock on the same ports. The daemon opens them to share, but macOS lets
+two programs share a port only when both ask to, and AirPlay may hold them
+for itself while **AirPlay Receiver** is on (System Settings, General,
+AirDrop & Handoff) or audio goes to AirPlay speakers.
+
+Then the daemon reads the PTP traffic from the Dante interface directly, as
+a packet capture does (BPF, which it may use as root), and sends its own
+clock requests (Delay_Req) from a port of its own; a Dante leader answers
+them to the PTP group, not to the sender's port. The log says `cannot bind
+UDP port 319: Address already in use. ... Reading the PTP traffic from the
+interface instead`, and the app's Clock section shows the source as
+**The network (PTP), read from the interface**. Nothing else changes: the
+receive times still come from the kernel (BPF's, in microseconds), and the
+audio is the same. `[clock] ptp_capture` chooses:
+
+| `ptp_capture` | The PTP traffic |
+|---|---|
+| `"auto"` (default) | Through the ports; from the interface while another program holds them. |
+| `"always"` | Always from the interface. |
+| `"never"` | Always through the ports: while another program holds them, the engine cannot start, and retries every few seconds. |
+
+This way of reading PTP is new and not yet tested with Dante hardware with
+AirPlay on. For a show, keeping AirPlay Receiver off remains the simplest
+and most predictable setup. `sudo lsof -nP -iUDP:319 -iUDP:320` shows which
+programs hold the ports.
 
 ### Channels, sample rate and latency
 
@@ -377,33 +451,49 @@ daemon over its [control socket](#the-control-socket), so it works only for
 an administrator of the Mac, and does not need to stay open: the daemon runs
 without it.
 
-* The header shows the device name and three lights: **Clock** (green when
-  locked to the Dante network, amber while locking or in holdover, red when
-  unlocked), **Driver** (green when Core Audio has loaded the
-  OpenVirtualSoundcard driver, red when it has not or when the driver has
-  failed) and **Audio**:
-  * green **Flowing**: audio can flow, and nothing audible went wrong in the
-    last 30 s;
+* The header shows the device name (with **Show lock on** beside it while
+  the [show lock](#locking-the-settings-for-a-show) is on), the sample rate,
+  bit depth, latency and interface, and three tiles. **Audio** is the one
+  to watch; it is red whenever audio is down:
+  * green **Flowing**: an application plays through OpenVirtualSoundcard,
+    and nothing audible went wrong in the last 30 s;
+  * grey **Idle**: no application uses OpenVirtualSoundcard, so the returns
+    carry silence;
   * amber **Dropouts**: audio flows, but something audible happened in the
     last 30 s (lost or late packets, late output or early input cycles,
     slips, packets sent without the application's audio): the warnings say
     what;
-  * amber **Stopped**: the driver holds the audio back (its gate is
-    closed), so inputs and returns are silent, usually for seconds while the
-    clock settles or the engine restarts;
+  * amber **Held back**: an application plays, but the driver holds the
+    audio back (its gate is closed), so inputs and returns are silent,
+    usually for a second or two while the clock settles; after 2 s it turns
+    red;
   * red **Silent**: the driver caught an internal error and is silent until
-    Core Audio restarts. The app shows the command, `sudo killall
-    coreaudiod`, with a button to copy it.
+    Core Audio restarts;
+  * red **No driver**: Core Audio has not loaded the driver, so no
+    application can use the device;
+  * red **No network**: the network engine is not running (for example, the
+    interface has no address);
+  * red **Down**: anything else the daemon reports as audio down now (a
+    clock that has not locked, or lost its leader past the holdover; a gate
+    closed for 2 s while an application plays; a stopped transmit engine);
+  * red **Off**, **No answer** or **Lost**: the daemon is not running, does
+    not answer, or the connection to it was lost;
+  * amber **Restarting**: a change from the app restarts the daemon, until
+    audio is back (the clock locked) or 40 s have passed.
 
-  Hovering over a light says more.
-* **Status** lists the device (interface, address, sample rate, bit depth,
-  latency, whether settings from the network are locked), the clock (its
-  leader, offset, network delay and rate), the receive channels with what
-  each one is subscribed to, the transmit flows and the packet counters.
-  Warnings from the daemon come first: in red those that mean audio is down
-  now (a failed driver, Core Audio no longer calling it, a gate closed
-  while an application plays, a stopped transmit engine, a clock that has
-  not locked or lost its leader), then in amber the rest. A warning about a
+  **Clock** is green **Locked** (to the leader it names), amber
+  **Locking** or **Holdover**, red **Unlocked**, or grey **Free running**
+  (no Dante network). **Driver** is green **Loaded** (saying whether an
+  application uses it), or red **Not loaded** or **Failed**. Hovering over
+  a tile says more.
+* While audio is down, a red **Audio is down** panel stays under the header
+  on both tabs, with what happened, what to do, and any command to run with
+  a button to copy it (`sudo killall coreaudiod` for a failed driver). The
+  window's title starts with "Audio down", also while the window is
+  covered or minimised, and if the window is in the background the Dock
+  icon bounces once. A panel also says when the daemon restarts after a
+  change, and when no status has arrived for a few seconds.
+* **Status** lists the other warnings first, in amber: a warning about a
   counter (lost, late or early packets, datagrams from a stray sender, send
   errors, late sends, skipped packets, expired flows, late output or early
   input cycles, slips, invalid samples from the application, packets sent
@@ -414,15 +504,25 @@ without it.
   left), a clock relocking, a jump of the clock, a new clock leader,
   subscribed channels without audio for 10 s, a transmit or receive
   thread without real-time priority and another device using this one's
-  name also warn.
-  The changes controllers made or tried to make come last, newest first,
-  for 10 minutes; older ones move to **Earlier**, at the bottom. The header
-  says `settings locked` while the show lock is on.
-* **Settings** changes the device name, the network interface, the sample
-  rate, the bit depth, the receive and transmit channel counts, the
-  latency and the [show lock](#locking-the-settings-for-a-show). **Apply**
-  sends only what changed, and asks first for anything that interrupts
-  audio or other devices' subscriptions, saying what it does:
+  name also warn. Then come the receive channels, with what each one is
+  subscribed to and whether audio arrives, and a line saying how many are
+  receiving; the transmit flows and the devices receiving them; on a
+  redundant system, the two networks (what each brings, its packets, and
+  which one the clock follows); the clock
+  (its leader, offset, network delay and drift); the packet counters, with
+  how much each problem counter rose in the last 30 s; the device; and the
+  driver. The changes controllers made or tried to make come last, newest
+  first, for 10 minutes, then the older ones. **Diagnostics**, folded, holds
+  the driver's raw status line for a bug report.
+* **Settings** changes the device name, the network interface, the
+  [secondary network](#dante-redundancy-two-networks), the sample rate, the
+  bit depth, the receive and transmit channel counts, the
+  latency and the [show lock](#locking-the-settings-for-a-show). An edited
+  setting is marked with a dot, and the bar at the bottom lists what is not
+  applied yet. **Apply** sends only what
+  changed, and asks first for anything that interrupts audio or other
+  devices' subscriptions, listing the changes and saying what each costs
+  (**Cancel** is the default):
   * A new latency restarts the device's inputs: they stop for about a
     second while it requests its receive flows again. The feeds other
     devices receive from OpenVirtualSoundcard, such as a console's returns,
@@ -432,15 +532,32 @@ without it.
   * A new interface, rate, bit depth or channel count is written into
     `ovsc.toml`, keeping its comments, and restarts the whole daemon:
     audio stops for 10 to 20 seconds in both directions while the clock
-    locks again.
+    locks again. The app counts the seconds and says when audio is back.
   * A new name applies at once, but subscriptions other devices made to
     OpenVirtualSoundcard's outputs name the old one: they stop resolving
     until patched again in Dante Controller. The question lists the devices
-    receiving from it now.
-  * The show lock applies at once and interrupts nothing.
+    receiving from it now, and afterwards the bar says what to re-patch.
+  * The show lock (**Refuse changes from Dante Controller**) applies as
+    soon as it is switched, and interrupts nothing.
+
+  A change the daemon refuses stays in the form, with the daemon's reason.
+  Closing the window or quitting with changes not applied asks first.
+* `⌘1` and `⌘2` (or `⌘,`) switch to Status and Settings, `⌘W` closes the
+  window, `⌘M` minimises it and `⌘Q` quits; Escape closes a menu or a
+  question. The app follows the system's light or dark appearance, and
+  remembers its window's size and place (in
+  `~/Library/Application Support/OpenVirtualSoundcard/window`).
+* The app is drawn with [GPUI](https://www.gpui.rs), the GPU-accelerated
+  toolkit of the Zed editor (Apache-2.0), on Metal, in the system font. Its
+  look is sober and native: grouped cards on a plain window, as System
+  Settings draws them, with colour kept for what means something: the
+  status, warnings and the accent. The Settings tab's bar is docked at the
+  bottom. A test checks the contrast of every colour pair it draws, in
+  both appearances. It has no VoiceOver support: GPUI has none yet.
 
 Build it with `packaging/macos/build-app.sh`, which needs nothing beyond
-Rust and the command-line tools. It is signed ad hoc; built on the Mac that
+Rust and the command-line tools: GPUI compiles its Metal shaders when the
+app starts, so Xcode is not needed. It is signed ad hoc; built on the Mac that
 runs it, it carries no quarantine, so Gatekeeper lets it open. Its icon is
 drawn in [`apps/macos/icon/OpenVirtualSoundcard.svg`](../apps/macos/icon/OpenVirtualSoundcard.svg);
 `apps/macos/icon/make-icon.sh` renders it into the `.icns` the bundle carries
@@ -819,6 +936,13 @@ The configuration, the state and the logs stay for a later install; add
 3. Check the unified log (above) for the driver's messages.
    `ci/macos/diagnostics.sh` also shows what `amfid` logged about the bundle
    ([Gatekeeper and signing](#gatekeeper-and-signing)).
+
+4. The device appears but not on the network (the app shows the engine as
+   down): the app and the log give the reason. `cannot bind UDP port 319`
+   means another program holds the PTP ports, usually AirPlay, and that
+   reading them from the interface failed too, or is off (`ptp_capture =
+   "never"`; see [Ports and other Dante
+   software](#ports-and-other-dante-software)).
 
 ### The device is silent
 

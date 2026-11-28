@@ -159,6 +159,7 @@ fn txt(id: u16) -> ChannelTxt {
         dbcp1: 0x1102,
         is_default_name: true,
         multicast: None,
+        nred: 0,
     }
 }
 
@@ -294,7 +295,7 @@ async fn a_dead_flow_is_stopped_before_it_is_requested_again() {
                 dbcp::opcode::REQUEST_FLOW => {
                     handle += 1;
                     seen.lock().unwrap().push(("request", handle));
-                    dbcp::encode_flow_created(&h, [0, 0, 0, 0, 0, handle])
+                    dbcp::encode_flow_created(&h, [0, 0, 0, 0, 0, handle], 1)
                 }
                 dbcp::opcode::STOP_FLOW => {
                     let stopped = dbcp::decode_stop_flow(&req).unwrap()[5];
@@ -369,7 +370,7 @@ async fn dead_flows_to_one_transmitter_are_stopped_together() {
                 dbcp::opcode::REQUEST_FLOW => {
                     handle += 1;
                     seen.lock().unwrap().push(("request", handle, Instant::now()));
-                    dbcp::encode_flow_created(&h, [0, 0, 0, 0, 0, handle])
+                    dbcp::encode_flow_created(&h, [0, 0, 0, 0, 0, handle], 1)
                 }
                 dbcp::opcode::STOP_FLOW => {
                     let stopped = dbcp::decode_stop_flow(&req).unwrap()[5];

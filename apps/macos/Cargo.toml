@@ -2,6 +2,10 @@
 # through the control socket. Its own workspace, so the main build stays free
 # of GUI dependencies. packaging/macos/build-app.sh makes OpenVirtualSoundcard.app from
 # it. It also builds on Linux (X11), for development.
+#
+# The GUI is GPUI, the toolkit of the Zed editor (Apache-2.0). Cargo.lock
+# keeps the versions GPUI was released with: newer ones of some of its
+# dependencies do not build together.
 [workspace]
 
 [package]
@@ -19,9 +23,22 @@ path = "src/main.rs"
 
 [dependencies]
 ovsc-control = { path = "../../crates/ovsc-control" }
+# Wakes the window from the worker thread.
+futures = { version = "0.3", default-features = false, features = ["std"] }
+# Moves the text cursor by whole characters, as the user sees them.
+unicode-segmentation = "1.12"
 
+# "runtime_shaders": GPUI compiles its Metal shaders when the app starts, so
+# that building needs only the command-line tools, not Xcode's Metal
+# compiler.
 [target.'cfg(target_os = "macos")'.dependencies]
-eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "accesskit"] }
+gpui = { version = "=0.2.2", default-features = false, features = ["font-kit", "runtime_shaders"] }
+# Asks for attention in the Dock while audio is down (GPUI has no call for it).
+objc = "0.2"
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "x11"] }
+gpui = { version = "=0.2.2", default-features = false, features = ["x11", "font-kit"] }
+
+# Debug builds of GPUI are large; line tables are enough to read a panic.
+[profile.dev]
+debug = "line-tables-only"

@@ -8,7 +8,7 @@ not contain source code from the projects it cites.
 > **Legal.** Dante is a trademark of Audinate Pty Ltd. The Dante protocols are
 > proprietary and undocumented. This file is an independent interoperability
 > reference compiled from public reverse-engineering work (see
-> [§12](#12-sources--credits)). It is not written, reviewed or endorsed by
+> [§13](#13-sources--credits)). It is not written, reviewed or endorsed by
 > Audinate, and nothing in it is guaranteed to be correct.
 
 ---
@@ -198,6 +198,7 @@ there is no evidence they are required. ❓
 | `latency_ns` | Minimum receive latency the transmitter demands, in ns | RX latency (FIXME in Inferno) | `6000000` | ✅ |
 | `fpp` | `"<max>,<min>"` frames per packet the TX accepts (note the order: maximum first) | `32,2` | `48,48` | ✅ |
 | `nchan` | Maximum channel slots per flow | `min(8, tx_channels)` | `8` | ✅ |
+| `nred` | Networks beyond the primary: `1` on a device on both networks of a redundant system ([§11](#11-redundancy-primary-and-secondary-networks)). Absent on single-network devices. netaudio reads the interface count as `nred + 1`. | — | — (lx-dante: `1`, CAP) | ⚠️ |
 | `default` | Bare flag on the factory-name instance | present | absent | ⚠️ |
 | `b.<bundle>` | `b.<bundle id>=<1-based slot in that bundle>`. The channel is also available in multicast bundle `<bundle id>@<device>`. | when multicast | — | ⚠️ INF only |
 | `at2` | bare flag, meaning unknown | — | present | ❓ |
@@ -445,7 +446,7 @@ Response:
 | 24 | 14 | u16 | max RX flows | 32 | 2 | ✅ |
 | 26 | 16 | u16 | `unknown5 (observed n_tx+n_rx (Inferno), 2 (AVIO))` | n_tx+n_rx | 2 | ❓ |
 | 28 | 18 | u16 | `unknown6 (observed 1)` | 1 | 1 | ❓ |
-| 30 | 20 | u16 | network interface count | 1 | 1 | ✅ (NAC) |
+| 30 | 20 | u16 | network interface count: 2 on both networks of a redundant system ([§11](#11-redundancy-primary-and-secondary-networks)) | 1 | 1 | ✅ (NAC); 2 ⚠️ (no capture) |
 | 32 | 22 | 12–16 | zero. netaudio reads p36 RX error-flag mask and p38 RX error-field mask (protocol ≥ 0x2711), and p44 resource-extension offset (≥ 0x2802). | 12 zero bytes | 16 zero bytes | ⚠️ |
 
 Sources: INF `proto_arc.rs` `channels_and_flows_count`, `arc_server.rs`;
@@ -737,7 +738,7 @@ then the objects.
 | 4 | u32 | sample rate | | 192000 | ✅ |
 | 8 | u16 | `unknown (observed 0)` | 0 | 0 | ✅ |
 | 10 | u16 | encoding (bits) | | 24 | ✅ |
-| 12 | u16 | destination count | 1 | 1 | ✅ |
+| 12 | u16 | destination count: 2 for a flow sent on both networks of a redundant system, the primary's first ([§11](#11-redundancy-primary-and-secondary-networks)) | 1 | 1 | ✅; 2 ⚠️ |
 | 14 | u16 | channel slot count N | | 8 | ✅ |
 | 16 | 2 × dests | ptr → socket descriptor per destination | | → `08 02 10e1 efff4567` (239.255.69.103:4321) | ✅ |
 | … | 2 × N | TX channel number per slot, 0 = empty slot | | `0010 0000 …` | ✅ |
@@ -922,7 +923,7 @@ Request: paged (`[1][first][0]`). Response:
 | 2 | u16 | flags. Observed 1. Bit 0x4000 selects a 48-byte "modern" record (netaudio). | 1 | 0x0001 | ✅ |
 | 4 | u32 | sample rate | | 48000 | ✅ |
 | 8 | u32 | encoding. Inferno writes u16 0 + u16 bits. | | 24 | ✅ |
-| 12 | u16 | interface count I | 1 | 1 | ✅ |
+| 12 | u16 | interface count I: one endpoint per network the flow is received on. 1 on every capture, also from the two-port lx-dante (whose transmitters had one port); OpenVirtualSoundcard reports 2 for a flow on both networks ([§11](#11-redundancy-primary-and-secondary-networks)). | 1 | 1 | ✅; 2 ⚠️ |
 | 14 | u16 | channel slot count N | | 2 | ✅ |
 | 16 | u16 | bitmap words W per slot | ⌈rx/16⌉ | 8 | ✅ |
 | 18 | I × u16 | ptr → receiver endpoint (socket descriptor of **this receiver's** IP and RX port; multicast: group:port) | | `08 02 3813 c0a8016c` / `08 02 10e1 efffff38` | ✅ (`08 02`, see [§3.4](#34-content-conventions)) |
@@ -934,7 +935,7 @@ Request: paged (`[1][first][0]`). Response:
 | Off | Size | Field | Inferno | CAP | Conf |
 |---|---|---|---|---|---|
 | 0 | u16 | status code (same table as [§4.14](#414-0x3000-rx-channels)) | 9 | 9 (unicast) / 0x0A (multicast) | ✅ |
-| 2 | u16 | interface state bitmap | 1 | 1 / 0 | ✅ |
+| 2 | u16 | interface state bitmap. Captured: 1 with status 9 (unicast, receiving), 0 with 0x15 and 0x0A (multicast, receiving), and once 0 with 9: not simply "receiving on interface i". OpenVirtualSoundcard sends 1 for a receiving unicast flow on one network, and for a flow on both, bit 0 for the primary and bit 1 for the secondary while packets arrive there. | 1 | 1 / 0 | ✅ 1; bits ❓ |
 | 4 | u16 | `flags (observed 0x0800)` | 0x0800 | 0x0800 | ✅ |
 | 6 | u16 | `unknown (0)` | 0 | 0 | ✅ |
 | 8 | u32 | latency ns | from flow | 1 000 000 / 2 000 000 | ✅ |
@@ -1044,7 +1045,7 @@ advertises 0x1200 ([§2.2](#22-txt-keys)). ✅
 
 | Opcode | Name | Request content | Success response |
 |---|---|---|---|
-| 0x0100 | request flow | [§6.2](#62-0x0100-request-flow) | result 1, content = 6-byte handle |
+| 0x0100 | request flow | [§6.2](#62-0x0100-request-flow) | result 1, content = handle and a result per network ([§6.3](#63-response-flow-handle)) |
 | 0x0101 | stop flow | 6-byte handle | result 1, empty |
 | 0x0102 | update channels | handle(6) + `u16 N` + N × u16 TX channel ids | result 1, empty |
 
@@ -1063,10 +1064,10 @@ packet offset.
 | 10 | 0 | u16 | ptr → receiver device name, the start of the heap: `0x30 + 2N` | 0x0038 | ✅ |
 | 12 | 2 | u32 | sample rate | 48000 | ✅ |
 | 16 | 6 | u32 | bits per sample | 24 | ✅ |
-| 20 | 10 | u16 | `unknown (observed 1)`. Inferno warns if it is not 1. | 1 | ✅ |
+| 20 | 10 | u16 | I, the number of receiver socket descriptors: one per network the receiver wants the flow on. 1 on every capture; Inferno warns if it is not 1, netaudio's transmitter reads it as the interface count and refuses I ≠ 1. | 1 | ✅ 1; 2 ⚠️ |
 | 22 | 12 | u16 | N | 4 | ✅ |
-| 24 | 14 | u16 | ptr → receiver socket descriptor (8-aligned) | 0x0048 | ✅ |
-| 26 | 16 | N × u16 | TX channel id (TXT `id`) per slot; 0 = unused slot | 1, 0, 0, 0 | ✅ |
+| 24 | 14 | I × u16 | ptr → receiver socket descriptor (8-aligned), the primary network's first | 0x0048 | ✅ |
+| 24+2I | 14+2I | N × u16 | TX channel id (TXT `id`) per slot; 0 = unused slot. The rows below are for I = 1: each moves by 2 per further descriptor. | 1, 0, 0, 0 | ✅ |
 | 26+2N | 16+2N | u16 | ptr → trailer, always `0x1C + 2N` | 0x0024 | ✅ |
 | 28+2N | 18+2N | u16 | trailer +0: `0x0A00` (length 10 words) | 0x0A00 | ✅ |
 | 30+2N | 20+2N | u16 | trailer +2: `unknown (observed 0x0002)` | 0x0002 | ✅ |
@@ -1076,7 +1077,7 @@ packet offset.
 | 48+2N | 38+2N | str | receiver device name + NUL | `A32-000001` | ✅ |
 | … | | str | receiver flow name + NUL. Inferno: `<local flow id>_<process id>`; A32: `1`. | `1` | ✅ |
 | … | | 0–7 | zero padding to an 8-byte packet offset | | ✅ |
-| ptr | | 8 | socket descriptor `08 02 <rx port> <rx IPv4>`: where to send the audio | `08 02 3801 0afe4e0b` | ✅ |
+| ptr | | 8 | socket descriptor `08 02 <rx port> <rx IPv4>`: where to send the audio; one per network, each 8-aligned | `08 02 3801 0afe4e0b` | ✅ |
 
 The captured A32 request (CAP
 `receiver_port_ranges_fallback/protocol_1102_opcode_0100_id_15.bin`, a Ferrofish
@@ -1090,10 +1091,28 @@ byte. ✅
 
 ### 6.3 Response: flow handle
 
-Result 1 with 6 bytes of content: the handle. It is opaque to the receiver,
-which stores it for 0x0101 and 0x0102. Inferno builds it as a u32 internal flow
-index plus a u16 random cookie and validates both. Real devices' handle
-structure is ❓. (INF `flows_control.rs`, `flows_tx.rs`)
+Result 1, with the content:
+
+| c | Size | Field | Real (CAP) | Conf |
+|---|---|---|---|---|
+| 0 | 6 | handle | `0001 7fef911d` | ✅ |
+| 6 | u16 | interfaces: the networks the flow is sent on | 1 | ✅ |
+| 8 | I × u16 | result per network: 1 sent there; netaudio's receiver also accepts warnings with bit 0x8000 | 1 | ✅ 1 |
+| … | u16 | ptr → extension, 0 for none | 0 | ✅ |
+| … | u16 | 0 (pad) | 0 | ✅ |
+
+A real transmitter answered the A32's request with
+`1102 0018 0000 0100 0001 | 0001 7fef911d | 0001 | 0001 | 0000 | 0000` (netaudio
+fixture), and netaudio's own transmitter answers the same way. Inferno, and
+OpenVirtualSoundcard before redundancy, answered with the handle alone, which
+Dante receivers accept; OpenVirtualSoundcard now answers as above, with I = 2
+for a flow it sends on both networks, and reads both forms.
+
+The handle is opaque to the receiver, which stores it for 0x0101 and 0x0102.
+Inferno builds it as a u32 internal flow index plus a u16 random cookie and
+validates both; netaudio's transmitter, as a u16 flow id and a u32
+generation, as the capture above looks. Real devices' handle structure is
+❓. (INF `flows_control.rs`, `flows_tx.rs`; NAC `source.rs`)
 
 ### 6.4 0x0101 stop flow
 
@@ -1303,8 +1322,32 @@ bare 32-byte headers, e.g. `ffff 0020 0fdb 0000 | 000eddfd4e130000 | Audinate | 
 | 60 | 4 | gateway | gateway | 192.168.1.1 | ✅ |
 | 64 | … | `00 18 00 30` + zeros (Inferno, A32, AVIO) / `00 00 00 0a` (lx-dante) | | | ❓ |
 
+A device on both networks of a redundant system lists both interfaces
+(three captures: Ferrofish A32 and Behringer WING, anonymised, and an
+LX-DANTE, not). From p40, a 28-byte record per interface, the primary's first:
+
+| r | Size | Field | Conf |
+|---|---|---|---|
+| +0 | u16 | mode: bit 1 static address; the primary has bit 0 too (1 or 3), the secondary not (0 or 2) | ✅ bit 1; bit 0 ❓ |
+| +2 | 6 | MAC (the LX-DANTE's secondary is the primary's plus one) | ✅ |
+| +8 | 4 | IPv4 (LX-DANTE secondary: 172.31.185.58/16) | ✅ |
+| +12 | 4 | netmask | ✅ |
+| +16 | 4 | DNS server (0 on every secondary) | ✅ |
+| +20 | 4 | gateway (0 on every secondary) | ✅ |
+| +24 | 4 | after the last record: `00 18` and a pointer, relative to p24, to the pending configuration (0x30 for one interface, 0x4C for two); after another record: 0 (A32, WING) or `0000000a` (LX-DANTE) | ✅ / ❓ |
+
+Then u16 redundancy flags (bit 0 redundant now, bit 1 configured redundant;
+A32 3 after a reboot into redundant mode, WING 1, LX-DANTE 0 although it runs
+both ports) and u16 0, then 24 bytes per interface of pending configuration,
+zero when nothing is pending. p34 is 1 on A32 and WING, 0 on LX-DANTE and AVIO.
+The link speed at p36 is one for the device. OpenVirtualSoundcard answers as
+the LX-DANTE (p34 0, flags 0, `0000000a` as 0): its two interfaces cannot be
+switched to one network either. Its one-interface answer is unchanged.
+
 Sources: INF `send_network_info`; NAC `responses/network.rs`; CAP
-`dhcp_dns_gateway_order.json`, `interface_status_*` in `core_responses_golden.json`.
+`dhcp_dns_gateway_order.json`, `interface_status_*` in `core_responses_golden.json`
+(`interface_status_lx_dante_packet_12362179`), `network_configuration.json`,
+`secondary_network_configuration.json`.
 
 #### 7.4.4 0x0020 clock status
 
@@ -1774,9 +1817,64 @@ Sources: INF `device_server/arc_server.rs`, `channels_subscriber.rs`,
 
 ---
 
-## 11. Open questions
+## 11. Redundancy (primary and secondary networks)
 
-### 11.1 Discrepancies and implementation decisions
+A redundant Dante system has two separate networks, primary and secondary,
+each with its own switches. A redundant device has an interface on each and
+sends each flow on both, so that either network can fail without a gap: the
+receiver plays whichever copy arrives. The secondary network is commonly
+172.31.0.0/16 (netaudio treats it as the Dante secondary network; the
+LX-DANTE's secondary has 172.31.185.58/16).
+
+What is known, from three captured devices and from netaudio's and our own
+implementations; no capture shows a flow on two networks, nor its audio
+packets:
+
+| What | How a device shows it | Conf |
+|---|---|---|
+| Being on both networks | `_netaudio-chan` TXT `nred=1` ([§2.2](#22-txt-keys)) | ⚠️ (LX-DANTE) |
+| Its interfaces | conmon 0x0011 with a record per interface ([§7.4.3](#743-0x0011-interface-status)) | ✅ |
+| The interface count | ARC 0x1000 p30 ([§4.2](#42-0x1000-channel-and-flow-counts)) | ⚠️ no capture of 2 |
+| A flow on both networks | DBCP 0x0100 with a socket descriptor per network ([§6.2](#62-0x0100-request-flow)), answered with a result per network ([§6.3](#63-response-flow-handle)); ARC 0x2200 with two destinations, 0x3200 with two endpoints ([§4.11](#411-0x2200-tx-flows), [§4.18](#418-0x3200-rx-flows)) | ⚠️ the layouts read the counts the captures show as 1 |
+| Each network's traffic | heartbeat 0x8000 has an entry per interface; 0x8003 and 0x8004 have F × interfaces entries, the primary's flows first ([§7.7](#77-heartbeat-22400233-8708)). The LX-DANTE, with its secondary link down, sends 64 entries and zeros for the secondary. | ✅ |
+| PTP | one PTPv1 port per interface in the clock status (0x0020); on the LX-DANTE the secondary's has its link-down bit set | ⚠️ |
+| Per-channel networks | bytes +12/+13 of an RX channel's status: available and asserted interface bitmaps (0x0101 receiving on one network; 0x0303 is a guess for two) | ⚠️ / ❓ |
+| Licence | the diagnostic log says "is redundant" or "is non-redundant" | ⚠️ |
+
+What OpenVirtualSoundcard does with `[device] secondary_interface` set (an
+interface on another network than the primary's):
+
+- It announces itself on both networks as above, and keeps its control
+  services (ARC, CMC, conmon, mDNS) on the primary.
+- **Receiving.** It asks a transmitter whose TXT says `nred=1` for the flow
+  at an address on each network, from a second socket on the secondary
+  interface, and other transmitters for the flow on the primary alone. One
+  thread waits on both sockets. Both copies are written into the receive
+  buffers by timestamp; the second writes the same samples again, so the
+  audio has no gap while either network brings each packet in time. A
+  packet is lost only when neither network brought it before it was due
+  to play. The secondary copy is accepted from any address on the secondary
+  network, since the transmitter's address there is not in the records the
+  receiver looks up; each network's copy keeps its own source lock.
+  Keepalives go to the transmitter on each network.
+- **Transmitting.** A receiver that asks for a flow on both networks gets
+  every packet on both; a keepalive on either keeps the flow.
+- **Clock.** The PTP follower joins the PTP group on both interfaces, takes
+  one network's messages at a time and sends its Delay_Reqs there: the
+  primary's, unless no leader message (Follow_Up, Delay_Resp) arrived there
+  for 2 s while the secondary brings them; back to the primary after 10 s
+  of steady messages there. Taking both at once would give the servo each
+  Sync twice, over paths of different delays. How Dante devices fail over
+  is ❓.
+- **Failures.** A secondary interface that is down when the device starts
+  leaves it on the primary network alone. The daemon watches both
+  interfaces but restarts for the primary only.
+
+---
+
+## 12. Open questions
+
+### 12.1 Discrepancies and implementation decisions
 
 | Topic | Inferno | netaudio / real captures | Recommendation |
 |---|---|---|---|
@@ -1795,7 +1893,7 @@ Sources: INF `device_server/arc_server.rs`, `channels_subscriber.rs`,
 | Received packet size | fpp derived from the length, slot count fixed | — | Derive fpp from the length ([§8.2](#82-payload)); OpenVirtualSoundcard accepts 1 to 256 whole frames of the flow's slots, only from the transmitter's addresses and the source port its audio comes from. The addresses are the A records of the transmitter's SRV target when the flow is requested, at most four: a computer on Wi-Fi and Ethernet announces one per interface and may send the audio from either ([§2.4](#24-query-and-response-behaviour-dante-peers-rely-on)) |
 | QoS marking | none | Audinate's QoS guidance: DSCP 56 (CS7) for PTP, 46 (EF) for audio, strict priority | OpenVirtualSoundcard marks audio EF (TOS `0xB8`), PTP event messages CS7 (`0xE0`) and PTP general messages EF; unverified that macOS keeps the marking on the wire |
 
-### 11.2 Unknowns worth capturing with Wireshark
+### 12.2 Unknowns worth capturing with Wireshark
 
 Capture with Dante Controller and at least one Dante hardware device, and
 optionally DVS. Filter `udp.port in {4440 4455 8700 8702 8708 8800} or ip.dst==224.0.0.233 or ip.dst==224.0.1.129`.
@@ -1811,6 +1909,7 @@ optionally DVS. Filter `udp.port in {4440 4455 8700 8702 8708 8800} or ip.dst==2
 - Media header byte 0 (= 0x02): version or flags? Does any device send another value (e.g. for 32-bit or AES3)?
 - Whether Dante transmitters align packet timestamps to fpp multiples, and the true send-time offset relative to the timestamp.
 - 0x3300 second port range: purpose (multicast? redundancy?).
+- Redundancy ([§11](#11-redundancy-primary-and-secondary-networks)): a redundant receiver's DBCP 0x0100 request (does p20 read 2, with a descriptor per network?), and the answer; 0x2200 and 0x3200 records of a flow on both networks, and the 0x3200 interface state bitmap; the RX channel status bytes +12/+13 for two networks; ARC 0x1000 p30 on a redundant device; whether a transmitter expects keepalives on both networks, and what it does when one stops; which A records a redundant device announces on which network; how followers fail over between the two networks' PTP; whether audio packets on the two networks are identical.
 - `_netaudio-chan` `default` flag and the `at2` flag; `_netaudio-cmc` `channels=0x6000…` bitmask; whether real devices advertise `_netaudio-bund` and `in-addr.local` reservations as Inferno does.
 - Conmon: who sends to 224.0.0.231:8700; whether replies go unicast as well as multicast; meaning of the device-id field in controller requests; the bodies of notifications 0x0101, 0x0103–0x0106, 0x0120, 0x100E.
 - Heartbeat bytes 24–31 (`00 08 00 01 10 00 00 00`).
@@ -1820,7 +1919,7 @@ optionally DVS. Filter `udp.port in {4440 4455 8700 8702 8708 8800} or ip.dst==2
 
 ---
 
-## 12. Sources & credits
+## 13. Sources & credits
 
 | Project | Licence | Links | What we used |
 |---|---|---|---|

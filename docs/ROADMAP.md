@@ -24,7 +24,7 @@ is to test against real equipment and fix what breaks.
   - still to do: routing from OpenVirtualSoundcard to hardware, renames and latency from Dante Controller, a second hardware device, Windows
   - capture each exchange with Wireshark and add the captures as test vectors
 - 🧪 PTPv1 follower against a real Dante leader: locks to an AVIO-DAI2 with kernel receive timestamps on macOS; measure lock time, offset and stability, and tune the servo
-- ⏳ Answer the open questions in `PROTOCOL.md` §11.2
+- ⏳ Answer the open questions in `PROTOCOL.md` §12.2
 - ⏳ Measure the minimum stable latency per OS
 - ⏳ Sound-card bridge on real hardware and virtual cables (BlackHole, VB-Cable, snd-aloop); compensate device latency; auto-reconnect
 - ⏳ Optional hardware timestamping (Linux `SO_TIMESTAMPING`) for lower latency
@@ -42,7 +42,7 @@ macOS follow-ups:
 
 - ⏳ Run the daemon as a dedicated `_ovsc` user instead of root
 - ✅ Kernel receive timestamps for PTP (`SO_TIMESTAMP_MONOTONIC`): user-space timestamps made the clock step by 2 to 3 ms on a real network
-- 🧪 The OpenVirtualSoundcard app (`apps/macos`, egui) and the daemon's control socket: status, settings and latency. Still to do: put it in the installer package, and run it in CI
+- 🧪 The OpenVirtualSoundcard app (`apps/macos`, GPUI) and the daemon's control socket: status, settings and latency. Still to do: put it in the installer package, and run it in CI
 - ⏳ Sleep and wake, not handled or tested yet: `CLOCK_UPTIME_RAW`, the host clock both sides use, stops while the Mac sleeps. Today the daemon only holds an idle-sleep assertion while the engine runs (`prevent_idle_sleep`)
 - ⏳ Report a clock domain derived from the PTP grandmaster (Core Audio treats devices with the same nonzero domain as synchronized; it is 0, unspecified, today)
 - ⏳ Sample-rate and channel changes from Dante Controller, applied without restarting the daemon (today: edit the configuration and restart it)

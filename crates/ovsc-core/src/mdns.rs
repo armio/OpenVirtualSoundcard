@@ -1091,6 +1091,7 @@ mod tests {
             dbcp1: 0x1102,
             is_default_name: true,
             multicast: None,
+            nred: 0,
         }
     }
 

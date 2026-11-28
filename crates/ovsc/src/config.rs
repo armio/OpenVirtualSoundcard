@@ -45,6 +45,10 @@ pub struct ClockConfig {
     pub source: ClockSource,
     pub ptp_event_port: u16,
     pub ptp_general_port: u16,
+    /// Whether the PTP follower reads its traffic from the interface
+    /// directly: `auto` when another program holds the PTP ports for
+    /// itself (AirPlay on a Mac), `always`, or `never`.
+    pub ptp_capture: PtpCaptureMode,
     /// `free`: how much faster than the local clock media time runs, in ppm.
     pub free_rate_ppm: f64,
 }
@@ -55,7 +59,28 @@ impl Default for ClockConfig {
             source: ClockSource::Ptp,
             ptp_event_port: 319,
             ptp_general_port: 320,
+            ptp_capture: PtpCaptureMode::Auto,
             free_rate_ppm: 0.0,
+        }
+    }
+}
+
+/// [`ClockConfig::ptp_capture`], as the configuration writes it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PtpCaptureMode {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+impl From<PtpCaptureMode> for ovsc_clock::ptp::PtpCapture {
+    fn from(mode: PtpCaptureMode) -> Self {
+        match mode {
+            PtpCaptureMode::Auto => Self::Auto,
+            PtpCaptureMode::Always => Self::Always,
+            PtpCaptureMode::Never => Self::Never,
         }
     }
 }
@@ -63,6 +88,21 @@ impl Default for ClockConfig {
 /// The largest frequency offset of a free-running clock, in ppm: the range
 /// PTP followers correct (real oscillators stay within ±100 ppm).
 pub const MAX_RATE_PPM: f64 = 500.0;
+
+/// The PTP follower's secondary network, for a device on both networks of a
+/// redundant Dante system: the clock follows the leader there while the
+/// primary network has none.
+pub fn ptp_secondary(device: &ovsc_core::DeviceConfig) -> Option<ovsc_clock::ptp::PtpSecondary> {
+    // One that cannot be found is the device's to report: it runs on the
+    // primary network alone then (`DeviceInfo::secondary_missing`). One on
+    // the primary's network is refused when the device starts.
+    match device.secondary_interface.as_str() {
+        "" => None,
+        spec => ovsc_core::net::Interface::find(spec).ok().map(|iface| {
+            ovsc_clock::ptp::PtpSecondary { interface: iface.ip, netmask: iface.netmask }
+        }),
+    }
+}
 
 /// The rate of a free-running clock `ppm` parts per million fast (or slow,
 /// if negative): media nanoseconds per local nanosecond.
@@ -376,6 +416,11 @@ pub const EXAMPLE: &str = r#"# OpenVirtualSoundcard configuration.
 name = ""
 # Network interface name or IPv4 address. Empty: interface of the default route.
 interface = ""
+# Dante redundancy: the interface on the secondary network, by name or IPv4
+# address; another interface, on another network. Flows with redundant
+# devices then run on both networks, and either can fail without a gap.
+# Empty: one network.
+secondary_interface = ""
 sample_rate = 48000          # 44100, 48000, 88200, 96000, 176400 or 192000
 bits_per_sample = 24         # 16, 24 or 32
 tx_channels = 8              # a count, or a list of names: ["Left", "Right"]
@@ -405,6 +450,9 @@ lock_remote_settings = false
 # PTP master) or "system" (tests only).
 source = "ptp"
 # free_rate_ppm = 0.0        # "free": rate offset, -500 to 500 ppm
+# "auto": read the PTP traffic from the interface when another program holds
+# the PTP ports for itself; "always"; or "never".
+# ptp_capture = "auto"
 
 [audio]
 # none, tone, record, loopback, soundcard, or coreaudio (macOS; see
@@ -435,6 +483,24 @@ mod tests {
         assert_eq!(cfg.clock.source, ClockSource::Ptp);
         assert_eq!(cfg.audio.backend, BackendKind::None);
         assert!(!cfg.device.lock_remote_settings);
+    }
+
+    #[test]
+    fn reading_ptp_from_the_interface_is_a_clock_option() {
+        let cfg: AppConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.clock.ptp_capture, PtpCaptureMode::Auto);
+        for (word, mode) in [
+            ("auto", PtpCaptureMode::Auto),
+            ("always", PtpCaptureMode::Always),
+            ("never", PtpCaptureMode::Never),
+        ] {
+            let cfg: AppConfig =
+                toml::from_str(&format!("[clock]\nptp_capture = \"{word}\"\n")).unwrap();
+            assert_eq!(cfg.clock.ptp_capture, mode);
+        }
+        assert!(toml::from_str::<AppConfig>("[clock]\nptp_capture = \"bpf\"\n").is_err());
+        let mac: AppConfig = toml::from_str(EXAMPLE_MACOS).unwrap();
+        assert_eq!(mac.clock.ptp_capture, PtpCaptureMode::Auto);
     }
 
     #[test]

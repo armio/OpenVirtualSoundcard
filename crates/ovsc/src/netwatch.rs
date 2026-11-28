@@ -19,6 +19,13 @@
 //! or has no address (a cable pull), the engine keeps running and waits: a
 //! cable that comes back with the same address needs no restart, as long as
 //! the clock locks again.
+//!
+//! On both networks of a redundant Dante system ([`Watches`]), the
+//! secondary interface is watched too, but never restarts the engine:
+//! the audio goes on on the primary network meanwhile, and a restart would
+//! stop it. What the secondary network lost until the daemon restarts (its
+//! flows after a new address, the clock's failover after its memberships
+//! went with a re-attached adapter) is logged and shown in the status.
 
 use std::io;
 use std::net::Ipv4Addr;
@@ -111,6 +118,11 @@ pub struct InterfaceWatch {
     /// two checks in a row, so a passing glitch of the system's view of the
     /// interfaces does not cost an engine restart.
     pending: Option<String>,
+    /// The interface on the secondary network of a redundant system, which
+    /// never restarts the engine.
+    secondary: bool,
+    /// For the secondary, what it lost until the daemon restarts.
+    stale: Option<String>,
 }
 
 impl InterfaceWatch {
@@ -123,17 +135,33 @@ impl InterfaceWatch {
             lost: false,
             back_at: None,
             pending: None,
+            secondary: false,
+            stale: None,
+        }
+    }
+
+    /// A watch of the interface on the secondary network.
+    pub fn secondary(name: &str, ip: Ipv4Addr) -> InterfaceWatch {
+        InterfaceWatch { secondary: true, ..InterfaceWatch::new(name, ip) }
+    }
+
+    /// "the network interface en0", or for the secondary, "the secondary
+    /// network's interface en7".
+    fn what(&self) -> String {
+        match self.secondary {
+            false => format!("the network interface {}", self.name),
+            true => format!("the secondary network's interface {}", self.name),
         }
     }
 
     /// What is wrong with the interface now, if anything, for the status.
     pub fn problem(&self) -> Option<String> {
         if self.gone {
-            Some(format!("the network interface {} is gone", self.name))
+            Some(format!("{} is gone", self.what()))
         } else if self.lost {
-            Some(format!("the network interface {} has no IPv4 address (link down?)", self.name))
+            Some(format!("{} has no IPv4 address (link down?)", self.what()))
         } else {
-            None
+            self.stale.clone()
         }
     }
 
@@ -158,6 +186,25 @@ impl InterfaceWatch {
     /// free-running). Logs each change of state once.
     pub fn check(&mut self, seen: Option<&Seen>, clock_locked: bool, now: Instant) -> Verdict {
         let reason = self.reason(seen, clock_locked, now);
+        if self.secondary {
+            // Noted once; the engine keeps running on the primary network.
+            if let Some(reason) = reason {
+                if self.stale.is_none() {
+                    warn!(
+                        "{reason}: audio goes on on the primary network; restart the daemon to \
+                         use the secondary network again"
+                    );
+                }
+                self.stale = Some(format!("{reason}; restart the daemon to use it again"));
+                self.gone = false;
+                self.lost = false;
+                self.index = seen.map(|s| s.index);
+                if let Some(s) = seen.and_then(|s| s.ipv4.first()) {
+                    self.ip = *s;
+                }
+            }
+            return Verdict::Keep;
+        }
         match (reason, self.pending.take()) {
             (Some(reason), Some(_)) => Verdict::Restart(reason),
             (Some(reason), None) => {
@@ -169,13 +216,14 @@ impl InterfaceWatch {
     }
 
     fn reason(&mut self, seen: Option<&Seen>, clock_locked: bool, now: Instant) -> Option<String> {
-        let name = &self.name;
+        let what = self.what();
+        let meanwhile = match self.secondary {
+            false => "audio stops until it is back; the engine restarts on it then",
+            true => "audio goes on on the primary network",
+        };
         let Some(seen) = seen else {
             if !self.gone {
-                warn!(
-                    "the network interface {name} is gone: audio stops until it is back; the \
-                     engine restarts on it then"
-                );
+                warn!("{what} is gone: {meanwhile}");
                 self.gone = true;
             }
             self.back_at = None;
@@ -183,23 +231,20 @@ impl InterfaceWatch {
         };
         if seen.ipv4.is_empty() {
             if !self.lost && !self.gone {
-                warn!(
-                    "the network interface {name} lost its IPv4 address {} (link down?): \
-                     waiting for it",
-                    self.ip
-                );
+                let meanwhile = if self.secondary { meanwhile } else { "waiting for it" };
+                warn!("{what} lost its IPv4 address {} (link down?): {meanwhile}", self.ip);
             }
             self.lost = true;
             self.back_at = None;
             return None;
         }
         if self.gone {
-            return Some(format!("the network interface {name} is back"));
+            return Some(format!("{what} is back"));
         }
         match self.index {
             Some(index) if index != seen.index => {
                 return Some(format!(
-                    "the network interface {name} was attached again (index {index}, now {})",
+                    "{what} was attached again (index {index}, now {})",
                     seen.index
                 ));
             }
@@ -209,15 +254,17 @@ impl InterfaceWatch {
         if !seen.ipv4.contains(&self.ip) {
             let now: Vec<String> = seen.ipv4.iter().map(Ipv4Addr::to_string).collect();
             return Some(format!(
-                "the address of the network interface {name} changed from {} to {}",
+                "the address of {what} changed from {} to {}",
                 self.ip,
                 now.join(", ")
             ));
         }
         if self.lost {
-            info!("the network interface {name} has its address {} back", self.ip);
+            info!("{what} has its address {} back", self.ip);
             self.lost = false;
-            self.back_at = Some(now);
+            // The clock follows the primary network's leader again by
+            // itself; nothing to wait for here.
+            self.back_at = (!self.secondary).then_some(now);
         }
         match self.back_at {
             Some(at) if clock_locked && now.duration_since(at) >= LOCK_EVIDENCE => {
@@ -225,7 +272,7 @@ impl InterfaceWatch {
                 None
             }
             Some(at) if now.duration_since(at) >= RELOCK_GRACE => Some(format!(
-                "the clock did not lock within {} s of the network interface {name} coming back",
+                "the clock did not lock within {} s of {what} coming back",
                 RELOCK_GRACE.as_secs()
             )),
             _ => None,
@@ -237,6 +284,53 @@ impl InterfaceWatch {
 /// for the end of a status line.
 pub fn status_note(watch: Option<&InterfaceWatch>) -> String {
     watch.and_then(InterfaceWatch::problem).map(|p| format!("; {p}")).unwrap_or_default()
+}
+
+/// The watches of an engine's interfaces: its primary interface, which it
+/// restarts for, and on both networks of a redundant system, its secondary
+/// interface, which it does not.
+#[derive(Debug, Default)]
+pub struct Watches {
+    pub primary: Option<InterfaceWatch>,
+    pub secondary: Option<InterfaceWatch>,
+}
+
+impl Probe {
+    /// The watches of the interfaces a device started on.
+    pub fn watch_device(self, info: &ovsc_core::DeviceInfo) -> Watches {
+        let watch = |i: &ovsc_core::net::Interface| self.watch(&i.name, i.ip);
+        Watches {
+            primary: watch(&info.iface),
+            secondary: info
+                .secondary
+                .as_ref()
+                .filter(|i| watch(i).is_some())
+                .map(|i| InterfaceWatch::secondary(&i.name, i.ip)),
+        }
+    }
+}
+
+impl Watches {
+    /// Looks at both interfaces; whether to restart for the primary.
+    pub fn poll(&mut self, probe: Probe, clock: &MediaClock) -> Verdict {
+        if let Some(w) = &mut self.secondary {
+            w.poll(probe, clock);
+        }
+        match &mut self.primary {
+            Some(w) => w.poll(probe, clock),
+            None => Verdict::Keep,
+        }
+    }
+
+    /// What is wrong with either interface, for the end of a status line.
+    pub fn note(&self) -> String {
+        status_note(self.primary.as_ref()) + &status_note(self.secondary.as_ref())
+    }
+
+    /// What is wrong with the secondary network's interface, if anything.
+    pub fn secondary_problem(&self) -> Option<String> {
+        self.secondary.as_ref().and_then(InterfaceWatch::problem)
+    }
 }
 
 /// Looks at interface `name` (see [`Probe::look`]).
@@ -315,6 +409,47 @@ mod tests {
             .filter(|(_, v)| matches!(v, Verdict::Restart(_)))
             .map(|(i, _)| i)
             .collect()
+    }
+
+    #[test]
+    fn the_secondary_interface_never_restarts_the_engine() {
+        let mut w = InterfaceWatch::secondary("en8", IP);
+        let start = Instant::now();
+        let new = Ipv4Addr::new(172, 31, 9, 9);
+        let looks = [
+            seen(5, &[IP]),
+            seen(5, &[]),
+            None,
+            seen(6, &[IP]),
+            seen(6, &[IP]),
+            seen(6, &[new]),
+            seen(6, &[new]),
+        ];
+        let mut problems = Vec::new();
+        for (i, s) in looks.iter().enumerate() {
+            let v = w.check(s.as_ref(), false, start + Duration::from_secs(i as u64));
+            assert_eq!(v, Verdict::Keep, "look {i}");
+            problems.push(w.problem());
+        }
+        assert_eq!(problems[0], None);
+        assert!(
+            problems[1].as_deref().unwrap().contains("secondary network's interface en8 has no")
+        );
+        assert!(problems[2].as_deref().unwrap().contains("is gone"));
+        // Back, attached again: what it lost lasts until the daemon restarts.
+        assert!(problems[3].as_deref().unwrap().contains("restart the daemon"), "{problems:?}");
+        assert!(problems[6].as_deref().unwrap().contains("restart the daemon"), "{problems:?}");
+        // A cable pull that comes back with the same address leaves nothing.
+        let mut w = InterfaceWatch::secondary("en8", IP);
+        for (i, s) in
+            [seen(5, &[IP]), seen(5, &[]), seen(5, &[IP]), seen(5, &[IP])].iter().enumerate()
+        {
+            assert_eq!(
+                w.check(s.as_ref(), false, start + Duration::from_secs(i as u64)),
+                Verdict::Keep
+            );
+        }
+        assert_eq!(w.problem(), None);
     }
 
     #[test]

@@ -6,6 +6,9 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 
+use super::PtpCapture;
+use super::capture::{Capture, Wanted};
+
 #[cfg(not(target_vendor = "apple"))]
 use crate::local_now_ns;
 
@@ -29,6 +32,9 @@ pub(crate) const GENERAL_TOS: u32 = 46 << 2;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Endpoints {
     pub interface: Ipv4Addr,
+    /// The interface on the secondary network of a redundant system, where
+    /// the group is joined too.
+    pub secondary: Option<Ipv4Addr>,
     pub group: Ipv4Addr,
     pub event_port: u16,
     pub general_port: u16,
@@ -95,6 +101,17 @@ impl Endpoints {
                 format!("cannot join {} on interface {}: {e}", self.group, self.interface),
             )
         })?;
+        // The leader of a redundant system is heard on both networks; the
+        // follower takes one network's messages at a time (Failover).
+        if let Some(secondary) = self.secondary {
+            if let Err(e) = socket.join_multicast_v4(&self.group, &secondary) {
+                tracing::warn!(
+                    "cannot join {} on the secondary interface {secondary}: {e}; the clock \
+                     follows the primary network only",
+                    self.group
+                );
+            }
+        }
         // A socket bound to 0.0.0.0 on Linux also receives the group's
         // datagrams from every other interface on which any process joined
         // it (IP_MULTICAST_ALL defaults to 1), so a host with a second PTP
@@ -129,13 +146,168 @@ impl Endpoints {
 }
 
 fn bind_error(port: u16, e: io::Error) -> io::Error {
-    let hint = if e.kind() == io::ErrorKind::PermissionDenied && port < 1024 {
-        ". Ports below 1024 are privileged: run as root, or on Linux grant the \
-         CAP_NET_BIND_SERVICE capability (e.g. `sudo setcap cap_net_bind_service=+ep <binary>`)"
-    } else {
-        ""
+    let hint = match e.kind() {
+        io::ErrorKind::PermissionDenied if port < 1024 => {
+            ". Ports below 1024 are privileged: run as root, or on Linux grant the \
+             CAP_NET_BIND_SERVICE capability (e.g. `sudo setcap cap_net_bind_service=+ep <binary>`)"
+                .to_owned()
+        }
+        // The socket opts in to sharing the port (SO_REUSEADDR and
+        // SO_REUSEPORT), but the system lets two sockets share it only when
+        // both did: another program holds the port for itself.
+        io::ErrorKind::AddrInUse => format!(
+            ". Another program holds it for itself{}; `sudo lsof -nP -iUDP:{port}` names it",
+            if cfg!(target_vendor = "apple") {
+                ": on a Mac, usually AirPlay, whose own clock uses PTP on the same ports. \
+                 Turn off AirPlay Receiver (System Settings, General, AirDrop & Handoff) \
+                 and stop sending audio to AirPlay speakers"
+            } else {
+                ", such as another PTP daemon (ptp4l)"
+            }
+        ),
+        _ => String::new(),
     };
     io::Error::new(e.kind(), format!("cannot bind UDP port {port}: {e}{hint}"))
+}
+
+/// How the follower reaches the PTP traffic: the ports, shared with other
+/// PTP software, or (when another program holds them for itself) the
+/// interfaces read directly, with a socket of our own to send from.
+pub(crate) enum Link {
+    Ports {
+        event: UdpSocket,
+        general: UdpSocket,
+    },
+    Capture {
+        /// The primary interface's, then the secondary's, if any.
+        captures: Vec<Capture>,
+        send: UdpSocket,
+        event_port: u16,
+    },
+}
+
+/// Which of the two kinds of PTP message a datagram is, by its port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind {
+    /// Sync, Delay_Req: timestamped on arrival.
+    Event,
+    /// Follow_Up, Delay_Resp, management.
+    General,
+}
+
+impl Endpoints {
+    /// Opens the way to the PTP traffic, as `mode` says.
+    pub fn open(&self, mode: PtpCapture) -> io::Result<Link> {
+        match mode {
+            PtpCapture::Never => {
+                let (event, general) = self.bind()?;
+                Ok(Link::Ports { event, general })
+            }
+            PtpCapture::Always => self.capture(),
+            PtpCapture::Auto => match self.bind() {
+                Ok((event, general)) => Ok(Link::Ports { event, general }),
+                Err(e) if e.kind() == io::ErrorKind::AddrInUse => match self.capture() {
+                    Ok(link) => {
+                        tracing::warn!(
+                            "{e}. Reading the PTP traffic from the interface instead, and sending \
+                             from a port of our own"
+                        );
+                        Ok(link)
+                    }
+                    Err(c) => Err(io::Error::new(
+                        e.kind(),
+                        format!(
+                            "{e}. Reading the PTP traffic from the interface instead failed: {c}"
+                        ),
+                    )),
+                },
+                Err(e) => Err(e),
+            },
+        }
+    }
+
+    /// The interfaces read directly, and a socket on a port of our own to
+    /// send from. The socket joins the group too: that membership makes
+    /// the interface and the switches deliver the group's traffic.
+    fn capture(&self) -> io::Result<Link> {
+        let wanted = Wanted {
+            group: self.group,
+            event_port: self.event_port,
+            general_port: self.general_port,
+        };
+        let mut captures = vec![Capture::open(self.interface, wanted)?];
+        if let Some(secondary) = self.secondary {
+            match Capture::open(secondary, wanted) {
+                Ok(c) => captures.push(c),
+                Err(e) => tracing::warn!("{e}; the clock follows the primary network only"),
+            }
+        }
+        let send = self.socket(0, EVENT_TOS)?;
+        send.set_nonblocking(true)?;
+        Ok(Link::Capture {
+            captures,
+            send: UdpSocket::from_std(send.into())?,
+            event_port: self.event_port,
+        })
+    }
+}
+
+impl Link {
+    /// Whether the interfaces are read directly.
+    pub fn reads_interface(&self) -> bool {
+        matches!(self, Link::Capture { .. })
+    }
+
+    /// The next datagram: which kind, and its length (in `event_buf` or
+    /// `general_buf`), sender and arrival time. Cancel-safe.
+    pub async fn recv(
+        &mut self,
+        event_buf: &mut [u8],
+        general_buf: &mut [u8],
+    ) -> (Kind, io::Result<(usize, SocketAddr, u64)>) {
+        match self {
+            // `biased`: the event socket is polled first, so when both are
+            // ready a Sync gets its receive timestamp before a Follow_Up is
+            // processed.
+            Link::Ports { event, general } => tokio::select! {
+                biased;
+                r = recv_timestamped(event, event_buf) => (Kind::Event, r),
+                r = recv_timestamped(general, general_buf) => (Kind::General, r),
+            },
+            Link::Capture { captures, event_port, .. } => {
+                let (first, rest) = captures.split_first_mut().expect("the primary capture");
+                let r = match rest.first_mut() {
+                    Some(second) => tokio::select! {
+                        biased;
+                        r = first.recv() => r,
+                        r = second.recv() => r,
+                    },
+                    None => first.recv().await,
+                };
+                match r {
+                    Ok(d) => {
+                        let (kind, buf) = if d.port == *event_port {
+                            (Kind::Event, event_buf)
+                        } else {
+                            (Kind::General, general_buf)
+                        };
+                        let n = d.data.len().min(buf.len());
+                        buf[..n].copy_from_slice(&d.data[..n]);
+                        (kind, Ok((n, d.src, d.at)))
+                    }
+                    Err(e) => (Kind::Event, Err(e)),
+                }
+            }
+        }
+    }
+
+    /// The socket event messages (Delay_Reqs) are sent from.
+    pub fn event_socket(&self) -> &UdpSocket {
+        match self {
+            Link::Ports { event, .. } => event,
+            Link::Capture { send, .. } => send,
+        }
+    }
 }
 
 /// Receives a datagram on a PTP socket, with the local time
@@ -349,9 +521,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_port_held_by_another_program_says_who_may_hold_it() {
+        let e = bind_error(319, io::Error::from(io::ErrorKind::AddrInUse));
+        assert_eq!(e.kind(), io::ErrorKind::AddrInUse);
+        let text = e.to_string();
+        assert!(text.starts_with("cannot bind UDP port 319: "), "{text}");
+        assert!(text.contains("`sudo lsof -nP -iUDP:319`"), "{text}");
+        #[cfg(target_vendor = "apple")]
+        assert!(text.contains("AirPlay Receiver"), "{text}");
+        // Other errors say only what happened.
+        let e = bind_error(319, io::Error::from(io::ErrorKind::InvalidInput));
+        assert!(!e.to_string().contains("lsof"));
+    }
+
+    #[test]
     fn sockets_are_marked_and_on_linux_filtered_by_interface() {
         let endpoints = Endpoints {
             interface: Ipv4Addr::LOCALHOST,
+            secondary: None,
             group: Ipv4Addr::new(224, 0, 1, 129),
             event_port: 0,
             general_port: 0,

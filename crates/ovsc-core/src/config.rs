@@ -108,6 +108,12 @@ pub struct DeviceConfig {
     /// Network interface name (e.g. `en0`, `eth0`) or IPv4 address. Empty
     /// means the interface of the default route.
     pub interface: String,
+    /// The interface on the secondary network of a redundant Dante system,
+    /// by name or IPv4 address; empty for none. With one, the device has
+    /// two interfaces, and its flows with redundant devices run on both
+    /// networks: either can fail without a gap in the audio. It must be
+    /// another interface than `interface`, on another network.
+    pub secondary_interface: String,
     pub sample_rate: u32,
     /// Bit depth of transmitted audio: 16, 24 or 32.
     pub bits_per_sample: u16,
@@ -154,6 +160,7 @@ impl Default for DeviceConfig {
         Self {
             name: String::new(),
             interface: String::new(),
+            secondary_interface: String::new(),
             sample_rate: 48_000,
             bits_per_sample: 24,
             tx_channels: Channels::Count(2),

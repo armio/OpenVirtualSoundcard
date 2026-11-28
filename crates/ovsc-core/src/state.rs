@@ -90,6 +90,11 @@ pub enum Notify {
 
 /// Packet counters, written by the transmit thread and the receive threads
 /// (relaxed increments) and read for status displays.
+///
+/// On a redundant device (one with a secondary interface) they count the
+/// audio, whichever network brought it: a packet is lost or late when no
+/// network brought it in time, and a send fails when it left on neither.
+/// [`Counters::networks`] counts each network on its own.
 #[derive(Debug, Default)]
 pub struct Counters {
     /// Audio packets sent.
@@ -141,6 +146,43 @@ pub struct Counters {
     /// Datagrams dropped by receive flows: not from the flow's transmitter,
     /// or not whole frames of the flow's slots.
     pub rx_rejected_packets: AtomicU64,
+    /// Each network's packets: the primary's, then the secondary's.
+    pub networks: [NetworkCounters; 2],
+}
+
+/// The packets of one network of a redundant device. A packet lost on one
+/// network is not lost to the audio while the other brings it.
+#[derive(Debug, Default)]
+pub struct NetworkCounters {
+    /// Audio packets sent on this network.
+    pub tx_packets: AtomicU64,
+    /// Audio packets the network stack refused to send on this network, or
+    /// reported undeliverable.
+    pub tx_send_errors: AtomicU64,
+    /// Audio packets received on this network.
+    pub rx_packets: AtomicU64,
+    /// Packets missing from the receive flows' packets on this network.
+    pub rx_lost_packets: AtomicU64,
+}
+
+impl NetworkCounters {
+    pub fn read(&self) -> NetworkStats {
+        NetworkStats {
+            tx_packets: self.tx_packets.load(Ordering::Relaxed),
+            tx_send_errors: self.tx_send_errors.load(Ordering::Relaxed),
+            rx_packets: self.rx_packets.load(Ordering::Relaxed),
+            rx_lost_packets: self.rx_lost_packets.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// [`NetworkCounters`] as read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NetworkStats {
+    pub tx_packets: u64,
+    pub tx_send_errors: u64,
+    pub rx_packets: u64,
+    pub rx_lost_packets: u64,
 }
 
 /// What one receive flow's packets look like, written by its receive thread
@@ -173,6 +215,33 @@ pub struct FlowStats {
     /// Set while the flow recently lost packets or received them too late
     /// to play: audible trouble, though the flow still counts as receiving.
     pub degraded: AtomicBool,
+    /// Each network's copy of the flow, the primary's then the secondary's.
+    /// The fields above count the audio, whichever network brought it.
+    pub networks: [FlowNetworkStats; 2],
+}
+
+/// One network's copy of a receive flow (see [`Counters::networks`]).
+#[derive(Debug, Default)]
+pub struct FlowNetworkStats {
+    /// Local time of the last packet on this network, 0 if none yet.
+    pub last_packet_ns: AtomicU64,
+    /// Packets received on this network.
+    pub packets: AtomicU64,
+    /// Packets missing from this network's copy.
+    pub lost_packets: AtomicU64,
+    /// Packets that arrived on this network later than the flow's latency.
+    pub late_packets: AtomicU64,
+    /// The longest a packet took on this network, from its timestamp to its
+    /// arrival, in samples, since the heartbeat last took it.
+    pub max_arrival: AtomicU32,
+}
+
+impl FlowNetworkStats {
+    /// Whether a packet came on this network in the second before `now_ns`.
+    pub fn is_receiving(&self, now_ns: u64) -> bool {
+        let last = self.last_packet_ns.load(Ordering::Relaxed);
+        last != 0 && now_ns.saturating_sub(last) < 1_000_000_000
+    }
 }
 
 /// A change a controller made, or tried to make, to a setting that

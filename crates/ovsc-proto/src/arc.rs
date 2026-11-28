@@ -16,7 +16,7 @@
 //! nested descriptors referenced by packet-absolute offsets. A result code of
 //! [`result::MORE_PAGES`] tells the controller to ask for the next page.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddrV4};
 
 use crate::frame::{Frame, Header, PacketBuilder, encode, protocol, respond, result};
 use crate::wire::{Reader, Writer, u16_at, u32_at};
@@ -217,6 +217,10 @@ pub struct ChannelCounts {
     pub max_rx_flows: u16,
     pub supports_tx_rename: bool,
     pub supports_tx_multicast: bool,
+    /// Network interfaces: 2 for a device on both networks of a redundant
+    /// system. Receive-flow entries of the heartbeat are per interface
+    /// (PROTOCOL.md §7.7).
+    pub network_interfaces: u16,
 }
 
 impl ChannelCounts {
@@ -236,7 +240,7 @@ impl ChannelCounts {
         // Some devices report the total channel count here, others not.
         w.u16(self.tx_channels.saturating_add(self.rx_channels));
         w.u16(1);
-        w.u16(1);
+        w.u16(self.network_interfaces);
         w.zeros(12);
         respond(request, result::SUCCESS, w.as_slice())
     }
@@ -252,6 +256,8 @@ impl ChannelCounts {
         r.u16()?;
         let max_tx_flows = r.u16()?;
         let max_rx_flows = r.u16()?;
+        r.skip(4)?;
+        let network_interfaces = r.u16()?;
         Ok(Self {
             tx_channels,
             rx_channels,
@@ -260,6 +266,7 @@ impl ChannelCounts {
             max_rx_flows,
             supports_tx_rename: flags & 0x10 != 0,
             supports_tx_multicast: flags & 0x20 != 0,
+            network_interfaces,
         })
     }
 }
@@ -712,6 +719,9 @@ pub struct TxFlowInfo {
     pub remote: Option<(String, String)>,
     pub dst_addr: Ipv4Addr,
     pub dst_port: u16,
+    /// The receiver's address on the secondary network, for a flow sent on
+    /// both networks of a redundant system: the record's second destination.
+    pub secondary: Option<SocketAddrV4>,
     /// Transmit channel ids carried by the flow (0 = empty slot).
     pub channels: Vec<u16>,
     /// Frames per packet.
@@ -734,9 +744,11 @@ pub fn encode_tx_flows_response(
         w.u32(sample_rate);
         w.u16(0);
         w.u16(bits_per_sample);
-        w.u16(1); // destinations
+        // One destination per network the flow is sent on.
+        let destinations = 1 + flow.secondary.is_some() as usize;
+        w.u16(destinations as u16);
         w.u16(flow.channels.len() as u16);
-        let socket_ptr = w.u16(0) as usize;
+        let socket_ptrs = w.zeros(2 * destinations) as usize;
         for &ch in &flow.channels {
             w.u16(ch);
         }
@@ -744,6 +756,11 @@ pub fn encode_tx_flows_response(
 
         w.align(4);
         let socket = write_socket_descriptor(w, flow.dst_addr, flow.dst_port);
+        w.patch_u16(socket_ptrs, socket);
+        if let Some(secondary) = flow.secondary {
+            let socket = write_socket_descriptor(w, *secondary.ip(), secondary.port());
+            w.patch_u16(socket_ptrs + 2, socket);
+        }
         let ext = w.u8(0x0a); // length in 16-bit words
         w.u8(0);
         w.u16(1);
@@ -761,7 +778,6 @@ pub fn encode_tx_flows_response(
             w.patch_u16(host_ptr, host_at);
             w.patch_u16(remote_name_ptr, name_at);
         }
-        w.patch_u16(socket_ptr, socket);
         w.patch_u16(ext_ptr, ext);
         w.patch_u16(local_name_ptr, local_name);
         be16(record).to_vec()
@@ -788,6 +804,13 @@ pub fn decode_tx_flows_response(frame: &Frame<'_>) -> Result<Vec<TxFlowInfo>> {
                 p,
                 *sockets.first().ok_or(Error::Invalid("no destination"))? as usize,
             )?;
+            let secondary = match sockets.get(1) {
+                Some(&at) => {
+                    let (addr, port) = read_socket_descriptor(p, at as usize)?;
+                    Some(SocketAddrV4::new(addr, port))
+                }
+                None => None,
+            };
             let remote_host = frame.opt_string_at(u16_at(p, ext + 4)?)?;
             let remote_name = frame.opt_string_at(u16_at(p, ext + 6)?)?;
             Ok(TxFlowInfo {
@@ -796,6 +819,7 @@ pub fn decode_tx_flows_response(frame: &Frame<'_>) -> Result<Vec<TxFlowInfo>> {
                 remote: remote_host.zip(remote_name),
                 dst_addr,
                 dst_port,
+                secondary,
                 channels,
                 fpp: u16_at(p, ext + 8)?,
             })
@@ -811,6 +835,14 @@ pub struct RxFlowInfo {
     /// Our address and the port the flow is received on.
     pub addr: Ipv4Addr,
     pub port: u16,
+    /// Our address and port on the secondary network, for a flow received
+    /// on both networks of a redundant system: the record's second
+    /// endpoint.
+    pub secondary: Option<SocketAddrV4>,
+    /// The networks the flow's packets arrive on: bit 0 the primary, bit 1
+    /// the secondary (the status's "interfaces receiving"; see PROTOCOL.md
+    /// §11 for what is known of it).
+    pub networks: u16,
     pub latency_ns: u32,
     pub status: SubscriptionStatus,
     /// For each channel slot in the flow, the 0-based local receive channels
@@ -835,10 +867,12 @@ pub fn encode_rx_flows_response(
         w.u16(1);
         w.u32(sample_rate);
         w.u32(bits_per_sample as u32);
-        w.u16(1); // interfaces
+        // One endpoint per network the flow is received on.
+        let interfaces = 1 + flow.secondary.is_some() as usize;
+        w.u16(interfaces as u16);
         w.u16(flow.slots.len() as u16);
         w.u16(words as u16);
-        let endpoint_ptr = w.u16(0) as usize;
+        let endpoint_ptrs = w.zeros(2 * interfaces) as usize;
         let mask_ptrs = w.zeros(2 * flow.slots.len()) as usize;
         let status_ptr = w.u16(0) as usize;
 
@@ -857,14 +891,18 @@ pub fn encode_rx_flows_response(
         }
         w.align(4);
         let endpoint = write_socket_descriptor(w, flow.addr, flow.port);
+        w.patch_u16(endpoint_ptrs, endpoint);
+        if let Some(secondary) = flow.secondary {
+            let endpoint = write_socket_descriptor(w, *secondary.ip(), secondary.port());
+            w.patch_u16(endpoint_ptrs + 2, endpoint);
+        }
         let status = w.u16((flow.status.code() & 0xffff) as u16);
-        w.u16(flow.status.is_receiving() as u16); // interfaces receiving
+        w.u16(flow.networks); // interfaces receiving
         w.u16(0x0800);
         w.u16(0);
         w.u32(flow.latency_ns);
         w.u16(0); // transport: native
         w.u16(0);
-        w.patch_u16(endpoint_ptr, endpoint);
         w.patch_u16(status_ptr, status);
         be16(record).to_vec()
     })
@@ -890,6 +928,13 @@ pub fn decode_rx_flows_response(frame: &Frame<'_>) -> Result<Vec<RxFlowInfo>> {
                 p,
                 *endpoints.first().ok_or(Error::Invalid("no endpoint"))? as usize,
             )?;
+            let secondary = match endpoints.get(1) {
+                Some(&at) => {
+                    let (addr, port) = read_socket_descriptor(p, at as usize)?;
+                    Some(SocketAddrV4::new(addr, port))
+                }
+                None => None,
+            };
             let slots = masks
                 .iter()
                 .map(|&m| {
@@ -910,6 +955,8 @@ pub fn decode_rx_flows_response(frame: &Frame<'_>) -> Result<Vec<RxFlowInfo>> {
                 id,
                 addr,
                 port,
+                secondary,
+                networks: u16_at(p, status_at + 2)?,
                 latency_ns: u32_at(p, status_at + 8)?,
                 status: SubscriptionStatus::from_code(u16_at(p, status_at)? as u32),
                 slots,
@@ -1164,6 +1211,7 @@ mod tests {
             max_rx_flows: 32,
             supports_tx_rename: true,
             supports_tx_multicast: false,
+            network_interfaces: 2,
         };
         let pkt = counts.encode_response(&req.header);
         assert_eq!(pkt.len(), HEADER_LEN + ChannelCounts::SIZE);
@@ -1312,6 +1360,7 @@ mod tests {
                 remote: Some(("console".into(), "rx-flow".into())),
                 dst_addr: Ipv4Addr::new(192, 168, 1, 20),
                 dst_port: 14336,
+                secondary: None,
                 channels: vec![1, 2, 0, 4],
                 fpp: 16,
             },
@@ -1321,6 +1370,7 @@ mod tests {
                 remote: None,
                 dst_addr: Ipv4Addr::new(239, 255, 1, 2),
                 dst_port: 4321,
+                secondary: None,
                 channels: vec![5],
                 fpp: 32,
             },
@@ -1349,6 +1399,7 @@ mod tests {
                 remote: None,
                 dst_addr: Ipv4Addr::new(239, 255, 69, 103),
                 dst_port: 4321,
+                secondary: None,
                 channels: vec![16, 0, 0, 0, 0, 0, 0, 0],
                 fpp: 16,
             }]
@@ -1361,6 +1412,8 @@ mod tests {
             id: 2,
             addr: Ipv4Addr::new(10, 0, 0, 5),
             port: 14337,
+            secondary: None,
+            networks: 1,
             latency_ns: 1_000_000,
             status: SubscriptionStatus::ReceivingUnicast,
             slots: vec![vec![0], vec![1, 17]],
@@ -1401,6 +1454,49 @@ mod tests {
         assert_eq!(flows[2].latency_ns, 2_000_000);
         assert_eq!(flows[3].status, SubscriptionStatus::ReceivingMulticast);
         assert_eq!(flows[3].addr, Ipv4Addr::new(239, 255, 255, 56));
+        // One network: one endpoint. The field after the status reads 1 for
+        // the unicast flows and 0 for the multicast one, though it receives.
+        assert!(flows.iter().all(|f| f.secondary.is_none()));
+        let networks: Vec<u16> = flows.iter().map(|f| f.networks).collect();
+        assert_eq!(networks, [1, 1, 1, 0]);
+    }
+
+    #[test]
+    fn redundant_flows_list_an_address_per_network() {
+        let secondary = SocketAddrV4::new(Ipv4Addr::new(172, 31, 0, 5), 14402);
+        let tx = vec![TxFlowInfo {
+            id: 2,
+            local_name: "2_77".into(),
+            remote: Some(("console".into(), "rx-flow".into())),
+            dst_addr: Ipv4Addr::new(192, 168, 1, 20),
+            dst_port: 14336,
+            secondary: Some(secondary),
+            channels: vec![1, 2],
+            fpp: 16,
+        }];
+        let req = leak_parse(request(opcode::TX_FLOWS, 0));
+        let resp = leak_parse(encode_tx_flows_response(&req.header, 0, 48_000, 24, &tx));
+        assert_eq!(decode_tx_flows_response(&resp).unwrap(), tx);
+        let record = u16_at(resp.payload(), 2).unwrap() as usize;
+        assert_eq!(u16_at(resp.packet, record + 12).unwrap(), 2, "destinations");
+
+        let rx = vec![RxFlowInfo {
+            id: 1,
+            addr: Ipv4Addr::new(10, 0, 0, 5),
+            port: 14337,
+            secondary: Some(secondary),
+            networks: 0b10,
+            latency_ns: 1_000_000,
+            status: SubscriptionStatus::ReceivingUnicast,
+            slots: vec![vec![0], vec![1]],
+        }];
+        let req = leak_parse(request(opcode::RX_FLOWS, 0));
+        let resp = leak_parse(encode_rx_flows_response(&req.header, 0, 48_000, 24, 8, &rx));
+        assert_eq!(decode_rx_flows_response(&resp).unwrap(), rx);
+        let record = u16_at(resp.payload(), 2).unwrap() as usize;
+        assert_eq!(u16_at(resp.packet, record + 12).unwrap(), 2, "interfaces");
+        let second = u16_at(resp.packet, record + 20).unwrap() as usize;
+        assert_eq!(&resp.packet[second + 4..second + 8], &[172, 31, 0, 5]);
     }
 
     #[test]

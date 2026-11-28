@@ -63,6 +63,7 @@ use tracing::info;
 use crate::{ClockStatus, MediaClock, local_now_ns};
 
 pub mod bmc;
+mod capture;
 mod follower;
 pub mod master;
 mod net;
@@ -97,6 +98,41 @@ pub struct PtpConfig {
     pub delay_req_interval: Duration,
     /// How long without Sync messages before the master is considered gone.
     pub master_timeout: Duration,
+    /// The secondary network, for a device on both networks of a redundant
+    /// Dante system: the follower takes the leader's messages there while
+    /// the primary network brings none.
+    pub secondary: Option<PtpSecondary>,
+    /// Whether to read the PTP traffic from the interface directly.
+    pub capture: PtpCapture,
+}
+
+/// Whether the follower reads the PTP traffic from the network interface
+/// directly, instead of through the PTP ports.
+///
+/// The ports are shared with other PTP software when it lets them be
+/// shared. Some does not: on a Mac, AirPlay's own clock holds them for
+/// itself. Reading the interface (BPF on macOS, a packet socket on Linux)
+/// needs root, as the ports below 1024 do; the follower then sends its
+/// Delay_Reqs from a port of its own, which a PTPv1 leader answers to the
+/// group as usual.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PtpCapture {
+    /// Through the ports; when another program holds them for itself, the
+    /// interface instead.
+    #[default]
+    Auto,
+    /// Always the interface.
+    Always,
+    /// Always the ports: fail when they are held.
+    Never,
+}
+
+/// The secondary network of a redundant Dante system, for [`PtpConfig`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PtpSecondary {
+    /// IPv4 address of the interface on the secondary network.
+    pub interface: Ipv4Addr,
+    pub netmask: Ipv4Addr,
 }
 
 impl PtpConfig {
@@ -111,12 +147,15 @@ impl PtpConfig {
             multicast_group: Ipv4Addr::new(224, 0, 1, 129),
             delay_req_interval: Duration::from_secs(1),
             master_timeout: Duration::from_secs(5),
+            secondary: None,
+            capture: PtpCapture::Auto,
         }
     }
 
     fn endpoints(&self) -> Endpoints {
         Endpoints {
             interface: self.interface,
+            secondary: self.secondary.map(|s| s.interface),
             group: self.multicast_group,
             event_port: self.event_port,
             general_port: self.general_port,
@@ -143,12 +182,14 @@ pub struct PtpFollower {
     task: tokio::task::JoinHandle<()>,
     output: Arc<ClockOutput>,
     clock: MediaClock,
+    reads_interface: bool,
 }
 
 impl PtpFollower {
     /// Starts following the best PTPv1 master on the network.
     ///
-    /// Binds the PTP ports, joins the multicast group on
+    /// Binds the PTP ports (or reads the interface, as
+    /// [`PtpConfig::capture`] says), joins the multicast group on
     /// `config.interface` and spawns the follower on the current tokio
     /// runtime (so this must run inside one), then returns immediately. The
     /// returned clock has no time until a master has been heard for a couple
@@ -160,10 +201,11 @@ impl PtpFollower {
     pub async fn start(config: PtpConfig) -> io::Result<(PtpFollower, MediaClock)> {
         let subdomain = parse_subdomain(&config.subdomain)?;
         let endpoints = config.endpoints();
-        let (event, general) = endpoints.bind()?;
+        let link = endpoints.open(config.capture)?;
+        let reads_interface = link.reads_interface();
 
         let (clock, writer) = MediaClock::new();
-        let output = Arc::new(ClockOutput::new(writer));
+        let output = Arc::new(ClockOutput::new(writer, reads_interface));
         // Different followers should pick different Delay_Req schedules.
         let seed = config.uuid.iter().fold(local_now_ns(), |acc, &b| acc.rotate_left(8) ^ b as u64);
         let core = Core::new(CoreConfig {
@@ -175,21 +217,32 @@ impl PtpFollower {
             servo: ServoConfig::default(),
             seed,
         });
-        let task = tokio::spawn(follower::run(core, event, general, endpoints, output.clone()));
+        let failover = config
+            .secondary
+            .map(|s| follower::Failover::new(s.interface, s.netmask, local_now_ns()));
+        let task = tokio::spawn(follower::run(core, link, endpoints, output.clone(), failover));
         info!(
             interface = %config.interface,
+            secondary = ?config.secondary.map(|s| s.interface),
             uuid = %follower::fmt_uuid(&config.uuid),
             group = %config.multicast_group,
             event_port = config.event_port,
             general_port = config.general_port,
+            reads_interface,
             "PTPv1 follower started"
         );
-        Ok((PtpFollower { task, output, clock: clock.clone() }, clock))
+        Ok((PtpFollower { task, output, clock: clock.clone(), reads_interface }, clock))
     }
 
     /// Current synchronisation status (same as [`MediaClock::status`]).
     pub fn status(&self) -> ClockStatus {
         self.clock.status()
+    }
+
+    /// Whether it reads the PTP traffic from the interface directly (see
+    /// [`PtpCapture`]).
+    pub fn reads_interface(&self) -> bool {
+        self.reads_interface
     }
 
     /// Another handle to the clock this follower drives.
