@@ -557,6 +557,9 @@ impl Model {
         if self.discarding || !self.pending() {
             return true;
         }
+        // One question at a time: a confirmation still up goes, and Apply
+        // brings it back if the user keeps editing.
+        self.confirm = None;
         self.ask_discard = Some(how);
         false
     }
@@ -760,6 +763,19 @@ mod tests {
         assert!(!m.may_leave(Leave::Close));
         assert_eq!(m.answer_discard(true), Some(Leave::Close));
         assert!(m.may_leave(Leave::Close));
+    }
+
+    #[test]
+    fn leaving_drops_a_confirmation_that_is_up() {
+        let t0 = Instant::now();
+        let mut m = connected(t0);
+        m.edit(|s| s.rx_channels = 16);
+        m.request_apply();
+        assert!(m.confirm.is_some());
+        assert!(!m.may_leave(Leave::Close));
+        assert!(m.confirm.is_none(), "only the question about leaving is up");
+        assert_eq!(m.answer_discard(false), None);
+        assert!(m.pending(), "the edit stays");
     }
 
     #[test]

@@ -40,6 +40,8 @@ fn main() {
             KeyBinding::new("cmd-w", CloseWindow, None),
             KeyBinding::new("cmd-m", Minimize, None),
             KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-h", Hide, None),
+            KeyBinding::new("alt-cmd-h", HideOthers, None),
             KeyBinding::new("escape", Cancel, None),
             // In a dialog, Return gives the safe answer: Cancel, Keep
             // editing.
@@ -48,10 +50,12 @@ fn main() {
         cx.bind_keys(input::key_bindings());
         cx.set_menus(menus());
 
-        let bounds = place::load(cx)
-            .unwrap_or_else(|| gpui::Bounds::centered(None, size(px(SIZE.0), px(SIZE.1)), cx));
+        let (bounds, display_id) = place::load(cx).unwrap_or_else(|| {
+            (gpui::Bounds::centered(None, size(px(SIZE.0), px(SIZE.1)), cx), None)
+        });
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
+            display_id,
             titlebar: Some(TitlebarOptions {
                 title: Some(APP_NAME.into()),
                 appears_transparent: false,
@@ -67,8 +71,9 @@ fn main() {
             })
             .expect("cannot open the window");
 
-        // Quit asks the window first about edits not applied; without the
-        // window, it quits.
+        // Quit asks the window first about edits not applied. The window
+        // handles it itself while it has the focus; this is for the times
+        // it has not (minimised, say). Without the window, it quits.
         cx.on_action(move |_: &Quit, cx| {
             if window.update(cx, |view, window, cx| view.leave(Leave::Quit, window, cx)).is_err() {
                 cx.quit();

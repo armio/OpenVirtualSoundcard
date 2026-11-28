@@ -405,6 +405,7 @@ fn select<T: Clone + PartialEq + 'static>(
             div()
                 .id(SharedString::from(format!("{id}-{i}")))
                 .h(px(24.0))
+                .flex_shrink_0()
                 .mx(px(4.0))
                 .pl(px(6.0))
                 .pr(px(12.0))
@@ -423,8 +424,11 @@ fn select<T: Clone + PartialEq + 'static>(
                     view.after_edit(window, cx);
                 }))
         });
+        // It takes the clicks, the hovering and the scrolling over it:
+        // nothing under it may get them too.
         let list = div()
             .id(SharedString::from(format!("{id}-list")))
+            .occlude()
             .min_w(px(width))
             .max_h(px(320.0))
             .overflow_y_scroll()

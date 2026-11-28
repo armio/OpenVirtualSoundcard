@@ -12,6 +12,7 @@ use gpui::{
     AnyElement, ClipboardItem, Context, Div, ElementId, Entity, FocusHandle, Focusable, FontWeight,
     InteractiveElement, IntoElement, ParentElement, Render, ScrollHandle, SharedString, Stateful,
     StatefulInteractiveElement, Styled, Subscription, Task, Window, actions, div, prelude::*, px,
+    relative,
 };
 
 use crate::input::{InputEvent, TextInput};
@@ -160,6 +161,11 @@ impl AppView {
             self.model.handle(event, now);
         }
         self.model.tick(now);
+        // A menu whose controls went out of use (the daemon left, a change
+        // is on its way) closes, rather than coming back later.
+        if self.open_menu.is_some() && !(self.model.usable() && self.model.tab == Tab::Settings) {
+            self.open_menu = None;
+        }
         if self.copied.as_ref().is_some_and(|(_, at)| at.elapsed() >= COPIED_FOR) {
             self.copied = None;
         }
@@ -250,6 +256,9 @@ impl AppView {
         }
         self.model.switch_tab(tab);
         self.open_menu = None;
+        // The name field may hold the focus, and it is not drawn on the
+        // other tab: without a focused element there, no shortcut works.
+        window.focus(&self.focus);
         self.after_edit(window, cx);
     }
 
@@ -257,9 +266,12 @@ impl AppView {
     /// question whether to drop the edits is up.
     fn may_close(&mut self, how: Leave, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.model.may_leave(how) {
-            place::save(window);
+            place::save(window, cx);
             true
         } else {
+            // The question is in the window: bring it up (it may be
+            // minimised, or behind another app's).
+            window.activate_window();
             self.sync_focus(window);
             cx.notify();
             false
@@ -277,11 +289,12 @@ impl AppView {
     }
 
     fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        // The dialog on top first: the question about leaving.
         if self.open_menu.take().is_none() {
-            if self.model.confirm.is_some() {
-                self.model.answer_confirmation(false);
-            } else if self.model.ask_discard.is_some() {
+            if self.model.ask_discard.is_some() {
                 self.model.answer_discard(false);
+            } else if self.model.confirm.is_some() {
+                self.model.answer_confirmation(false);
             }
         }
         self.after_edit(window, cx);
@@ -392,6 +405,7 @@ impl AppView {
                     .min_w_0()
                     .truncate()
                     .text_size(px(theme::HEADING))
+                    .line_height(px(28.0))
                     .font_weight(FontWeight::BOLD)
                     .child(model.device_name()),
             )
@@ -448,10 +462,15 @@ impl AppView {
 
     /// What is pinned under the header on both tabs: an outage, a restart,
     /// a stale status. It never scrolls away.
-    fn alerts(&self, p: &Palette, now: Instant, cx: &mut Context<Self>) -> Div {
+    fn alerts(&self, p: &Palette, now: Instant, cx: &mut Context<Self>) -> Stateful<Div> {
         let model = &self.model;
         let compact = model.tab == Tab::Settings;
+        // At most 40 % of the window, scrolling beyond: many warnings must
+        // not push the tabs' content and the Settings bar out of it.
         let list = div()
+            .id("alerts")
+            .max_h(relative(0.4))
+            .overflow_y_scroll()
             .flex_shrink_0()
             .flex()
             .flex_col()
@@ -626,6 +645,9 @@ impl Render for AppView {
                     view.leave(Leave::Close, window, cx)
                 }),
             )
+            .on_action(
+                cx.listener(|view, _: &Quit, window, cx| view.leave(Leave::Quit, window, cx)),
+            )
             .on_action(cx.listener(|_, _: &Minimize, window, _| window.minimize_window()))
             .on_action(cx.listener(Self::cancel))
             // A click on the window's background takes the focus from the
@@ -659,6 +681,8 @@ impl Render for AppView {
                     .min_h_0()
                     .overflow_y_scroll()
                     .track_scroll(scroll)
+                    // A menu stays where its button was: scrolling closes it.
+                    .on_scroll_wheel(cx.listener(|view, _, _, cx| view.close_menu(cx)))
                     .child(
                         div()
                             .w_full()

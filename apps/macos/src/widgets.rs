@@ -366,7 +366,10 @@ pub fn tile(
         .h(px(84.0))
         .flex()
         .gap(px(9.0))
-        .p(px(14.0))
+        // 12 + 14 + 27 + 16 + 12 and the edges: the three lines of the
+        // large tile fit.
+        .px(px(14.0))
+        .py(px(12.0))
         .bg(bg)
         .border_1()
         .border_color(edge)
@@ -379,7 +382,14 @@ pub fn tile(
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .child(div().text_size(px(SMALL)).text_color(text2).truncate().child(title))
+                .child(
+                    div()
+                        .text_size(px(SMALL))
+                        .line_height(px(14.0))
+                        .text_color(text2)
+                        .truncate()
+                        .child(title),
+                )
                 .child(
                     div()
                         .text_size(px(if large { 22.0 } else { 19.0 }))
@@ -390,7 +400,12 @@ pub fn tile(
                         .child(lamp.word.clone()),
                 )
                 .child(
-                    div().text_size(px(12.0)).text_color(text2).truncate().child(lamp.note.clone()),
+                    div()
+                        .text_size(px(12.0))
+                        .line_height(px(16.0))
+                        .text_color(text2)
+                        .truncate()
+                        .child(lamp.note.clone()),
                 ),
         )
         .when(!detail.is_empty(), |t| t.tooltip(Tooltip::text(detail)))
